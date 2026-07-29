@@ -23,6 +23,43 @@ pub const LaunchOptions = struct {
     arguments: []const []const u8 = &.{},
 };
 
+pub const WindowSize = struct {
+    width: u32,
+    height: u32,
+};
+
+pub const WindowPosition = struct {
+    x: i32,
+    y: i32,
+};
+
+pub const WindowControls = struct {
+    kiosk: bool = false,
+    size: ?WindowSize = null,
+    position: ?WindowPosition = null,
+
+    pub fn validate(self: WindowControls) !void {
+        if (self.size) |size|
+            if (size.width == 0 or size.height == 0)
+                return error.InvalidWindowSize;
+    }
+
+    pub fn validateFor(self: WindowControls, selected: Browser) !void {
+        try self.validate();
+        switch (selected) {
+            .safari => if (self.isActive())
+                return error.UnsupportedBrowserControl,
+            .firefox => if (self.position != null)
+                return error.UnsupportedBrowserControl,
+            else => {},
+        }
+    }
+
+    pub fn isActive(self: WindowControls) bool {
+        return self.kiosk or self.size != null or self.position != null;
+    }
+};
+
 /// PID on POSIX and a process handle on Windows.
 pub const ProcessId = std.process.Child.Id;
 
@@ -69,10 +106,12 @@ pub fn launch(
     io: std.Io,
     url: []const u8,
     options: LaunchOptions,
+    controls: WindowControls,
 ) !std.process.Child {
     if (url.len == 0) return error.InvalidUrl;
     if (options.executable) |executable|
         if (executable.len == 0) return error.InvalidBrowserExecutable;
+    try controls.validateFor(options.browser);
 
     const discovered = if (options.executable == null)
         try resolveExecutable(gpa, io, options.browser) orelse
@@ -86,6 +125,38 @@ pub fn launch(
     defer argv.deinit(gpa);
     try argv.append(gpa, executable);
     try argv.appendSlice(gpa, options.arguments);
+    if (controls.kiosk) try argv.append(gpa, switch (options.browser) {
+        .firefox => "-kiosk",
+        else => "--kiosk",
+    });
+    var size_buffer: [48]u8 = undefined;
+    if (controls.size) |size| switch (options.browser) {
+        .firefox => {
+            try argv.appendSlice(gpa, &.{
+                "-width",
+                try std.fmt.bufPrint(&size_buffer, "{d}", .{size.width}),
+                "-height",
+                try std.fmt.bufPrint(size_buffer[24..], "{d}", .{size.height}),
+            });
+        },
+        else => try argv.append(
+            gpa,
+            try std.fmt.bufPrint(
+                &size_buffer,
+                "--window-size={d},{d}",
+                .{ size.width, size.height },
+            ),
+        ),
+    };
+    var position_buffer: [64]u8 = undefined;
+    if (controls.position) |position| try argv.append(
+        gpa,
+        try std.fmt.bufPrint(
+            &position_buffer,
+            "--window-position={d},{d}",
+            .{ position.x, position.y },
+        ),
+    );
     const app_url = switch (options.browser) {
         .firefox, .safari => null,
         else => try std.fmt.allocPrint(gpa, "--app={s}", .{url}),
@@ -332,6 +403,33 @@ fn preferredBrowsers() []const Browser {
             .safari,
         },
     };
+}
+
+test "window controls validate browser support" {
+    try (WindowControls{
+        .kiosk = true,
+        .size = .{ .width = 1280, .height = 720 },
+        .position = .{ .x = -200, .y = 40 },
+    }).validateFor(.chromium);
+    try (WindowControls{
+        .kiosk = true,
+        .size = .{ .width = 1280, .height = 720 },
+    }).validateFor(.firefox);
+    try (WindowControls{}).validateFor(.safari);
+    try std.testing.expectError(
+        error.UnsupportedBrowserControl,
+        (WindowControls{ .position = .{ .x = 0, .y = 0 } })
+            .validateFor(.firefox),
+    );
+    try std.testing.expectError(
+        error.UnsupportedBrowserControl,
+        (WindowControls{ .kiosk = true }).validateFor(.safari),
+    );
+    try std.testing.expectError(
+        error.InvalidWindowSize,
+        (WindowControls{ .size = .{ .width = 0, .height = 720 } })
+            .validateFor(.chromium),
+    );
 }
 
 test "browser candidates and preference order cover every browser" {

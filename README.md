@@ -54,6 +54,8 @@ The current phase provides:
   public listening;
 - general OS URL opening and installed-browser discovery;
 - explicit browser launching with custom executable paths and argv;
+- per-window kiosk mode, initial size, and initial position for supported
+  explicitly selected browsers;
 - per-window browser child identifiers and deterministic process cleanup;
 - default-browser launching and deterministic shutdown.
 
@@ -134,6 +136,15 @@ The returned `BrowserProcessId`, also available through
 `Window.browserProcessId()`, is a PID on POSIX and a process handle on
 Windows. Each window retains at most one launched child; launching another
 replaces it, and `Running.stop()` kills and reaps every retained child.
+
+Set `.kiosk`, `.size`, or `.position` in `App.WindowOptions` to control the
+initial browser window. These options require `Window.openWithBrowser()`:
+`Window.open()` returns `error.ExplicitBrowserRequired` instead of ignoring
+them. Chromium-family browsers support all three controls. Firefox supports
+kiosk mode and size but returns `error.UnsupportedBrowserControl` for
+position; Safari returns the same error for any of these controls. Width and
+height must be non-zero, while positions may be negative for secondary
+displays.
 
 Serve a directory by setting
 `.content = .{ .directory = "path/to/public" }`. The path is opened when the

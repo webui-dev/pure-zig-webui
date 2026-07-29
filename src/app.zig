@@ -65,6 +65,8 @@ pub const Request = Linsang.Request;
 pub const Response = Linsang.Response;
 pub const BrowserLaunchOptions = browser.LaunchOptions;
 pub const BrowserProcessId = browser.ProcessId;
+pub const WindowSize = browser.WindowSize;
+pub const WindowPosition = browser.WindowPosition;
 
 pub const EventKind = enum {
     connected,
@@ -468,6 +470,7 @@ const WindowState = struct {
     event_binding: ?EventBinding = null,
     logger: ?Logger,
     logger_user_data: ?*anyopaque,
+    browser_controls: browser.WindowControls,
     mutex: std.Io.Mutex = .init,
     event_mutex: std.Io.Mutex = .init,
     event_mode: std.atomic.Value(EventMode),
@@ -1545,6 +1548,8 @@ pub const Window = struct {
     pub fn open(self: Window, io: std.Io, running: *const Running) !void {
         const page_url = try self.url(running, self.state.gpa);
         defer self.state.gpa.free(page_url);
+        if (self.state.browser_controls.isActive())
+            return error.ExplicitBrowserRequired;
         try browser.openUrl(self.state.gpa, io, page_url);
     }
 
@@ -1564,6 +1569,7 @@ pub const Window = struct {
             running.inner.io,
             page_url,
             options,
+            self.state.browser_controls,
         );
         return running.app.manageBrowser(
             running.inner.io,
@@ -1787,6 +1793,13 @@ pub const App = struct {
 
     pub const WindowOptions = struct {
         content: ?Content = null,
+        /// Launch the selected browser in kiosk mode.
+        kiosk: bool = false,
+        /// Initial outer browser-window size in pixels.
+        size: ?WindowSize = null,
+        /// Initial browser-window position in pixels. Negative coordinates
+        /// support displays to the left or above the primary display.
+        position: ?WindowPosition = null,
         /// One client by default; values above one explicitly enable
         /// bounded multi-client mode.
         max_clients: usize = 1,
@@ -1820,6 +1833,12 @@ pub const App = struct {
     pub fn createWindow(self: *App, options: WindowOptions) !Window {
         if (self.started) return error.AlreadyStarted;
         try self.options.limits.validate();
+        const browser_controls: browser.WindowControls = .{
+            .kiosk = options.kiosk,
+            .size = options.size,
+            .position = options.position,
+        };
+        try browser_controls.validate();
         if (options.max_clients == 0) return error.InvalidClientLimit;
         if (options.max_pending_evals == 0 or
             options.max_pending_evals > std.math.maxInt(u16))
@@ -1856,6 +1875,7 @@ pub const App = struct {
             .event_mode = .init(options.event_mode),
             .logger = self.options.logger,
             .logger_user_data = self.options.logger_user_data,
+            .browser_controls = browser_controls,
         };
         try self.windows.append(self.gpa, state);
         return .{ .state = state };
@@ -3277,7 +3297,7 @@ fn readTestFileEventually(
     return error.Timeout;
 }
 
-test "selected browser launch owns argv process and shutdown" {
+test "selected browser launch applies window controls and owns process" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
@@ -3318,11 +3338,28 @@ test "selected browser launch owns argv process and shutdown" {
 
     var app = App.init(gpa, .{});
     defer app.deinit();
+    try std.testing.expectError(
+        error.InvalidWindowSize,
+        app.createWindow(.{
+            .content = .{ .html = "invalid size" },
+            .size = .{ .width = 0, .height = 720 },
+        }),
+    );
     const window = try app.createWindow(.{
         .content = .{ .html = "managed browser" },
+        .kiosk = true,
+        .size = .{ .width = 1280, .height = 720 },
+    });
+    const positioned_window = try app.createWindow(.{
+        .content = .{ .html = "positioned browser" },
+        .position = .{ .x = -200, .y = 40 },
     });
     var running = try app.start(io);
     defer running.stop() catch {};
+    try std.testing.expectError(
+        error.ExplicitBrowserRequired,
+        window.open(io, &running),
+    );
     try std.testing.expectError(
         error.InvalidBrowserExecutable,
         window.openWithBrowser(&running, .{
@@ -3351,7 +3388,8 @@ test "selected browser launch owns argv process and shutdown" {
     defer gpa.free(first_argv);
     const expected_first = try std.fmt.allocPrint(
         gpa,
-        "--private-window\n-new-window\n{s}\n",
+        "--private-window\n-kiosk\n-width\n1280\n-height\n720\n" ++
+            "-new-window\n{s}\n",
         .{page_url},
     );
     defer gpa.free(expected_first);
@@ -3376,11 +3414,52 @@ test "selected browser launch owns argv process and shutdown" {
     defer gpa.free(second_argv);
     const expected_second = try std.fmt.allocPrint(
         gpa,
-        "--guest\n--app={s}\n",
+        "--guest\n--kiosk\n--window-size=1280,720\n--app={s}\n",
         .{page_url},
     );
     defer gpa.free(expected_second);
     try std.testing.expectEqualStrings(expected_second, second_argv);
+
+    try std.testing.expectError(
+        error.UnsupportedBrowserControl,
+        positioned_window.openWithBrowser(&running, .{
+            .browser = .firefox,
+            .executable = executable,
+        }),
+    );
+    try std.testing.expectEqual(
+        null,
+        try positioned_window.browserProcessId(&running),
+    );
+
+    const third_capture = try std.fmt.allocPrint(
+        gpa,
+        ".zig-cache/tmp/{s}/third-argv",
+        .{tmp.sub_path},
+    );
+    defer gpa.free(third_capture);
+    const positioned_url = try positioned_window.url(&running, gpa);
+    defer gpa.free(positioned_url);
+    _ = try positioned_window.openWithBrowser(&running, .{
+        .browser = .chromium,
+        .executable = executable,
+        .arguments = &.{third_capture},
+    });
+    const third_argv = try readTestFileEventually(
+        tmp.dir,
+        io,
+        gpa,
+        "third-argv",
+    );
+    defer gpa.free(third_argv);
+    const expected_third = try std.fmt.allocPrint(
+        gpa,
+        "--window-position=-200,40\n--app={s}\n",
+        .{positioned_url},
+    );
+    defer gpa.free(expected_third);
+    try std.testing.expectEqualStrings(expected_third, third_argv);
+    try std.testing.expectEqual(@as(usize, 2), app.managed_browsers.items.len);
 
     try running.stop();
     try std.testing.expectEqual(@as(usize, 0), app.managed_browsers.items.len);
