@@ -480,6 +480,7 @@ Keep at least one direct test for every non-trivial parser. The final gate is:
 
 ```text
 zig build test
+zig build test-bridge
 zig build -Dtarget=x86_64-linux
 zig build -Dtarget=aarch64-linux
 zig build -Dtarget=x86_64-windows
@@ -489,6 +490,8 @@ zig build -Dtarget=aarch64-macos
 
 - Protocol tests cover every command, truncated packets, invalid lengths,
   invalid tokens, and unknown commands.
+- `zig build test` skips browser bridge tests with a warning when Node is
+  unavailable; `zig build test-bridge` requires Node for CI and release gates.
 - Node's built-in test runner covers browser bridge command behavior without
   npm dependencies.
 - Integration tests cover HTTP content, WebSocket handshake, JavaScript-to-Zig,

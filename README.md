@@ -108,10 +108,12 @@ zig build
 zig build run
 ```
 
-`zig build test` uses Node's built-in test runner for the browser bridge.
-Building and using the library does not require Node or npm. `Window.evalAll`
-returns owned results; call `deinit` on them after consuming every per-client
-outcome.
+`zig build test` uses Node's built-in test runner for the browser bridge when
+Node is available and otherwise skips those tests with a warning. Building and
+using the library does not require Node or npm. CI and release validation
+should run `zig build test-bridge`, which fails when Node is unavailable.
+`Window.evalAll` returns owned results; call `deinit` on them after consuming
+every per-client outcome.
 
 `Window.open()` launches the browser and returns immediately. Call
 `Window.waitForConnection(io, timeout)` when startup must wait for a browser;
