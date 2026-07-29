@@ -209,6 +209,22 @@ fn validateRunScript(script: []const u8, max_size: usize) !void {
     if (!std.unicode.utf8ValidateSlice(script)) return error.InvalidUtf8;
 }
 
+fn resizeScript(buffer: []u8, size: WindowSize) ![]const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "window.resizeTo({d},{d});",
+        .{ size.width, size.height },
+    );
+}
+
+fn moveScript(buffer: []u8, position: WindowPosition) ![]const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "window.moveTo({d},{d});",
+        .{ position.x, position.y },
+    );
+}
+
 fn appendRawPayload(
     payload: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
@@ -471,6 +487,7 @@ const WindowState = struct {
     logger: ?Logger,
     logger_user_data: ?*anyopaque,
     browser_controls: browser.WindowControls,
+    controls_mutex: std.Io.Mutex = .init,
     mutex: std.Io.Mutex = .init,
     event_mutex: std.Io.Mutex = .init,
     event_mode: std.atomic.Value(EventMode),
@@ -617,6 +634,72 @@ const WindowState = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return self.clients.items.len != 0;
+    }
+
+    fn browserControls(
+        self: *WindowState,
+        io: std.Io,
+    ) browser.WindowControls {
+        self.controls_mutex.lockUncancelable(io);
+        defer self.controls_mutex.unlock(io);
+        return self.browser_controls;
+    }
+
+    fn setSize(
+        self: *WindowState,
+        io: std.Io,
+        size: WindowSize,
+    ) !usize {
+        try (browser.WindowControls{ .size = size }).validate();
+        var buffer: [64]u8 = undefined;
+        const script = try resizeScript(&buffer, size);
+
+        self.controls_mutex.lockUncancelable(io);
+        defer self.controls_mutex.unlock(io);
+        self.browser_controls.size = size;
+        return self.broadcast(io, .js_quick, script);
+    }
+
+    fn setPosition(
+        self: *WindowState,
+        io: std.Io,
+        position: WindowPosition,
+    ) !usize {
+        var buffer: [64]u8 = undefined;
+        const script = try moveScript(&buffer, position);
+
+        self.controls_mutex.lockUncancelable(io);
+        defer self.controls_mutex.unlock(io);
+        self.browser_controls.position = position;
+        return self.broadcast(io, .js_quick, script);
+    }
+
+    fn applyGeometry(
+        self: *WindowState,
+        connection: *Linsang.Connection,
+    ) !void {
+        self.controls_mutex.lockUncancelable(connection.io);
+        defer self.controls_mutex.unlock(connection.io);
+
+        var buffer: [64]u8 = undefined;
+        if (self.browser_controls.size) |size| {
+            const script = try resizeScript(&buffer, size);
+            if (script.len > self.limits.max_ws_message_size - protocol.header_len)
+                return error.MessageTooLarge;
+            try send(connection, self.gpa, .{
+                .token = self.token,
+                .command = .js_quick,
+            }, script);
+        }
+        if (self.browser_controls.position) |position| {
+            const script = try moveScript(&buffer, position);
+            if (script.len > self.limits.max_ws_message_size - protocol.header_len)
+                return error.MessageTooLarge;
+            try send(connection, self.gpa, .{
+                .token = self.token,
+                .command = .js_quick,
+            }, script);
+        }
     }
 
     fn authenticate(
@@ -1548,7 +1631,7 @@ pub const Window = struct {
     pub fn open(self: Window, io: std.Io, running: *const Running) !void {
         const page_url = try self.url(running, self.state.gpa);
         defer self.state.gpa.free(page_url);
-        if (self.state.browser_controls.isActive())
+        if (self.state.browserControls(io).isActive())
             return error.ExplicitBrowserRequired;
         try browser.openUrl(self.state.gpa, io, page_url);
     }
@@ -1564,12 +1647,13 @@ pub const Window = struct {
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
         const page_url = try self.url(running, self.state.gpa);
         defer self.state.gpa.free(page_url);
+        const controls = self.state.browserControls(running.inner.io);
         const child = try browser.launch(
             self.state.gpa,
             running.inner.io,
             page_url,
             options,
-            self.state.browser_controls,
+            controls,
         );
         return running.app.manageBrowser(
             running.inner.io,
@@ -1592,6 +1676,22 @@ pub const Window = struct {
     /// Return whether at least one browser client is connected.
     pub fn isShown(self: Window, io: std.Io) bool {
         return self.state.hasClients(io);
+    }
+
+    /// Persist a browser-window size and request it from connected clients.
+    /// The state remains updated if notification fails.
+    pub fn setSize(self: Window, io: std.Io, size: WindowSize) !usize {
+        return self.state.setSize(io, size);
+    }
+
+    /// Persist a browser-window position and request it from connected clients.
+    /// The state remains updated if notification fails.
+    pub fn setPosition(
+        self: Window,
+        io: std.Io,
+        position: WindowPosition,
+    ) !usize {
+        return self.state.setPosition(io, position);
     }
 
     /// Wait for at least one browser connection and return the first client.
@@ -2400,6 +2500,8 @@ fn onMessage(
                 .acq_rel,
             );
             std.debug.assert(previous > 0);
+            window.applyGeometry(connection) catch |err|
+                window.log(.warn, "Browser geometry update failed: {}", .{err});
             window.dispatchEvent(connection.io, .{
                 .kind = .connected,
                 .client = client,
@@ -3275,6 +3377,21 @@ fn authenticateTestClient(
     return std.mem.eql(u8, response.payload, &.{1});
 }
 
+fn expectQuickScript(
+    stream: std.Io.net.Stream,
+    io: std.Io,
+    response_buffer: []u8,
+    expected: []const u8,
+) !void {
+    const packet = try protocol.decode(try readServerFrame(
+        stream,
+        io,
+        response_buffer,
+    ));
+    try std.testing.expectEqual(protocol.Command.js_quick, packet.header.command);
+    try std.testing.expectEqualStrings(expected, packet.payload);
+}
+
 fn readTestFileEventually(
     dir: std.Io.Dir,
     io: std.Io,
@@ -3295,6 +3412,129 @@ fn readTestFileEventually(
         return data;
     }
     return error.Timeout;
+}
+
+test "runtime geometry persists for current and future clients" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{
+        .content = .{ .html = "runtime geometry" },
+        .max_clients = 2,
+    });
+    try std.testing.expectError(
+        error.InvalidWindowSize,
+        window.setSize(io, .{ .width = 0, .height = 720 }),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try window.setSize(io, .{ .width = 1024, .height = 768 }),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try window.setPosition(io, .{ .x = -50, .y = 20 }),
+    );
+
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    const first_stream = try connectTestWebSocket(
+        running.inner.address,
+        io,
+        &window.state.capability,
+    );
+    defer first_stream.close(io);
+    var first_response: [125]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(
+        first_stream,
+        io,
+        gpa,
+        window.state.token,
+        &window.state.capability,
+        &first_response,
+    ));
+    try expectQuickScript(
+        first_stream,
+        io,
+        &first_response,
+        "window.resizeTo(1024,768);",
+    );
+    try expectQuickScript(
+        first_stream,
+        io,
+        &first_response,
+        "window.moveTo(-50,20);",
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try window.setSize(io, .{ .width = 1280, .height = 720 }),
+    );
+    try expectQuickScript(
+        first_stream,
+        io,
+        &first_response,
+        "window.resizeTo(1280,720);",
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try window.setPosition(io, .{ .x = 10, .y = -30 }),
+    );
+    try expectQuickScript(
+        first_stream,
+        io,
+        &first_response,
+        "window.moveTo(10,-30);",
+    );
+
+    const second_stream = try connectTestWebSocket(
+        running.inner.address,
+        io,
+        &window.state.capability,
+    );
+    defer second_stream.close(io);
+    var second_response: [125]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(
+        second_stream,
+        io,
+        gpa,
+        window.state.token,
+        &window.state.capability,
+        &second_response,
+    ));
+    try expectQuickScript(
+        second_stream,
+        io,
+        &second_response,
+        "window.resizeTo(1280,720);",
+    );
+    try expectQuickScript(
+        second_stream,
+        io,
+        &second_response,
+        "window.moveTo(10,-30);",
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        try window.setSize(io, .{ .width = 1366, .height = 768 }),
+    );
+    for ([_]struct { std.Io.net.Stream, *[125]u8 }{
+        .{ first_stream, &first_response },
+        .{ second_stream, &second_response },
+    }) |target| {
+        try expectQuickScript(
+            target[0],
+            io,
+            target[1],
+            "window.resizeTo(1366,768);",
+        );
+    }
+
+    try running.stop();
 }
 
 test "selected browser launch applies window controls and owns process" {
@@ -3367,6 +3607,10 @@ test "selected browser launch applies window controls and owns process" {
             .executable = "",
         }),
     );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try window.setSize(io, .{ .width = 1366, .height = 768 }),
+    );
     const page_url = try window.url(&running, gpa);
     defer gpa.free(page_url);
 
@@ -3388,7 +3632,7 @@ test "selected browser launch applies window controls and owns process" {
     defer gpa.free(first_argv);
     const expected_first = try std.fmt.allocPrint(
         gpa,
-        "--private-window\n-kiosk\n-width\n1280\n-height\n720\n" ++
+        "--private-window\n-kiosk\n-width\n1366\n-height\n768\n" ++
             "-new-window\n{s}\n",
         .{page_url},
     );
@@ -3414,7 +3658,7 @@ test "selected browser launch applies window controls and owns process" {
     defer gpa.free(second_argv);
     const expected_second = try std.fmt.allocPrint(
         gpa,
-        "--guest\n--kiosk\n--window-size=1280,720\n--app={s}\n",
+        "--guest\n--kiosk\n--window-size=1366,768\n--app={s}\n",
         .{page_url},
     );
     defer gpa.free(expected_second);
@@ -3430,6 +3674,10 @@ test "selected browser launch applies window controls and owns process" {
     try std.testing.expectEqual(
         null,
         try positioned_window.browserProcessId(&running),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try positioned_window.setPosition(io, .{ .x = -300, .y = 50 }),
     );
 
     const third_capture = try std.fmt.allocPrint(
@@ -3454,7 +3702,7 @@ test "selected browser launch applies window controls and owns process" {
     defer gpa.free(third_argv);
     const expected_third = try std.fmt.allocPrint(
         gpa,
-        "--window-position=-200,40\n--app={s}\n",
+        "--window-position=-300,50\n--app={s}\n",
         .{positioned_url},
     );
     defer gpa.free(expected_third);

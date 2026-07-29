@@ -54,8 +54,7 @@ The current phase provides:
   public listening;
 - general OS URL opening and installed-browser discovery;
 - explicit browser launching with custom executable paths and argv;
-- per-window kiosk mode, initial size, and initial position for supported
-  explicitly selected browsers;
+- per-window kiosk mode plus persistent initial and runtime size and position;
 - per-window browser child identifiers and deterministic process cleanup;
 - default-browser launching and deterministic shutdown.
 
@@ -143,6 +142,13 @@ kiosk mode and size but returns `error.UnsupportedBrowserControl` for
 position; Safari returns the same error for any of these controls. Width and
 height must be non-zero, while positions may be negative for secondary
 displays.
+
+`Window.setSize(io, size)` and `Window.setPosition(io, position)` persist new
+geometry, return the number of currently notified clients, and replay the
+latest values to clients that connect later. Subsequent
+`Window.openWithBrowser()` calls use the updated values. Connected external
+browsers receive `window.resizeTo()` or `window.moveTo()` requests; browser
+security policy may ignore those requests for ordinary tabs.
 
 Serve a directory by setting
 `.content = .{ .directory = "path/to/public" }`. The path is opened when the

@@ -30,14 +30,14 @@ deleted.
 | Server and security | HTTP, WebSocket, TLS, loopback/public policy, capabilities, Origin checks, cookies, and protocol limits are implemented. |
 | Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, and multiple clients are implemented. |
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, logging, and deterministic shutdown are implemented. |
-| Browser integration | Default URL opening, browser discovery, explicit browser selection, custom executables and argv, initial kiosk/size/position controls, direct child tracking, replacement, and shutdown cleanup are implemented. |
+| Browser integration | Default URL opening, browser discovery, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk mode, direct child tracking, replacement, and shutdown cleanup are implemented. |
 | Current validation | `zig build test`, native builds, Windows x86_64 builds, macOS aarch64 builds, and Windows/macOS test-module cross-compilation pass. |
 
 Remaining work is limited to the remaining browser window controls and
-runtime geometry, managed profiles and proxies, a portable parent-process
-numeric ID, server-side runtimes, optional native WebViews and handles, and
-the final parity validation gates. The coverage ledger below is the
-authoritative method-level list.
+geometry, managed profiles and proxies, a portable parent-process numeric ID,
+server-side runtimes, optional native WebViews and handles, and the final
+parity validation gates. The coverage ledger below is the authoritative
+method-level list.
 
 ## Original Baseline
 
@@ -323,7 +323,6 @@ implementations.
 | Upstream API | Current gap |
 |---|---|
 | `webui_set_kiosk()` | `App.WindowOptions.kiosk` generates an explicit Chromium-family or Firefox kiosk argument. Typed controls require `Window.openWithBrowser()` and return an error instead of being ignored. |
-| `webui_set_size()`, `webui_set_position()` | `App.WindowOptions.size` and `.position` implement initial window geometry. Chromium-family browsers support both; Firefox supports size but reports position as unsupported; Safari reports both as unsupported. Runtime geometry updates remain unimplemented. |
 | `webui_focus()`, `webui_minimize()`, `webui_maximize()`, `webui_set_hide()` | Browser window lifecycle controls are not implemented. |
 | `webui_set_resizable()`, `webui_set_minimum_size()`, `webui_set_center()` | These browser window geometry controls are not implemented. |
 | `webui_set_frameless()`, `webui_set_transparent()` | Frameless and transparent browser window modes are not implemented. |
@@ -354,6 +353,7 @@ not implementation gaps:
 | `webui_show()`, `webui_start_server()`, `webui_get_url()` | Initial `Content`, runtime `Window.setContent()`, `App.start()`, `Window.open()`, and `Window.url()`. |
 | `webui_show_client()` | `Client.show()` replaces the window content and navigates only the selected client. |
 | `webui_is_shown()` | `Window.isShown()` reports whether the window has at least one connected browser client. |
+| `webui_set_size()`, `webui_set_position()` | `App.WindowOptions.size` and `.position` set initial geometry. `Window.setSize()` and `Window.setPosition()` persist updates, notify connected clients, replay the latest geometry to later clients, and affect subsequent explicit browser launches. |
 | `webui_open_url()` | `openUrl()` safely passes a non-empty URL as one argument to the platform default opener. |
 | `webui_get_best_browser()`, `webui_browser_exist()` | `bestBrowser()` and `browserExists()` discover registered or executable browser candidates through the public `Browser` enum. |
 | `webui_show_browser()`, `webui_set_browser_folder()`, `webui_set_custom_parameters()` | `Window.openWithBrowser()` accepts a `BrowserLaunchOptions` value with an explicit browser, optional full executable path, and additional argv. |
@@ -435,7 +435,8 @@ child tracking methods in the ledger.
 ### Browser window controls
 
 - Initial kiosk, size, and position options generate direct browser argv with
-  explicit validation and unsupported-browser errors.
+  explicit validation and unsupported-browser errors. Runtime size and
+  position persist and use the existing quick-script protocol.
 - Implement focus, minimize, maximize, hidden, resizable, remaining geometry,
   frameless, transparent, and high-contrast controls where the selected
   browser and platform support them.
@@ -524,6 +525,6 @@ zig build -Dtarget=aarch64-macos
 
 Continue capability parity:
 
-1. Add focus, minimize, maximize, hidden, resizable, minimum-size, center, and
-   runtime size/position behavior.
+1. Add focus, minimize, maximize, hidden, resizable, minimum-size, and center
+   behavior.
 2. Add managed browser profiles and proxy configuration.
