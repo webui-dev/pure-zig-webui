@@ -24,11 +24,9 @@ fn hello(call: *webui.Call, _: ?*anyopaque) !void {
     ));
 }
 
-pub fn main() !void {
-    const gpa = std.heap.page_allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
-    defer threaded.deinit();
-    const io = threaded.io();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
 
     var app = webui.App.init(gpa, .{});
     defer app.deinit();
