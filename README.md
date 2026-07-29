@@ -1,5 +1,9 @@
 # zig-webui
 
+> [!WARNING]
+> This is an experimental project under active development and is not suitable
+> for production use.
+
 zig-webui is being rebuilt as a pure Zig WebUI implementation. The core no
 longer compiles or links the upstream WebUI C library or CivetWeb.
 [Linsang](https://github.com/jinzhongjia/Linsang) provides HTTP and WebSocket
