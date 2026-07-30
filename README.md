@@ -57,6 +57,7 @@ The current phase provides:
 - per-window kiosk mode plus persistent initial and runtime size and position;
 - per-window browser profile directories and Chromium-family proxy rules;
 - per-window browser child identifiers and deterministic process cleanup;
+- current backend process ID through `parentProcessId()`;
 - default-browser launching and deterministic shutdown.
 
 ```zig
@@ -134,6 +135,11 @@ The returned `BrowserProcessId`, also available through
 `Window.browserProcessId()`, is a PID on POSIX and a process handle on
 Windows. Each window retains at most one launched child; launching another
 replaces it, and `Running.stop()` kills and reaps every retained child.
+
+`parentProcessId()` returns the numeric ID of the current Zig backend process,
+which is the parent of browsers launched directly by this package. It is
+process-wide and does not require a `Window`. Targets without a supported
+process-ID API return `error.UnsupportedPlatform`.
 
 Set `.kiosk`, `.size`, or `.position` in `App.WindowOptions` to control the
 initial browser window. These options require `Window.openWithBrowser()`:

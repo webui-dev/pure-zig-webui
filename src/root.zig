@@ -28,6 +28,7 @@ pub const BrowserLaunchOptions = @import("browser.zig").LaunchOptions;
 pub const BrowserProcessId = @import("browser.zig").ProcessId;
 pub const WindowSize = @import("browser.zig").WindowSize;
 pub const WindowPosition = @import("browser.zig").WindowPosition;
+pub const parentProcessId = @import("browser.zig").parentProcessId;
 pub const openUrl = @import("browser.zig").openUrl;
 pub const browserExists = @import("browser.zig").browserExists;
 pub const bestBrowser = @import("browser.zig").bestBrowser;

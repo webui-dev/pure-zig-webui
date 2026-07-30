@@ -93,6 +93,20 @@ pub const WindowControls = struct {
 /// PID on POSIX and a process handle on Windows.
 pub const ProcessId = std.process.Child.Id;
 
+/// Return the numeric ID of the current backend process, which is the parent
+/// of browsers launched directly by this package.
+pub fn parentProcessId() !u32 {
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.GetCurrentProcessId(),
+        .linux => @intCast(std.os.linux.getpid()),
+        .plan9 => std.os.plan9.getpid(),
+        else => if (builtin.link_libc)
+            @intCast(std.c.getpid())
+        else
+            error.UnsupportedPlatform,
+    };
+}
+
 /// Open a non-empty URL with the operating system's default handler.
 pub fn openUrl(
     gpa: std.mem.Allocator,
@@ -519,6 +533,16 @@ test "window controls validate browser support" {
         error.InvalidUtf8,
         (WindowControls{ .proxy_server = invalid_utf8 }).validate(),
     );
+}
+
+test "parent process ID identifies the backend process" {
+    const actual = try parentProcessId();
+    try std.testing.expect(actual != 0);
+    if (builtin.os.tag == .linux)
+        try std.testing.expectEqual(
+            @as(u32, @intCast(std.os.linux.getpid())),
+            actual,
+        );
 }
 
 test "browser candidates and preference order cover every browser" {
