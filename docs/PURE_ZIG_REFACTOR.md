@@ -30,11 +30,11 @@ deleted.
 | Server and security | HTTP, WebSocket, TLS, loopback/public policy, capabilities, Origin checks, cookies, and protocol limits are implemented. |
 | Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, and multiple clients are implemented. |
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, logging, and deterministic shutdown are implemented. |
-| Browser integration | Default URL opening, browser discovery, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk mode, direct child tracking, replacement, and shutdown cleanup are implemented. |
+| Browser integration | Default URL opening, browser discovery, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk mode, caller-managed profile directories, Chromium-family proxy rules, direct child tracking, replacement, and shutdown cleanup are implemented. |
 | Current validation | `zig build test`, native builds, Windows x86_64 builds, macOS aarch64 builds, and Windows/macOS test-module cross-compilation pass. |
 
 Remaining work is limited to the remaining browser window controls and
-geometry, managed profiles and proxies, a portable parent-process numeric ID,
+geometry, managed profile deletion, a portable parent-process numeric ID,
 server-side runtimes, optional native WebViews and handles, and the final
 parity validation gates. The coverage ledger below is the authoritative
 method-level list.
@@ -91,7 +91,7 @@ races, and synchronous access to the actual `port = 0` address through
 - WebView2, GTK/WebKit, or WKWebView.
 - Deno, Node, or Bun server-side runtimes.
 - Browser window controls, geometry, and high-contrast control.
-- Browser profiles and proxy configuration.
+- Managed browser profile deletion.
 - A portable parent-process numeric ID accessor.
 
 These do not block the external-browser core, but they are required before
@@ -327,8 +327,7 @@ implementations.
 | `webui_set_resizable()`, `webui_set_minimum_size()`, `webui_set_center()` | These browser window geometry controls are not implemented. |
 | `webui_set_frameless()`, `webui_set_transparent()` | Frameless and transparent browser window modes are not implemented. |
 | `webui_set_high_contrast()`, `webui_is_high_contrast()` | High-contrast mode control and detection are not implemented. |
-| `webui_set_profile()`, `webui_delete_profile()`, `webui_delete_all_profiles()` | Managed browser profiles are not implemented. |
-| `webui_set_proxy()` | Browser proxy configuration is not implemented. |
+| `webui_delete_profile()`, `webui_delete_all_profiles()` | Caller-managed profile directories are supported, but automatic profile deletion is not implemented. |
 | `webui_get_parent_process_id()` | A portable parent-process numeric ID accessor is not implemented. |
 | `webui_set_runtime()` | Deno, Node.js, and Bun execution for served files is not implemented. |
 | `webui_show_wv()`, `webui_set_close_handler_wv()`, `webui_get_hwnd()`, `webui_win32_get_hwnd()` | Native WebView hosting and native window handles are outside the pure Zig browser core. |
@@ -361,6 +360,8 @@ not implementation gaps:
 | `webui_set_default_root_folder()` | `App.Options.default_directory` supplies directory content to windows created without explicit content. |
 | `webui_set_config(folder_monitor)` | `App.Options.folder_monitor_interval` enables portable recursive directory polling and reloads the affected window's connected clients. |
 | `webui_set_icon()`, `webui_set_icon_file()` | `Window.setIcon()` copies inline data and MIME type; `Window.setIconFile()` loads a supported image file as the window favicon. |
+| `webui_set_profile()` | `App.WindowOptions.profile_directory` is copied and mapped to Chromium-family `--user-data-dir` or Firefox `--profile`. The caller owns directory lifecycle. |
+| `webui_set_proxy()` | `App.WindowOptions.proxy_server` is copied and passed as one Chromium-family `--proxy-server` argument. Unsupported browsers return an explicit error. |
 | `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. |
 | `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `Running.stop()`, and `App.deinit()`. |
 | `webui_set_context()`, `webui_get_context()` | Binding and event-handler `user_data`. |
@@ -437,12 +438,14 @@ child tracking methods in the ledger.
 - Initial kiosk, size, and position options generate direct browser argv with
   explicit validation and unsupported-browser errors. Runtime size and
   position persist and use the existing quick-script protocol.
+- Profile directories and proxy rules are copied into window state and passed
+  as individual browser argv entries. Chromium-family browsers support both;
+  Firefox supports profiles; Safari supports neither.
 - Implement focus, minimize, maximize, hidden, resizable, remaining geometry,
   frameless, transparent, and high-contrast controls where the selected
   browser and platform support them.
-- Implement managed profiles and proxy configuration.
-
-This completes the window control, profile, and proxy methods in the ledger.
+- Implement managed profile deletion only if zig-webui takes ownership of
+  profile lifecycle.
 
 ### File monitoring (complete)
 
@@ -527,4 +530,5 @@ Continue capability parity:
 
 1. Add focus, minimize, maximize, hidden, resizable, minimum-size, and center
    behavior.
-2. Add managed browser profiles and proxy configuration.
+2. Decide whether to add managed browser profile deletion or keep profile
+   lifecycle caller-owned.

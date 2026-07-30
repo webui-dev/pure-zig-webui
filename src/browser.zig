@@ -37,26 +37,56 @@ pub const WindowControls = struct {
     kiosk: bool = false,
     size: ?WindowSize = null,
     position: ?WindowPosition = null,
+    profile_directory: ?[]const u8 = null,
+    proxy_server: ?[]const u8 = null,
 
     pub fn validate(self: WindowControls) !void {
         if (self.size) |size|
             if (size.width == 0 or size.height == 0)
                 return error.InvalidWindowSize;
+        if (self.profile_directory) |directory| {
+            if (directory.len == 0 or
+                std.mem.indexOfScalar(u8, directory, 0) != null)
+            {
+                return error.InvalidBrowserProfile;
+            }
+            if (!std.unicode.utf8ValidateSlice(directory))
+                return error.InvalidUtf8;
+        }
+        if (self.proxy_server) |proxy| {
+            if (proxy.len == 0 or std.mem.indexOfScalar(u8, proxy, 0) != null)
+                return error.InvalidBrowserProxy;
+            if (!std.unicode.utf8ValidateSlice(proxy))
+                return error.InvalidUtf8;
+        }
     }
 
     pub fn validateFor(self: WindowControls, selected: Browser) !void {
         try self.validate();
         switch (selected) {
-            .safari => if (self.isActive())
-                return error.UnsupportedBrowserControl,
-            .firefox => if (self.position != null)
-                return error.UnsupportedBrowserControl,
+            .safari => {
+                if (self.profile_directory != null)
+                    return error.UnsupportedBrowserProfile;
+                if (self.proxy_server != null)
+                    return error.UnsupportedBrowserProxy;
+                if (self.isActive()) return error.UnsupportedBrowserControl;
+            },
+            .firefox => {
+                if (self.proxy_server != null)
+                    return error.UnsupportedBrowserProxy;
+                if (self.position != null)
+                    return error.UnsupportedBrowserControl;
+            },
             else => {},
         }
     }
 
     pub fn isActive(self: WindowControls) bool {
-        return self.kiosk or self.size != null or self.position != null;
+        return self.kiosk or
+            self.size != null or
+            self.position != null or
+            self.profile_directory != null or
+            self.proxy_server != null;
     }
 };
 
@@ -125,6 +155,29 @@ pub fn launch(
     defer argv.deinit(gpa);
     try argv.append(gpa, executable);
     try argv.appendSlice(gpa, options.arguments);
+    const profile_argument = if (controls.profile_directory) |directory|
+        switch (options.browser) {
+            .firefox, .safari => null,
+            else => try std.fmt.allocPrint(
+                gpa,
+                "--user-data-dir={s}",
+                .{directory},
+            ),
+        }
+    else
+        null;
+    defer if (profile_argument) |argument| gpa.free(argument);
+    if (controls.profile_directory) |directory| switch (options.browser) {
+        .firefox => try argv.appendSlice(gpa, &.{ "--profile", directory }),
+        .safari => unreachable,
+        else => try argv.append(gpa, profile_argument.?),
+    };
+    const proxy_argument = if (controls.proxy_server) |proxy|
+        try std.fmt.allocPrint(gpa, "--proxy-server={s}", .{proxy})
+    else
+        null;
+    defer if (proxy_argument) |argument| gpa.free(argument);
+    if (proxy_argument) |argument| try argv.append(gpa, argument);
     if (controls.kiosk) try argv.append(gpa, switch (options.browser) {
         .firefox => "-kiosk",
         else => "--kiosk",
@@ -410,10 +463,13 @@ test "window controls validate browser support" {
         .kiosk = true,
         .size = .{ .width = 1280, .height = 720 },
         .position = .{ .x = -200, .y = 40 },
+        .profile_directory = "profiles/main",
+        .proxy_server = "socks5://127.0.0.1:1080",
     }).validateFor(.chromium);
     try (WindowControls{
         .kiosk = true,
         .size = .{ .width = 1280, .height = 720 },
+        .profile_directory = "profiles/firefox",
     }).validateFor(.firefox);
     try (WindowControls{}).validateFor(.safari);
     try std.testing.expectError(
@@ -426,9 +482,42 @@ test "window controls validate browser support" {
         (WindowControls{ .kiosk = true }).validateFor(.safari),
     );
     try std.testing.expectError(
+        error.UnsupportedBrowserProfile,
+        (WindowControls{ .profile_directory = "profiles/safari" })
+            .validateFor(.safari),
+    );
+    try std.testing.expectError(
+        error.UnsupportedBrowserProxy,
+        (WindowControls{ .proxy_server = "http://127.0.0.1:8080" })
+            .validateFor(.firefox),
+    );
+    try std.testing.expectError(
+        error.UnsupportedBrowserProxy,
+        (WindowControls{ .proxy_server = "http://127.0.0.1:8080" })
+            .validateFor(.safari),
+    );
+    try std.testing.expectError(
         error.InvalidWindowSize,
         (WindowControls{ .size = .{ .width = 0, .height = 720 } })
             .validateFor(.chromium),
+    );
+    try std.testing.expectError(
+        error.InvalidBrowserProfile,
+        (WindowControls{ .profile_directory = "" }).validate(),
+    );
+    try std.testing.expectError(
+        error.InvalidBrowserProxy,
+        (WindowControls{ .proxy_server = "http://host\x00:8080" })
+            .validate(),
+    );
+    const invalid_utf8 = &[_]u8{0xff};
+    try std.testing.expectError(
+        error.InvalidUtf8,
+        (WindowControls{ .profile_directory = invalid_utf8 }).validate(),
+    );
+    try std.testing.expectError(
+        error.InvalidUtf8,
+        (WindowControls{ .proxy_server = invalid_utf8 }).validate(),
     );
 }
 

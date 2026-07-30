@@ -55,6 +55,7 @@ The current phase provides:
 - general OS URL opening and installed-browser discovery;
 - explicit browser launching with custom executable paths and argv;
 - per-window kiosk mode plus persistent initial and runtime size and position;
+- per-window browser profile directories and Chromium-family proxy rules;
 - per-window browser child identifiers and deterministic process cleanup;
 - default-browser launching and deterministic shutdown.
 
@@ -142,6 +143,17 @@ kiosk mode and size but returns `error.UnsupportedBrowserControl` for
 position; Safari returns the same error for any of these controls. Width and
 height must be non-zero, while positions may be negative for secondary
 displays.
+
+Set `.profile_directory` in `App.WindowOptions` to launch Chromium-family
+browsers with `--user-data-dir` or Firefox with `--profile`. Set
+`.proxy_server` for Chromium-family browsers to pass one `--proxy-server`
+argument without invoking a shell. The app copies both strings. Profile
+directories remain caller-managed and are never deleted by zig-webui.
+Firefox returns `error.UnsupportedBrowserProxy` for proxy configuration;
+Safari returns `error.UnsupportedBrowserProfile` or
+`error.UnsupportedBrowserProxy` instead of silently ignoring either option.
+Like the other initial browser controls, these options require
+`Window.openWithBrowser()`.
 
 `Window.setSize(io, size)` and `Window.setPosition(io, position)` persist new
 geometry, return the number of currently notified clients, and replay the

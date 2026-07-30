@@ -511,6 +511,10 @@ const WindowState = struct {
         self.bindings.deinit(self.gpa);
         if (self.icon) |*icon| icon.deinit(self.gpa);
         self.content.deinit(self.gpa);
+        if (self.browser_controls.profile_directory) |directory|
+            self.gpa.free(directory);
+        if (self.browser_controls.proxy_server) |proxy|
+            self.gpa.free(proxy);
         self.gpa.destroy(self);
     }
 
@@ -1900,6 +1904,10 @@ pub const App = struct {
         /// Initial browser-window position in pixels. Negative coordinates
         /// support displays to the left or above the primary display.
         position: ?WindowPosition = null,
+        /// Caller-managed browser profile directory, copied by the app.
+        profile_directory: ?[]const u8 = null,
+        /// Browser proxy rule, copied by the app and passed as one argument.
+        proxy_server: ?[]const u8 = null,
         /// One client by default; values above one explicitly enable
         /// bounded multi-client mode.
         max_clients: usize = 1,
@@ -1933,10 +1941,12 @@ pub const App = struct {
     pub fn createWindow(self: *App, options: WindowOptions) !Window {
         if (self.started) return error.AlreadyStarted;
         try self.options.limits.validate();
-        const browser_controls: browser.WindowControls = .{
+        var browser_controls: browser.WindowControls = .{
             .kiosk = options.kiosk,
             .size = options.size,
             .position = options.position,
+            .profile_directory = options.profile_directory,
+            .proxy_server = options.proxy_server,
         };
         try browser_controls.validate();
         if (options.max_clients == 0) return error.InvalidClientLimit;
@@ -1964,6 +1974,18 @@ pub const App = struct {
         errdefer self.gpa.destroy(state);
         var content = try StoredContent.init(self.gpa, selected_content);
         errdefer content.deinit(self.gpa);
+        browser_controls.profile_directory = if (options.profile_directory) |directory|
+            try self.gpa.dupe(u8, directory)
+        else
+            null;
+        errdefer if (browser_controls.profile_directory) |directory|
+            self.gpa.free(directory);
+        browser_controls.proxy_server = if (options.proxy_server) |proxy|
+            try self.gpa.dupe(u8, proxy)
+        else
+            null;
+        errdefer if (browser_controls.proxy_server) |proxy|
+            self.gpa.free(proxy);
         state.* = .{
             .gpa = self.gpa,
             .content = content,
@@ -3575,6 +3597,14 @@ test "selected browser launch applies window controls and owns process" {
         .{tmp.sub_path},
     );
     defer gpa.free(second_capture);
+    const configured_profile = try std.fmt.allocPrint(
+        gpa,
+        ".zig-cache/tmp/{s}/profile with space",
+        .{tmp.sub_path},
+    );
+    defer gpa.free(configured_profile);
+    const expected_profile = try gpa.dupe(u8, configured_profile);
+    defer gpa.free(expected_profile);
 
     var app = App.init(gpa, .{});
     defer app.deinit();
@@ -3585,14 +3615,31 @@ test "selected browser launch applies window controls and owns process" {
             .size = .{ .width = 0, .height = 720 },
         }),
     );
+    try std.testing.expectError(
+        error.InvalidBrowserProfile,
+        app.createWindow(.{
+            .content = .{ .html = "invalid profile" },
+            .profile_directory = "",
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidBrowserProxy,
+        app.createWindow(.{
+            .content = .{ .html = "invalid proxy" },
+            .proxy_server = "http://host\x00:8080",
+        }),
+    );
     const window = try app.createWindow(.{
         .content = .{ .html = "managed browser" },
         .kiosk = true,
         .size = .{ .width = 1280, .height = 720 },
+        .profile_directory = configured_profile,
     });
+    @memset(configured_profile, 'x');
     const positioned_window = try app.createWindow(.{
         .content = .{ .html = "positioned browser" },
         .position = .{ .x = -200, .y = 40 },
+        .proxy_server = "socks5://127.0.0.1:1080",
     });
     var running = try app.start(io);
     defer running.stop() catch {};
@@ -3632,9 +3679,10 @@ test "selected browser launch applies window controls and owns process" {
     defer gpa.free(first_argv);
     const expected_first = try std.fmt.allocPrint(
         gpa,
-        "--private-window\n-kiosk\n-width\n1366\n-height\n768\n" ++
+        "--private-window\n--profile\n{s}\n-kiosk\n" ++
+            "-width\n1366\n-height\n768\n" ++
             "-new-window\n{s}\n",
-        .{page_url},
+        .{ expected_profile, page_url },
     );
     defer gpa.free(expected_first);
     try std.testing.expectEqualStrings(expected_first, first_argv);
@@ -3658,14 +3706,15 @@ test "selected browser launch applies window controls and owns process" {
     defer gpa.free(second_argv);
     const expected_second = try std.fmt.allocPrint(
         gpa,
-        "--guest\n--kiosk\n--window-size=1366,768\n--app={s}\n",
-        .{page_url},
+        "--guest\n--user-data-dir={s}\n--kiosk\n" ++
+            "--window-size=1366,768\n--app={s}\n",
+        .{ expected_profile, page_url },
     );
     defer gpa.free(expected_second);
     try std.testing.expectEqualStrings(expected_second, second_argv);
 
     try std.testing.expectError(
-        error.UnsupportedBrowserControl,
+        error.UnsupportedBrowserProxy,
         positioned_window.openWithBrowser(&running, .{
             .browser = .firefox,
             .executable = executable,
@@ -3702,7 +3751,8 @@ test "selected browser launch applies window controls and owns process" {
     defer gpa.free(third_argv);
     const expected_third = try std.fmt.allocPrint(
         gpa,
-        "--window-position=-300,50\n--app={s}\n",
+        "--proxy-server=socks5://127.0.0.1:1080\n" ++
+            "--window-position=-300,50\n--app={s}\n",
         .{positioned_url},
     );
     defer gpa.free(expected_third);
