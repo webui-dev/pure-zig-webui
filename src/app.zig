@@ -1899,6 +1899,8 @@ pub const App = struct {
         content: ?Content = null,
         /// Launch the selected browser in kiosk mode.
         kiosk: bool = false,
+        /// Allow browser-native forced colors for high-contrast themes.
+        high_contrast: bool = true,
         /// Initial outer browser-window size in pixels.
         size: ?WindowSize = null,
         /// Initial browser-window position in pixels. Negative coordinates
@@ -1943,6 +1945,7 @@ pub const App = struct {
         try self.options.limits.validate();
         var browser_controls: browser.WindowControls = .{
             .kiosk = options.kiosk,
+            .high_contrast = options.high_contrast,
             .size = options.size,
             .position = options.position,
             .profile_directory = options.profile_directory,
@@ -3638,6 +3641,7 @@ test "selected browser launch applies window controls and owns process" {
     @memset(configured_profile, 'x');
     const positioned_window = try app.createWindow(.{
         .content = .{ .html = "positioned browser" },
+        .high_contrast = false,
         .position = .{ .x = -200, .y = 40 },
         .proxy_server = "socks5://127.0.0.1:1080",
     });
@@ -3752,6 +3756,7 @@ test "selected browser launch applies window controls and owns process" {
     const expected_third = try std.fmt.allocPrint(
         gpa,
         "--proxy-server=socks5://127.0.0.1:1080\n" ++
+            "--disable-features=ForcedColors\n" ++
             "--window-position=-300,50\n--app={s}\n",
         .{positioned_url},
     );

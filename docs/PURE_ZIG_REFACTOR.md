@@ -28,9 +28,9 @@ deleted.
 | Area | Status |
 |---|---|
 | Server and security | HTTP, WebSocket, TLS, loopback/public policy, capabilities, Origin checks, cookies, and protocol limits are implemented. |
-| Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, and multiple clients are implemented. |
+| Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, browser-native high-contrast detection, and multiple clients are implemented. |
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, logging, and deterministic shutdown are implemented. |
-| Browser integration | Default URL opening, browser discovery, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk mode, caller-managed profile directories, Chromium-family proxy rules, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
+| Browser integration | Default URL opening, browser discovery, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk mode, Chromium forced-color control, caller-managed profile directories, Chromium-family proxy rules, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
 | Current validation | `zig build test`, native builds, Windows x86_64 builds, macOS aarch64 builds, and Windows/macOS test-module cross-compilation pass. |
 
 Remaining work is limited to the remaining browser window controls and
@@ -89,7 +89,7 @@ races, and synchronous access to the actual `port = 0` address through
 
 - WebView2, GTK/WebKit, or WKWebView.
 - Deno, Node, or Bun server-side runtimes.
-- Browser window controls, geometry, and high-contrast control.
+- Browser window controls and geometry.
 - Managed browser profile deletion.
 
 These do not block the external-browser core, but they are required before
@@ -324,7 +324,6 @@ implementations.
 | `webui_focus()`, `webui_minimize()`, `webui_maximize()`, `webui_set_hide()` | Browser window lifecycle controls are not implemented. |
 | `webui_set_resizable()`, `webui_set_minimum_size()`, `webui_set_center()` | These browser window geometry controls are not implemented. |
 | `webui_set_frameless()`, `webui_set_transparent()` | Frameless and transparent browser window modes are not implemented. |
-| `webui_set_high_contrast()`, `webui_is_high_contrast()` | High-contrast mode control and detection are not implemented. |
 | `webui_delete_profile()`, `webui_delete_all_profiles()` | Caller-managed profile directories are supported, but automatic profile deletion is not implemented. |
 | `webui_set_runtime()` | Deno, Node.js, and Bun execution for served files is not implemented. |
 | `webui_show_wv()`, `webui_set_close_handler_wv()`, `webui_get_hwnd()`, `webui_win32_get_hwnd()` | Native WebView hosting and native window handles are outside the pure Zig browser core. |
@@ -350,6 +349,7 @@ not implementation gaps:
 | `webui_show_client()` | `Client.show()` replaces the window content and navigates only the selected client. |
 | `webui_is_shown()` | `Window.isShown()` reports whether the window has at least one connected browser client. |
 | `webui_set_size()`, `webui_set_position()` | `App.WindowOptions.size` and `.position` set initial geometry. `Window.setSize()` and `Window.setPosition()` persist updates, notify connected clients, replay the latest geometry to later clients, and affect subsequent explicit browser launches. |
+| `webui_set_high_contrast()`, `webui_is_high_contrast()` | `App.WindowOptions.high_contrast` controls Chromium forced-color support with explicit unsupported-browser errors. Browser-side `webui.isHighContrast()` uses native forced-color and contrast media queries without external programs. |
 | `webui_open_url()` | `openUrl()` safely passes a non-empty URL as one argument to the platform default opener. |
 | `webui_get_best_browser()`, `webui_browser_exist()` | `bestBrowser()` and `browserExists()` discover registered or executable browser candidates through the public `Browser` enum. |
 | `webui_show_browser()`, `webui_set_browser_folder()`, `webui_set_custom_parameters()` | `Window.openWithBrowser()` accepts a `BrowserLaunchOptions` value with an explicit browser, optional full executable path, and additional argv. |
@@ -439,9 +439,11 @@ child tracking methods in the ledger.
 - Profile directories and proxy rules are copied into window state and passed
   as individual browser argv entries. Chromium-family browsers support both;
   Firefox supports profiles; Safari supports neither.
+- Chromium can explicitly disable forced-color support; the browser bridge
+  detects active high-contrast media preferences.
 - Implement focus, minimize, maximize, hidden, resizable, remaining geometry,
-  frameless, transparent, and high-contrast controls where the selected
-  browser and platform support them.
+  frameless, and transparent controls where the selected browser and platform
+  support them.
 - Implement managed profile deletion only if zig-webui takes ownership of
   profile lifecycle.
 

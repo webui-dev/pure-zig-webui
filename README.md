@@ -55,6 +55,8 @@ The current phase provides:
 - general OS URL opening and installed-browser discovery;
 - explicit browser launching with custom executable paths and argv;
 - per-window kiosk mode plus persistent initial and runtime size and position;
+- per-window Chromium forced-color control and browser-native high-contrast
+  detection;
 - per-window browser profile directories and Chromium-family proxy rules;
 - per-window browser child identifiers and deterministic process cleanup;
 - current backend process ID through `parentProcessId()`;
@@ -149,6 +151,14 @@ kiosk mode and size but returns `error.UnsupportedBrowserControl` for
 position; Safari returns the same error for any of these controls. Width and
 height must be non-zero, while positions may be negative for secondary
 displays.
+
+Set `.high_contrast = false` in `App.WindowOptions` to disable Chromium's
+forced-color feature for that window. Firefox and Safari return
+`error.UnsupportedBrowserHighContrast` instead of ignoring this setting.
+The browser-side `webui.isHighContrast()` detects active forced colors or a
+stronger contrast preference through native media queries and requires no
+external OS program. Disabling high-contrast support requires
+`Window.openWithBrowser()`.
 
 Set `.profile_directory` in `App.WindowOptions` to launch Chromium-family
 browsers with `--user-data-dir` or Firefox with `--profile`. Set

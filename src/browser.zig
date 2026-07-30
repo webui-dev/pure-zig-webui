@@ -35,6 +35,7 @@ pub const WindowPosition = struct {
 
 pub const WindowControls = struct {
     kiosk: bool = false,
+    high_contrast: bool = true,
     size: ?WindowSize = null,
     position: ?WindowPosition = null,
     profile_directory: ?[]const u8 = null,
@@ -69,11 +70,15 @@ pub const WindowControls = struct {
                     return error.UnsupportedBrowserProfile;
                 if (self.proxy_server != null)
                     return error.UnsupportedBrowserProxy;
+                if (!self.high_contrast)
+                    return error.UnsupportedBrowserHighContrast;
                 if (self.isActive()) return error.UnsupportedBrowserControl;
             },
             .firefox => {
                 if (self.proxy_server != null)
                     return error.UnsupportedBrowserProxy;
+                if (!self.high_contrast)
+                    return error.UnsupportedBrowserHighContrast;
                 if (self.position != null)
                     return error.UnsupportedBrowserControl;
             },
@@ -83,6 +88,7 @@ pub const WindowControls = struct {
 
     pub fn isActive(self: WindowControls) bool {
         return self.kiosk or
+            !self.high_contrast or
             self.size != null or
             self.position != null or
             self.profile_directory != null or
@@ -192,6 +198,8 @@ pub fn launch(
         null;
     defer if (proxy_argument) |argument| gpa.free(argument);
     if (proxy_argument) |argument| try argv.append(gpa, argument);
+    if (!controls.high_contrast)
+        try argv.append(gpa, "--disable-features=ForcedColors");
     if (controls.kiosk) try argv.append(gpa, switch (options.browser) {
         .firefox => "-kiosk",
         else => "--kiosk",
@@ -479,6 +487,7 @@ test "window controls validate browser support" {
         .position = .{ .x = -200, .y = 40 },
         .profile_directory = "profiles/main",
         .proxy_server = "socks5://127.0.0.1:1080",
+        .high_contrast = false,
     }).validateFor(.chromium);
     try (WindowControls{
         .kiosk = true,
@@ -509,6 +518,17 @@ test "window controls validate browser support" {
         error.UnsupportedBrowserProxy,
         (WindowControls{ .proxy_server = "http://127.0.0.1:8080" })
             .validateFor(.safari),
+    );
+    try std.testing.expectError(
+        error.UnsupportedBrowserHighContrast,
+        (WindowControls{ .high_contrast = false }).validateFor(.firefox),
+    );
+    try std.testing.expectError(
+        error.UnsupportedBrowserHighContrast,
+        (WindowControls{ .high_contrast = false }).validateFor(.safari),
+    );
+    try std.testing.expect(
+        (WindowControls{ .high_contrast = false }).isActive(),
     );
     try std.testing.expectError(
         error.InvalidWindowSize,
