@@ -35,6 +35,8 @@ pub const WindowPosition = struct {
 
 pub const WindowControls = struct {
     kiosk: bool = false,
+    /// Launch the browser without a visible window.
+    hide: bool = false,
     high_contrast: bool = true,
     size: ?WindowSize = null,
     position: ?WindowPosition = null,
@@ -88,6 +90,7 @@ pub const WindowControls = struct {
 
     pub fn isActive(self: WindowControls) bool {
         return self.kiosk or
+            self.hide or
             !self.high_contrast or
             self.size != null or
             self.position != null or
@@ -175,7 +178,17 @@ pub fn launch(
     defer argv.deinit(gpa);
     try argv.append(gpa, executable);
     try argv.appendSlice(gpa, options.arguments);
-    const profile_argument = if (controls.profile_directory) |directory|
+
+    // Chromium-family browsers reuse an already running instance unless they
+    // get their own profile, which makes every window argument below silently
+    // ineffective and leaves the launched process without a window.
+    const managed_profile = if (controls.profile_directory == null)
+        try managedProfileDirectory(gpa, options.browser)
+    else
+        null;
+    defer if (managed_profile) |directory| gpa.free(directory);
+    const profile = controls.profile_directory orelse managed_profile;
+    const profile_argument = if (profile) |directory|
         switch (options.browser) {
             .firefox, .safari => null,
             else => try std.fmt.allocPrint(
@@ -187,23 +200,44 @@ pub fn launch(
     else
         null;
     defer if (profile_argument) |argument| gpa.free(argument);
-    if (controls.profile_directory) |directory| switch (options.browser) {
+    if (profile) |directory| switch (options.browser) {
         .firefox => try argv.appendSlice(gpa, &.{ "--profile", directory }),
         .safari => unreachable,
         else => try argv.append(gpa, profile_argument.?),
     };
+
+    // Caller-supplied arguments replace the defaults instead of being merged
+    // with them, so an explicit argv is never contradicted.
+    const use_defaults = options.arguments.len == 0;
+    if (use_defaults) switch (options.browser) {
+        .firefox => try argv.append(gpa, "-purgecaches"),
+        .safari => {},
+        else => try argv.appendSlice(gpa, &chromium_defaults),
+    };
+
     const proxy_argument = if (controls.proxy_server) |proxy|
         try std.fmt.allocPrint(gpa, "--proxy-server={s}", .{proxy})
     else
         null;
     defer if (proxy_argument) |argument| gpa.free(argument);
-    if (proxy_argument) |argument| try argv.append(gpa, argument);
-    if (!controls.high_contrast)
-        try argv.append(gpa, "--disable-features=ForcedColors");
-    if (controls.kiosk) try argv.append(gpa, switch (options.browser) {
-        .firefox => "-kiosk",
-        else => "--kiosk",
-    });
+    if (proxy_argument) |argument|
+        try argv.append(gpa, argument)
+    else if (use_defaults and isChromium(options.browser))
+        try argv.append(gpa, "--no-proxy-server");
+
+    if (isChromium(options.browser))
+        if (disableFeatures(use_defaults, controls.high_contrast)) |argument|
+            try argv.append(gpa, argument);
+    if (controls.kiosk) switch (options.browser) {
+        .firefox => try argv.append(gpa, "-kiosk"),
+        .safari => unreachable,
+        else => try argv.appendSlice(gpa, &.{ "--chrome-frame", "--kiosk" }),
+    };
+    if (controls.hide) switch (options.browser) {
+        .firefox => try argv.append(gpa, "-headless"),
+        .safari => unreachable,
+        else => try argv.append(gpa, "--headless=new"),
+    };
     var size_buffer: [48]u8 = undefined;
     if (controls.size) |size| switch (options.browser) {
         .firefox => {
@@ -252,6 +286,86 @@ pub fn launch(
         .stdout = .ignore,
         .stderr = .ignore,
     });
+}
+
+/// Arguments applied to Chromium-family browsers when the caller does not
+/// supply an explicit argv. They keep the app window free of first-run
+/// interstitials, extensions, and background services.
+const chromium_defaults = [_][]const u8{
+    "--no-first-run",
+    "--safe-mode",
+    "--disable-extensions",
+    "--disable-background-mode",
+    "--disable-plugins",
+    "--disable-plugins-discovery",
+    "--disable-translate",
+    "--bwsi",
+    "--disable-sync",
+    "--disable-sync-preferences",
+    "--disable-component-update",
+    "--allow-insecure-localhost",
+    "--auto-accept-camera-and-microphone-capture",
+};
+
+fn isChromium(selected: Browser) bool {
+    return switch (selected) {
+        .firefox, .safari => false,
+        else => true,
+    };
+}
+
+/// Chromium keeps only the last `--disable-features` occurrence, so every
+/// disabled feature has to travel in one argument.
+fn disableFeatures(use_defaults: bool, high_contrast: bool) ?[]const u8 {
+    if (use_defaults) return if (high_contrast)
+        "--disable-features=Translate"
+    else
+        "--disable-features=Translate,ForcedColors";
+    return if (high_contrast) null else "--disable-features=ForcedColors";
+}
+
+fn managedProfileName(selected: Browser) ?[]const u8 {
+    return switch (selected) {
+        .chrome => "WebUIChromeProfile",
+        .edge => "WebUIEdgeProfile",
+        .epic => "WebUIEpicProfile",
+        .vivaldi => "WebUIVivaldiProfile",
+        .brave => "WebUIBraveProfile",
+        .yandex => "WebUIYandexProfile",
+        .opera => "WebUIOperaProfile",
+        .chromium => "WebUIChromiumProfile",
+        // Firefox profiles live in profiles.ini rather than a directory
+        // argument, and Safari has no profile support at all.
+        .firefox, .safari => null,
+    };
+}
+
+/// Temporary profile directory used when the caller does not manage one. The
+/// browser creates the directory on first use; returns null when no managed
+/// profile applies. Caller owns the returned memory.
+fn managedProfileDirectory(
+    gpa: std.mem.Allocator,
+    selected: Browser,
+) !?[]u8 {
+    const name = managedProfileName(selected) orelse return null;
+    return switch (builtin.os.tag) {
+        .windows => blk: {
+            const temp = (std.process.Environ{ .block = .global })
+                .getAlloc(gpa, "TEMP") catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return null,
+                };
+            defer gpa.free(temp);
+            break :blk try std.fmt.allocPrint(
+                gpa,
+                "{s}\\.WebUI\\{s}",
+                .{ temp, name },
+            );
+        },
+        // ponytail: /tmp is always writable on POSIX; read TMPDIR only if a
+        // sandboxed target turns out to need it.
+        else => try std.fmt.allocPrint(gpa, "/tmp/.WebUI/{s}", .{name}),
+    };
 }
 
 fn commandSucceeds(
@@ -490,10 +604,16 @@ test "window controls validate browser support" {
     }).validateFor(.chromium);
     try (WindowControls{
         .kiosk = true,
+        .hide = true,
         .size = .{ .width = 1280, .height = 720 },
         .profile_directory = "profiles/firefox",
     }).validateFor(.firefox);
     try (WindowControls{}).validateFor(.safari);
+    try std.testing.expectError(
+        error.UnsupportedBrowserControl,
+        (WindowControls{ .hide = true }).validateFor(.safari),
+    );
+    try std.testing.expect((WindowControls{ .hide = true }).isActive());
     try std.testing.expectError(
         error.UnsupportedBrowserControl,
         (WindowControls{ .position = .{ .x = 0, .y = 0 } })
@@ -552,6 +672,52 @@ test "window controls validate browser support" {
         error.InvalidUtf8,
         (WindowControls{ .proxy_server = invalid_utf8 }).validate(),
     );
+}
+
+test "managed profiles and default arguments cover the chromium family" {
+    const gpa = std.testing.allocator;
+    for (std.enums.values(Browser)) |selected| {
+        const directory = try managedProfileDirectory(gpa, selected);
+        defer if (directory) |value| gpa.free(value);
+        switch (selected) {
+            .firefox, .safari => {
+                try std.testing.expect(!isChromium(selected));
+                try std.testing.expectEqual(@as(?[]u8, null), directory);
+            },
+            else => {
+                try std.testing.expect(isChromium(selected));
+                if (builtin.os.tag != .windows) {
+                    try std.testing.expectStringStartsWith(
+                        directory.?,
+                        "/tmp/.WebUI/WebUI",
+                    );
+                    try std.testing.expectStringEndsWith(
+                        directory.?,
+                        "Profile",
+                    );
+                }
+            },
+        }
+    }
+
+    try std.testing.expectEqualStrings(
+        "--disable-features=Translate",
+        disableFeatures(true, true).?,
+    );
+    try std.testing.expectEqualStrings(
+        "--disable-features=Translate,ForcedColors",
+        disableFeatures(true, false).?,
+    );
+    try std.testing.expectEqualStrings(
+        "--disable-features=ForcedColors",
+        disableFeatures(false, false).?,
+    );
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        disableFeatures(false, true),
+    );
+    for (chromium_defaults) |argument|
+        try std.testing.expectStringStartsWith(argument, "--");
 }
 
 test "parent process ID identifies the backend process" {

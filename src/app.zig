@@ -1632,11 +1632,20 @@ pub const Window = struct {
         try self.state.replaceIcon(io, data, mime_type);
     }
 
-    pub fn open(self: Window, io: std.Io, running: *const Running) !void {
-        const page_url = try self.url(running, self.state.gpa);
-        defer self.state.gpa.free(page_url);
+    /// Launch the best available browser as a standalone app window. Falls
+    /// back to the operating system URL handler, which opens a regular tab and
+    /// therefore rejects active window controls, when no known browser exists.
+    pub fn open(self: Window, io: std.Io, running: *Running) !void {
+        if (running.stopped or !running.app.started) return error.NotRunning;
+        if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
+        if (try browser.bestBrowser(self.state.gpa, io)) |selected| {
+            _ = try self.openWithBrowser(running, .{ .browser = selected });
+            return;
+        }
         if (self.state.browserControls(io).isActive())
             return error.ExplicitBrowserRequired;
+        const page_url = try self.url(running, self.state.gpa);
+        defer self.state.gpa.free(page_url);
         try browser.openUrl(self.state.gpa, io, page_url);
     }
 
@@ -1899,6 +1908,8 @@ pub const App = struct {
         content: ?Content = null,
         /// Launch the selected browser in kiosk mode.
         kiosk: bool = false,
+        /// Launch the selected browser headless, without a visible window.
+        hide: bool = false,
         /// Allow browser-native forced colors for high-contrast themes.
         high_contrast: bool = true,
         /// Initial outer browser-window size in pixels.
@@ -1945,6 +1956,7 @@ pub const App = struct {
         try self.options.limits.validate();
         var browser_controls: browser.WindowControls = .{
             .kiosk = options.kiosk,
+            .hide = options.hide,
             .high_contrast = options.high_contrast,
             .size = options.size,
             .position = options.position,
@@ -3600,6 +3612,31 @@ test "selected browser launch applies window controls and owns process" {
         .{tmp.sub_path},
     );
     defer gpa.free(second_capture);
+    const fourth_capture = try std.fmt.allocPrint(
+        gpa,
+        ".zig-cache/tmp/{s}/fourth-argv",
+        .{tmp.sub_path},
+    );
+    defer gpa.free(fourth_capture);
+    // A launch without caller arguments has nowhere to carry the capture path,
+    // so this launcher hardcodes it.
+    const capturing_script = try std.fmt.allocPrint(
+        gpa,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{s}\"\nexec sleep 30\n",
+        .{fourth_capture},
+    );
+    defer gpa.free(capturing_script);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "fake-browser-defaults",
+        .data = capturing_script,
+        .flags = .{ .permissions = .executable_file },
+    });
+    const defaults_executable = try std.fmt.allocPrint(
+        gpa,
+        ".zig-cache/tmp/{s}/fake-browser-defaults",
+        .{tmp.sub_path},
+    );
+    defer gpa.free(defaults_executable);
     const configured_profile = try std.fmt.allocPrint(
         gpa,
         ".zig-cache/tmp/{s}/profile with space",
@@ -3645,11 +3682,23 @@ test "selected browser launch applies window controls and owns process" {
         .position = .{ .x = -200, .y = 40 },
         .proxy_server = "socks5://127.0.0.1:1080",
     });
+    const hidden_window = try app.createWindow(.{
+        .content = .{ .html = "hidden browser" },
+        .hide = true,
+    });
     var running = try app.start(io);
     defer running.stop() catch {};
+    // `open()` discovers a real browser, so only its guard clauses are safe to
+    // exercise here. Argument construction is covered through explicit
+    // launches below.
+    var foreign_app = App.init(gpa, .{});
+    defer foreign_app.deinit();
+    const foreign_window = try foreign_app.createWindow(.{
+        .content = .{ .html = "foreign window" },
+    });
     try std.testing.expectError(
-        error.ExplicitBrowserRequired,
-        window.open(io, &running),
+        error.UnknownWindow,
+        foreign_window.open(io, &running),
     );
     try std.testing.expectError(
         error.InvalidBrowserExecutable,
@@ -3710,7 +3759,7 @@ test "selected browser launch applies window controls and owns process" {
     defer gpa.free(second_argv);
     const expected_second = try std.fmt.allocPrint(
         gpa,
-        "--guest\n--user-data-dir={s}\n--kiosk\n" ++
+        "--guest\n--user-data-dir={s}\n--chrome-frame\n--kiosk\n" ++
             "--window-size=1366,768\n--app={s}\n",
         .{ expected_profile, page_url },
     );
@@ -3755,7 +3804,8 @@ test "selected browser launch applies window controls and owns process" {
     defer gpa.free(third_argv);
     const expected_third = try std.fmt.allocPrint(
         gpa,
-        "--proxy-server=socks5://127.0.0.1:1080\n" ++
+        "--user-data-dir=/tmp/.WebUI/WebUIChromiumProfile\n" ++
+            "--proxy-server=socks5://127.0.0.1:1080\n" ++
             "--disable-features=ForcedColors\n" ++
             "--window-position=-300,50\n--app={s}\n",
         .{positioned_url},
@@ -3764,12 +3814,43 @@ test "selected browser launch applies window controls and owns process" {
     try std.testing.expectEqualStrings(expected_third, third_argv);
     try std.testing.expectEqual(@as(usize, 2), app.managed_browsers.items.len);
 
+    const hidden_url = try hidden_window.url(&running, gpa);
+    defer gpa.free(hidden_url);
+    _ = try hidden_window.openWithBrowser(&running, .{
+        .browser = .chrome,
+        .executable = defaults_executable,
+    });
+    const fourth_argv = try readTestFileEventually(
+        tmp.dir,
+        io,
+        gpa,
+        "fourth-argv",
+    );
+    defer gpa.free(fourth_argv);
+    const expected_fourth = try std.fmt.allocPrint(
+        gpa,
+        "--user-data-dir=/tmp/.WebUI/WebUIChromeProfile\n" ++
+            "--no-first-run\n--safe-mode\n--disable-extensions\n" ++
+            "--disable-background-mode\n--disable-plugins\n" ++
+            "--disable-plugins-discovery\n--disable-translate\n" ++
+            "--bwsi\n--disable-sync\n--disable-sync-preferences\n" ++
+            "--disable-component-update\n--allow-insecure-localhost\n" ++
+            "--auto-accept-camera-and-microphone-capture\n" ++
+            "--no-proxy-server\n--disable-features=Translate\n" ++
+            "--headless=new\n--app={s}\n",
+        .{hidden_url},
+    );
+    defer gpa.free(expected_fourth);
+    try std.testing.expectEqualStrings(expected_fourth, fourth_argv);
+    try std.testing.expectEqual(@as(usize, 3), app.managed_browsers.items.len);
+
     try running.stop();
     try std.testing.expectEqual(@as(usize, 0), app.managed_browsers.items.len);
     try std.testing.expectError(
         error.NotRunning,
         window.browserProcessId(&running),
     );
+    try std.testing.expectError(error.NotRunning, window.open(io, &running));
 }
 
 test "directory monitor reloads changed window only" {

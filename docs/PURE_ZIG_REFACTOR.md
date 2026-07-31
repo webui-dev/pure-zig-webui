@@ -30,7 +30,7 @@ deleted.
 | Server and security | HTTP, WebSocket, TLS, loopback/public policy, capabilities, Origin checks, cookies, and protocol limits are implemented. |
 | Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, browser-native high-contrast detection, and multiple clients are implemented. |
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, logging, and deterministic shutdown are implemented. |
-| Browser integration | Default URL opening, browser discovery, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk mode, Chromium forced-color control, caller-managed profile directories, Chromium-family proxy rules, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
+| Browser integration | App-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed profile directories, Chromium-family proxy rules, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
 | Current validation | `zig build test`, native builds, Windows x86_64 builds, macOS aarch64 builds, and Windows/macOS test-module cross-compilation pass. |
 
 Remaining work is limited to the remaining browser window controls and
@@ -169,8 +169,10 @@ try window.open(io, &running);
 try running.wait();
 ```
 
-Use `window.openWithBrowser(&running, options)` when explicit browser
-selection, a custom executable, or additional argv is required.
+`window.open()` discovers the best installed browser and launches it as a
+standalone app window with a managed profile. Use
+`window.openWithBrowser(&running, options)` when explicit browser selection, a
+custom executable, or additional argv is required.
 
 Start with one explicit type-erased handler signature:
 
@@ -320,8 +322,9 @@ implementations.
 
 | Upstream API | Current gap |
 |---|---|
-| `webui_set_kiosk()` | `App.WindowOptions.kiosk` generates an explicit Chromium-family or Firefox kiosk argument. Typed controls require `Window.openWithBrowser()` and return an error instead of being ignored. |
-| `webui_focus()`, `webui_minimize()`, `webui_maximize()`, `webui_set_hide()` | Browser window lifecycle controls are not implemented. |
+| `webui_set_kiosk()` | `App.WindowOptions.kiosk` generates an explicit Chromium-family (`--chrome-frame --kiosk`) or Firefox (`-kiosk`) argument, and returns an error for browsers that cannot honour it. |
+| `webui_set_hide()` | `App.WindowOptions.hide` launches the browser headless through `--headless=new` or Firefox `-headless`. |
+| `webui_focus()`, `webui_minimize()`, `webui_maximize()` | Browser window lifecycle controls are not implemented. |
 | `webui_set_resizable()`, `webui_set_minimum_size()`, `webui_set_center()` | These browser window geometry controls are not implemented. |
 | `webui_set_frameless()`, `webui_set_transparent()` | Frameless and transparent browser window modes are not implemented. |
 | `webui_delete_profile()`, `webui_delete_all_profiles()` | Caller-managed profile directories are supported, but automatic profile deletion is not implemented. |
@@ -345,20 +348,20 @@ not implementation gaps:
 | Upstream API | Zig replacement |
 |---|---|
 | `webui_new_window()`, `webui_new_window_id()`, `webui_get_new_window_id()` | `App.createWindow()` and application-owned IDs. |
-| `webui_show()`, `webui_start_server()`, `webui_get_url()` | Initial `Content`, runtime `Window.setContent()`, `App.start()`, `Window.open()`, and `Window.url()`. |
+| `webui_show()`, `webui_start_server()`, `webui_get_url()` | Initial `Content`, runtime `Window.setContent()`, `App.start()`, `Window.open()`, and `Window.url()`. `Window.open()` launches the best installed browser in app mode and falls back to the OS URL handler, matching upstream `webui_show()` with `AnyBrowser`. |
 | `webui_show_client()` | `Client.show()` replaces the window content and navigates only the selected client. |
 | `webui_is_shown()` | `Window.isShown()` reports whether the window has at least one connected browser client. |
 | `webui_set_size()`, `webui_set_position()` | `App.WindowOptions.size` and `.position` set initial geometry. `Window.setSize()` and `Window.setPosition()` persist updates, notify connected clients, replay the latest geometry to later clients, and affect subsequent explicit browser launches. |
 | `webui_set_high_contrast()`, `webui_is_high_contrast()` | `App.WindowOptions.high_contrast` controls Chromium forced-color support with explicit unsupported-browser errors. Browser-side `webui.isHighContrast()` uses native forced-color and contrast media queries without external programs. |
 | `webui_open_url()` | `openUrl()` safely passes a non-empty URL as one argument to the platform default opener. |
 | `webui_get_best_browser()`, `webui_browser_exist()` | `bestBrowser()` and `browserExists()` discover registered or executable browser candidates through the public `Browser` enum. |
-| `webui_show_browser()`, `webui_set_browser_folder()`, `webui_set_custom_parameters()` | `Window.openWithBrowser()` accepts a `BrowserLaunchOptions` value with an explicit browser, optional full executable path, and additional argv. |
+| `webui_show_browser()`, `webui_set_browser_folder()`, `webui_set_custom_parameters()` | `Window.openWithBrowser()` accepts a `BrowserLaunchOptions` value with an explicit browser, optional full executable path, and additional argv. An empty argv applies the Chromium default arguments; a non-empty argv replaces them, matching upstream `custom_parameters`. |
 | `webui_get_child_process_id()` | `Window.openWithBrowser()` returns the retained direct child's `BrowserProcessId`; `Window.browserProcessId()` retrieves it later. |
 | `webui_get_parent_process_id()` | Root-level `parentProcessId()` returns the current Zig backend's numeric process ID without a redundant window argument. Unsupported process targets return an explicit error. |
 | `webui_set_default_root_folder()` | `App.Options.default_directory` supplies directory content to windows created without explicit content. |
 | `webui_set_config(folder_monitor)` | `App.Options.folder_monitor_interval` enables portable recursive directory polling and reloads the affected window's connected clients. |
 | `webui_set_icon()`, `webui_set_icon_file()` | `Window.setIcon()` copies inline data and MIME type; `Window.setIconFile()` loads a supported image file as the window favicon. |
-| `webui_set_profile()` | `App.WindowOptions.profile_directory` is copied and mapped to Chromium-family `--user-data-dir` or Firefox `--profile`. The caller owns directory lifecycle. |
+| `webui_set_profile()` | `App.WindowOptions.profile_directory` is copied and mapped to Chromium-family `--user-data-dir` or Firefox `--profile`. Chromium-family launches without it use a managed temporary profile such as `/tmp/.WebUI/WebUIChromeProfile`, which is what keeps the app window independent of a running browser instance. The caller owns directory lifecycle; zig-webui never deletes a profile. |
 | `webui_set_proxy()` | `App.WindowOptions.proxy_server` is copied and passed as one Chromium-family `--proxy-server` argument. Unsupported browsers return an explicit error. |
 | `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. |
 | `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `Running.stop()`, and `App.deinit()`. |
@@ -433,15 +436,15 @@ child tracking methods in the ledger.
 
 ### Browser window controls
 
-- Initial kiosk, size, and position options generate direct browser argv with
-  explicit validation and unsupported-browser errors. Runtime size and
+- Initial kiosk, hide, size, and position options generate direct browser argv
+  with explicit validation and unsupported-browser errors. Runtime size and
   position persist and use the existing quick-script protocol.
 - Profile directories and proxy rules are copied into window state and passed
   as individual browser argv entries. Chromium-family browsers support both;
   Firefox supports profiles; Safari supports neither.
 - Chromium can explicitly disable forced-color support; the browser bridge
   detects active high-contrast media preferences.
-- Implement focus, minimize, maximize, hidden, resizable, remaining geometry,
+- Implement focus, minimize, maximize, resizable, remaining geometry,
   frameless, and transparent controls where the selected browser and platform
   support them.
 - Implement managed profile deletion only if zig-webui takes ownership of
@@ -528,7 +531,7 @@ zig build -Dtarget=aarch64-macos
 
 Continue capability parity:
 
-1. Add focus, minimize, maximize, hidden, resizable, minimum-size, and center
+1. Add focus, minimize, maximize, resizable, minimum-size, and center
    behavior.
 2. Decide whether to add managed browser profile deletion or keep profile
    lifecycle caller-owned.

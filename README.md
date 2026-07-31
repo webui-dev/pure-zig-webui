@@ -52,9 +52,11 @@ The current phase provides:
   `App.Options.use_cookies`;
 - loopback-only listening by default and caller-provided TLS for explicit
   public listening;
-- general OS URL opening and installed-browser discovery;
+- app-mode window launching through installed-browser discovery, with a
+  managed per-browser profile and OS URL opening as the fallback;
 - explicit browser launching with custom executable paths and argv;
-- per-window kiosk mode plus persistent initial and runtime size and position;
+- per-window kiosk and headless modes plus persistent initial and runtime size
+  and position;
 - per-window Chromium forced-color control and browser-native high-contrast
   detection;
 - per-window browser profile directories and Chromium-family proxy rules;
@@ -118,10 +120,14 @@ should run `zig build test-bridge`, which fails when Node is unavailable.
 `Window.evalAll` returns owned results; call `deinit` on them after consuming
 every per-client outcome.
 
-`Window.open()` launches the browser and returns immediately. Call
-`Window.waitForConnection(io, timeout)` when startup must wait for a browser;
-it returns the first connected `Client`. `Window.eval()` uses the same total
-timeout for connection waiting and JavaScript execution.
+`Window.open()` discovers the best installed browser and launches it as a
+standalone app window, exactly like `Window.openWithBrowser()` with that
+browser. It returns immediately. When no known browser is installed it hands
+the URL to the OS default handler, which opens an ordinary tab and therefore
+returns `error.ExplicitBrowserRequired` when any window control is active.
+Call `Window.waitForConnection(io, timeout)` when startup must wait for a
+browser; it returns the first connected `Client`. `Window.eval()` uses the same
+total timeout for connection waiting and JavaScript execution.
 
 Call `openUrl(gpa, io, url)` to open any non-empty URL with the OS default
 handler. `browserExists(gpa, io, browser)` checks an explicit `Browser`, while
@@ -133,6 +139,10 @@ platforms without opening the selected browser.
 `Window.openWithBrowser(&running, options)` launches a selected `Browser`
 with an optional full executable path and additional argv. Chromium-family
 browsers receive an `--app=` URL argument; Firefox receives `-new-window`.
+When `options.arguments` is empty, Chromium-family browsers also receive a set
+of default arguments that suppress first-run interstitials, extensions,
+background services, translation, sync, and proxies; a non-empty
+`options.arguments` replaces those defaults entirely.
 The returned `BrowserProcessId`, also available through
 `Window.browserProcessId()`, is a PID on POSIX and a process handle on
 Windows. Each window retains at most one launched child; launching another
@@ -143,22 +153,21 @@ which is the parent of browsers launched directly by this package. It is
 process-wide and does not require a `Window`. Targets without a supported
 process-ID API return `error.UnsupportedPlatform`.
 
-Set `.kiosk`, `.size`, or `.position` in `App.WindowOptions` to control the
-initial browser window. These options require `Window.openWithBrowser()`:
-`Window.open()` returns `error.ExplicitBrowserRequired` instead of ignoring
-them. Chromium-family browsers support all three controls. Firefox supports
-kiosk mode and size but returns `error.UnsupportedBrowserControl` for
-position; Safari returns the same error for any of these controls. Width and
-height must be non-zero, while positions may be negative for secondary
-displays.
+Set `.kiosk`, `.hide`, `.size`, or `.position` in `App.WindowOptions` to
+control the initial browser window. `.hide` launches the browser headless.
+Chromium-family browsers support all four controls. Firefox supports kiosk,
+hide, and size but returns `error.UnsupportedBrowserControl` for position;
+Safari returns the same error for any of these controls. Width and height must
+be non-zero, while positions may be negative for secondary displays. Only the
+OS-handler fallback inside `Window.open()` cannot honour these controls, and it
+returns `error.ExplicitBrowserRequired` instead of ignoring them.
 
 Set `.high_contrast = false` in `App.WindowOptions` to disable Chromium's
 forced-color feature for that window. Firefox and Safari return
 `error.UnsupportedBrowserHighContrast` instead of ignoring this setting.
 The browser-side `webui.isHighContrast()` detects active forced colors or a
 stronger contrast preference through native media queries and requires no
-external OS program. Disabling high-contrast support requires
-`Window.openWithBrowser()`.
+external OS program.
 
 Set `.profile_directory` in `App.WindowOptions` to launch Chromium-family
 browsers with `--user-data-dir` or Firefox with `--profile`. Set
@@ -168,8 +177,14 @@ directories remain caller-managed and are never deleted by zig-webui.
 Firefox returns `error.UnsupportedBrowserProxy` for proxy configuration;
 Safari returns `error.UnsupportedBrowserProfile` or
 `error.UnsupportedBrowserProxy` instead of silently ignoring either option.
-Like the other initial browser controls, these options require
-`Window.openWithBrowser()`.
+
+Without `.profile_directory`, Chromium-family launches get a managed profile
+under the system temporary directory, such as
+`/tmp/.WebUI/WebUIChromeProfile`. A dedicated profile is what makes the app
+window independent: an already running browser instance otherwise adopts the
+URL, ignores every window argument, and lets the launched process exit
+immediately. The browser creates the directory on first use, and zig-webui
+never deletes it.
 
 `Window.setSize(io, size)` and `Window.setPosition(io, position)` persist new
 geometry, return the number of currently notified clients, and replay the
