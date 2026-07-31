@@ -336,7 +336,6 @@ fn resolveMacosExecutable(
             gpa.free(path);
             switch (err) {
                 error.FileNotFound,
-                error.NotDir,
                 error.AccessDenied,
                 error.PermissionDenied,
                 => continue,
@@ -369,7 +368,7 @@ fn commandValue(
         else => return null,
     }
     const value = parseCommandValue(result.stdout, marker) orelse return null;
-    return gpa.dupe(u8, value);
+    return try gpa.dupe(u8, value);
 }
 
 fn parseCommandValue(
