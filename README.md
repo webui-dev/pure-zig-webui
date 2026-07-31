@@ -61,7 +61,8 @@ The current phase provides:
   and position;
 - per-window Chromium forced-color control and browser-native high-contrast
   detection;
-- per-window browser profile directories and Chromium-family proxy rules;
+- per-window browser profile directories with deletable managed profiles,
+  and Chromium-family proxy rules;
 - per-window browser child identifiers and deterministic process cleanup;
 - current backend process ID through `parentProcessId()`;
 - default-browser launching and deterministic shutdown.
@@ -185,8 +186,16 @@ under the system temporary directory, such as
 `/tmp/.WebUI/WebUIChromeProfile`. A dedicated profile is what makes the app
 window independent: an already running browser instance otherwise adopts the
 URL, ignores every window argument, and lets the launched process exit
-immediately. The browser creates the directory on first use, and zig-webui
-never deletes it.
+immediately. The browser creates the directory on first use and reuses it
+across runs.
+
+`Window.deleteProfile(&running)` removes the managed profile of the browser
+that window launched and reports whether one existed; `deleteManagedProfile`
+and `deleteAllManagedProfiles` do the same without a `Window`, and
+`managedProfileDirectory(gpa, browser)` returns the path. Deletion only ever
+touches the generated path: a window configured with `.profile_directory`
+returns `error.CallerManagedProfile`, and caller-owned directories are never
+removed.
 
 `Window.setSize(io, size)` and `Window.setPosition(io, position)` persist new
 geometry, return the number of currently notified clients, and replay the
@@ -194,6 +203,13 @@ latest values to clients that connect later. Subsequent
 `Window.openWithBrowser()` calls use the updated values. Connected external
 browsers receive `window.resizeTo()` or `window.moveTo()` requests; browser
 security policy may ignore those requests for ordinary tabs.
+
+`Window.setCenter(io)`, and `.center = true` in `App.WindowOptions`, centre
+the window on the primary display. Only the browser knows the screen
+geometry, so it computes the coordinates itself, which means centring takes
+effect once a client connects rather than at launch. Centring and an explicit
+position are mutually exclusive: each one clears the other, and setting both
+in `App.WindowOptions` returns `error.ConflictingWindowPlacement`.
 
 Serve a directory by setting
 `.content = .{ .directory = "path/to/public" }`. The path is opened when the

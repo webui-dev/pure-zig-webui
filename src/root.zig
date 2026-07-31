@@ -33,6 +33,9 @@ pub const parentProcessId = @import("browser.zig").parentProcessId;
 pub const openUrl = @import("browser.zig").openUrl;
 pub const browserExists = @import("browser.zig").browserExists;
 pub const bestBrowser = @import("browser.zig").bestBrowser;
+pub const managedProfileDirectory = @import("browser.zig").managedProfileDirectory;
+pub const deleteManagedProfile = @import("browser.zig").deleteManagedProfile;
+pub const deleteAllManagedProfiles = @import("browser.zig").deleteAllManagedProfiles;
 pub const protocol = @import("protocol.zig");
 
 test {

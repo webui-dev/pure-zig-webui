@@ -70,6 +70,7 @@ pub const Request = Linsang.Request;
 pub const Response = Linsang.Response;
 pub const BrowserLaunchOptions = browser.LaunchOptions;
 pub const BrowserProcessId = browser.ProcessId;
+pub const Browser = browser.Browser;
 pub const WindowSize = browser.WindowSize;
 pub const WindowPosition = browser.WindowPosition;
 
@@ -248,6 +249,14 @@ fn resizeScript(buffer: []u8, size: WindowSize) ![]const u8 {
         .{ size.width, size.height },
     );
 }
+
+/// Centring needs the screen geometry, which no browser exposes to the
+/// backend, so the browser computes the target itself. Coordinates are
+/// relative to the primary display; the browser clamps them to a visible
+/// area on its own.
+const center_script =
+    "window.moveTo((screen.availWidth-outerWidth)/2," ++
+    "(screen.availHeight-outerHeight)/2);";
 
 fn moveScript(buffer: []u8, position: WindowPosition) ![]const u8 {
     return std.fmt.bufPrint(
@@ -519,6 +528,9 @@ const WindowState = struct {
     logger: ?Logger,
     logger_user_data: ?*anyopaque,
     runtime: ?Runtime,
+    /// Centering supersedes `browser_controls.position`; the two are kept
+    /// mutually exclusive under `controls_mutex`.
+    center: bool,
     browser_controls: browser.WindowControls,
     controls_mutex: std.Io.Mutex = .init,
     mutex: std.Io.Mutex = .init,
@@ -708,7 +720,18 @@ const WindowState = struct {
         self.controls_mutex.lockUncancelable(io);
         defer self.controls_mutex.unlock(io);
         self.browser_controls.position = position;
+        self.center = false;
         return self.broadcast(io, .js_quick, script);
+    }
+
+    fn setCenter(self: *WindowState, io: std.Io) !usize {
+        self.controls_mutex.lockUncancelable(io);
+        defer self.controls_mutex.unlock(io);
+        // An explicit position and centering cannot both hold, and only the
+        // browser can compute the centred coordinates.
+        self.browser_controls.position = null;
+        self.center = true;
+        return self.broadcast(io, .js_quick, center_script);
     }
 
     fn applyGeometry(
@@ -728,8 +751,13 @@ const WindowState = struct {
                 .command = .js_quick,
             }, script);
         }
-        if (self.browser_controls.position) |position| {
-            const script = try moveScript(&buffer, position);
+        const placement = if (self.center)
+            center_script
+        else if (self.browser_controls.position) |position|
+            try moveScript(&buffer, position)
+        else
+            null;
+        if (placement) |script| {
             if (script.len > self.limits.max_ws_message_size - protocol.header_len)
                 return error.MessageTooLarge;
             try send(connection, self.gpa, .{
@@ -1705,7 +1733,23 @@ pub const Window = struct {
             running.inner.io,
             self.state,
             child,
+            options.browser,
         );
+    }
+
+    /// Delete the managed profile directory of the browser this window
+    /// launched and report whether one existed. A caller-managed
+    /// `profile_directory` is never deleted; it returns
+    /// `error.CallerManagedProfile` instead.
+    pub fn deleteProfile(self: Window, running: *const Running) !bool {
+        if (running.stopped or !running.app.started) return error.NotRunning;
+        if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
+        const io = running.inner.io;
+        if (self.state.browserControls(io).profile_directory != null)
+            return error.CallerManagedProfile;
+        const selected = running.app.launchedBrowser(io, self.state) orelse
+            return error.NoManagedBrowser;
+        return browser.deleteManagedProfile(self.state.gpa, io, selected);
     }
 
     /// Return the platform-native identifier of the retained browser child.
@@ -1728,6 +1772,14 @@ pub const Window = struct {
     /// The state remains updated if notification fails.
     pub fn setSize(self: Window, io: std.Io, size: WindowSize) !usize {
         return self.state.setSize(io, size);
+    }
+
+    /// Persist centring and request it from connected clients, superseding any
+    /// explicit position. The browser computes the coordinates from its own
+    /// screen geometry, so centring only takes effect once a client connects.
+    /// The state remains updated if notification fails.
+    pub fn setCenter(self: Window, io: std.Io) !usize {
+        return self.state.setCenter(io);
     }
 
     /// Persist a browser-window position and request it from connected clients.
@@ -1906,6 +1958,9 @@ const ManagedBrowser = struct {
     // tasks only if one bounded child per window becomes insufficient.
     window: *WindowState,
     child: std.process.Child,
+    /// Browser that was launched, so its managed profile can be located
+    /// again after `Window.open()` picked one automatically.
+    browser: Browser,
 };
 
 pub const App = struct {
@@ -1950,6 +2005,9 @@ pub const App = struct {
         /// Initial browser-window position in pixels. Negative coordinates
         /// support displays to the left or above the primary display.
         position: ?WindowPosition = null,
+        /// Centre the browser window once a client connects. Mutually
+        /// exclusive with `position`.
+        center: bool = false,
         /// Caller-managed browser profile directory, copied by the app.
         profile_directory: ?[]const u8 = null,
         /// Browser proxy rule, copied by the app and passed as one argument.
@@ -2000,6 +2058,8 @@ pub const App = struct {
             .proxy_server = options.proxy_server,
         };
         try browser_controls.validate();
+        if (options.center and options.position != null)
+            return error.ConflictingWindowPlacement;
         if (options.max_clients == 0) return error.InvalidClientLimit;
         if (options.max_pending_evals == 0 or
             options.max_pending_evals > std.math.maxInt(u16))
@@ -2049,6 +2109,7 @@ pub const App = struct {
             .logger = self.options.logger,
             .logger_user_data = self.options.logger_user_data,
             .runtime = options.runtime,
+            .center = options.center,
             .browser_controls = browser_controls,
         };
         try self.windows.append(self.gpa, state);
@@ -2164,6 +2225,7 @@ pub const App = struct {
         io: std.Io,
         window: *WindowState,
         child: std.process.Child,
+        selected: Browser,
     ) !BrowserProcessId {
         var owned = child;
         errdefer owned.kill(io);
@@ -2175,13 +2237,27 @@ pub const App = struct {
             if (managed.window != window) continue;
             managed.child.kill(io);
             managed.child = owned;
+            managed.browser = selected;
             return id;
         }
         try self.managed_browsers.append(self.gpa, .{
             .window = window,
             .child = owned,
+            .browser = selected,
         });
         return id;
+    }
+
+    fn launchedBrowser(
+        self: *App,
+        io: std.Io,
+        window: *WindowState,
+    ) ?Browser {
+        self.browser_mutex.lockUncancelable(io);
+        defer self.browser_mutex.unlock(io);
+        for (self.managed_browsers.items) |*managed|
+            if (managed.window == window) return managed.browser;
+        return null;
     }
 
     fn browserId(
@@ -3649,9 +3725,17 @@ test "runtime geometry persists for current and future clients" {
 
     var app = App.init(gpa, .{});
     defer app.deinit();
+    try std.testing.expectError(
+        error.ConflictingWindowPlacement,
+        app.createWindow(.{
+            .content = .{ .html = "conflicting placement" },
+            .center = true,
+            .position = .{ .x = 0, .y = 0 },
+        }),
+    );
     const window = try app.createWindow(.{
         .content = .{ .html = "runtime geometry" },
-        .max_clients = 2,
+        .max_clients = 3,
     });
     try std.testing.expectError(
         error.InvalidWindowSize,
@@ -3761,7 +3845,153 @@ test "runtime geometry persists for current and future clients" {
         );
     }
 
+    // Centring supersedes the persisted position for connected clients.
+    try std.testing.expectEqual(@as(usize, 2), try window.setCenter(io));
+    for ([_]struct { std.Io.net.Stream, *[125]u8 }{
+        .{ first_stream, &first_response },
+        .{ second_stream, &second_response },
+    }) |target| {
+        try expectQuickScript(target[0], io, target[1], center_script);
+    }
+    try std.testing.expect(window.state.center);
+    try std.testing.expectEqual(
+        @as(?WindowPosition, null),
+        window.state.browser_controls.position,
+    );
+
+    // ... and for clients that connect afterwards.
+    const third_stream = try connectTestWebSocket(
+        running.inner.address,
+        io,
+        &window.state.capability,
+    );
+    defer third_stream.close(io);
+    var third_response: [125]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(
+        third_stream,
+        io,
+        gpa,
+        window.state.token,
+        &window.state.capability,
+        &third_response,
+    ));
+    try expectQuickScript(
+        third_stream,
+        io,
+        &third_response,
+        "window.resizeTo(1366,768);",
+    );
+    try expectQuickScript(third_stream, io, &third_response, center_script);
+
+    // An explicit position takes centring back off.
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        try window.setPosition(io, .{ .x = 5, .y = 5 }),
+    );
+    try std.testing.expect(!window.state.center);
+
     try running.stop();
+}
+
+test "managed profiles are deletable and caller directories are not" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "fake-browser",
+        .data = "#!/bin/sh\nexec sleep 30\n",
+        .flags = .{ .permissions = .executable_file },
+    });
+    const executable = try std.fmt.allocPrint(
+        gpa,
+        ".zig-cache/tmp/{s}/fake-browser",
+        .{tmp.sub_path},
+    );
+    defer gpa.free(executable);
+    const caller_profile = try std.fmt.allocPrint(
+        gpa,
+        ".zig-cache/tmp/{s}/caller-profile",
+        .{tmp.sub_path},
+    );
+    defer gpa.free(caller_profile);
+    try tmp.dir.createDirPath(io, "caller-profile");
+
+    // Epic is not installed on test machines, so its managed profile can
+    // never be a real profile this test would destroy.
+    const managed = (try browser.managedProfileDirectory(gpa, .epic)).?;
+    defer gpa.free(managed);
+    try std.testing.expectEqualStrings(
+        "/tmp/.WebUI/WebUIEpicProfile",
+        managed,
+    );
+    try std.testing.expectEqual(
+        @as(?[]u8, null),
+        try browser.managedProfileDirectory(gpa, .firefox),
+    );
+    try std.testing.expect(
+        !try browser.deleteManagedProfile(gpa, io, .firefox),
+    );
+
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{
+        .content = .{ .html = "managed profile" },
+    });
+    const caller_window = try app.createWindow(.{
+        .content = .{ .html = "caller profile" },
+        .profile_directory = caller_profile,
+    });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+
+    // Nothing launched yet, so no profile can be identified.
+    try std.testing.expectError(
+        error.NoManagedBrowser,
+        window.deleteProfile(&running),
+    );
+    _ = try window.openWithBrowser(&running, .{
+        .browser = .epic,
+        .executable = executable,
+    });
+    // The launcher is a stub, so the directory does not exist yet.
+    try std.testing.expect(!try window.deleteProfile(&running));
+
+    try std.Io.Dir.cwd().createDirPath(io, managed);
+    var profile_dir = try std.Io.Dir.openDirAbsolute(io, managed, .{});
+    defer profile_dir.close(io);
+    try profile_dir.createDirPath(io, "Default/Cache");
+    try profile_dir.writeFile(io, .{
+        .sub_path = "Default/Cache/entry",
+        .data = "cached",
+    });
+    try std.testing.expect(try window.deleteProfile(&running));
+    try std.testing.expect(!try window.deleteProfile(&running));
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.accessAbsolute(io, managed, .{}),
+    );
+
+    // A caller-managed directory is never removed.
+    _ = try caller_window.openWithBrowser(&running, .{
+        .browser = .epic,
+        .executable = executable,
+    });
+    try std.testing.expectError(
+        error.CallerManagedProfile,
+        caller_window.deleteProfile(&running),
+    );
+    try tmp.dir.access(io, "caller-profile", .{});
+
+    try running.stop();
+    try std.testing.expectError(
+        error.NotRunning,
+        window.deleteProfile(&running),
+    );
 }
 
 test "selected browser launch applies window controls and owns process" {

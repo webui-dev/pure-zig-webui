@@ -30,7 +30,7 @@ deleted.
 | Server and security | HTTP, WebSocket, TLS, loopback/public policy, capabilities, Origin checks, cookies, and protocol limits are implemented. |
 | Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, browser-native high-contrast detection, and multiple clients are implemented. |
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, Deno/Node.js/Bun script interpretation, logging, and deterministic shutdown are implemented. |
-| Browser integration | App-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed profile directories, Chromium-family proxy rules, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
+| Browser integration | Centring, app-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed and deletable managed profile directories, Chromium-family proxy rules, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
 | Current validation | `zig build test`, native builds, Windows x86_64 builds, macOS aarch64 builds, and Windows/macOS test-module cross-compilation pass. |
 
 Remaining work is limited to the remaining browser window controls and
@@ -88,9 +88,8 @@ races, and synchronous access to the actual `port = 0` address through
 ### Remaining capability parity
 
 - WebView2, GTK/WebKit, or WKWebView.
-- Browser window controls and geometry, most of which upstream implements for
+- Browser window controls and geometry, all of which upstream implements for
   its native WebView only.
-- Managed browser profile deletion.
 
 These do not block the external-browser core, but they are required before
 declaring complete upstream capability parity.
@@ -326,10 +325,8 @@ implementations.
 | `webui_set_hide()` | `App.WindowOptions.hide` launches the browser headless through `--headless=new` or Firefox `-headless`. |
 | `webui_focus()` | Not implemented. Upstream supports it for external browsers on Windows only, by enumerating top-level windows of the child process, and documents Linux and macOS as no-ops. |
 | `webui_minimize()`, `webui_maximize()` | Not implemented. Upstream routes both to its native WebView only. |
-| `webui_set_center()` | Not implemented. Upstream computes a centred `--window-position` from the primary monitor geometry, which needs GDK on Linux; the browser-side `screen` object and the existing `Window.setPosition()` protocol can supply it without a C dependency. |
 | `webui_set_resizable()`, `webui_set_minimum_size()` | Not implemented. Upstream stores both and applies them only in its Win32 and GTK WebView window procedures, so external browsers ignore them there too. |
 | `webui_set_frameless()`, `webui_set_transparent()` | Not implemented. Upstream applies both only to its native WebView windows; external browsers ignore them there too. |
-| `webui_delete_profile()`, `webui_delete_all_profiles()` | Profile deletion is not implemented. Caller-managed directories stay caller-owned, and the managed Chromium profile under the system temporary directory is reused across runs and never removed. |
 | `webui_show_wv()`, `webui_set_close_handler_wv()`, `webui_get_hwnd()`, `webui_win32_get_hwnd()` | Native WebView hosting and native window handles are outside the pure Zig browser core. |
 
 ### Browser Bridge APIs
@@ -352,6 +349,8 @@ not implementation gaps:
 | `webui_show()`, `webui_start_server()`, `webui_get_url()` | Initial `Content`, runtime `Window.setContent()`, `App.start()`, `Window.open()`, and `Window.url()`. `Window.open()` launches the best installed browser in app mode and falls back to the OS URL handler, matching upstream `webui_show()` with `AnyBrowser`. |
 | `webui_show_client()` | `Client.show()` replaces the window content and navigates only the selected client. |
 | `webui_is_shown()` | `Window.isShown()` reports whether the window has at least one connected browser client. |
+| `webui_set_center()` | `App.WindowOptions.center` and `Window.setCenter()` centre the window on the primary display. Upstream reads the monitor geometry natively, which needs GDK on Linux; the browser computes the coordinates instead, so centring applies once a client connects rather than at launch. Centring and an explicit position clear each other. |
+| `webui_delete_profile()`, `webui_delete_all_profiles()` | `Window.deleteProfile()`, `deleteManagedProfile()`, and `deleteAllManagedProfiles()` remove generated profile directories only. A window configured with `.profile_directory` returns `error.CallerManagedProfile`; caller-owned directories are never deleted. |
 | `webui_set_size()`, `webui_set_position()` | `App.WindowOptions.size` and `.position` set initial geometry. `Window.setSize()` and `Window.setPosition()` persist updates, notify connected clients, replay the latest geometry to later clients, and affect subsequent explicit browser launches. |
 | `webui_set_high_contrast()`, `webui_is_high_contrast()` | `App.WindowOptions.high_contrast` controls Chromium forced-color support with explicit unsupported-browser errors. Browser-side `webui.isHighContrast()` uses native forced-color and contrast media queries without external programs. |
 | `webui_open_url()` | `openUrl()` safely passes a non-empty URL as one argument to the platform default opener. |
@@ -448,9 +447,7 @@ child tracking methods in the ledger.
   detects active high-contrast media preferences.
 - Implement focus, minimize, maximize, resizable, remaining geometry,
   frameless, and transparent controls where the selected browser and platform
-  support them.
-- Implement managed profile deletion only if zig-webui takes ownership of
-  profile lifecycle.
+  support them. Upstream applies all of them to its native WebView only.
 
 ### File monitoring (complete)
 
@@ -533,7 +530,4 @@ zig build -Dtarget=aarch64-macos
 
 Continue capability parity:
 
-1. Add focus, minimize, maximize, resizable, minimum-size, and center
-   behavior.
-2. Decide whether to add managed browser profile deletion or keep profile
-   lifecycle caller-owned.
+1. Add focus, minimize, maximize, resizable, and minimum-size behavior.

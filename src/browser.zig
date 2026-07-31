@@ -343,7 +343,7 @@ fn managedProfileName(selected: Browser) ?[]const u8 {
 /// Temporary profile directory used when the caller does not manage one. The
 /// browser creates the directory on first use; returns null when no managed
 /// profile applies. Caller owns the returned memory.
-fn managedProfileDirectory(
+pub fn managedProfileDirectory(
     gpa: std.mem.Allocator,
     selected: Browser,
 ) !?[]u8 {
@@ -366,6 +366,39 @@ fn managedProfileDirectory(
         // sandboxed target turns out to need it.
         else => try std.fmt.allocPrint(gpa, "/tmp/.WebUI/{s}", .{name}),
     };
+}
+
+/// Delete the managed profile directory of `selected` and report whether one
+/// existed. Caller-managed profile directories are never touched: only the
+/// path `managedProfileDirectory` generates is removed.
+pub fn deleteManagedProfile(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    selected: Browser,
+) !bool {
+    const path = try managedProfileDirectory(gpa, selected) orelse return false;
+    defer gpa.free(path);
+    const parent_path = std.fs.path.dirname(path) orelse return false;
+    const name = std.fs.path.basename(path);
+    var parent = std.Io.Dir.openDirAbsolute(io, parent_path, .{}) catch |err|
+        switch (err) {
+            error.FileNotFound, error.NotDir => return false,
+            else => return err,
+        };
+    defer parent.close(io);
+    parent.access(io, name, .{}) catch return false;
+    try parent.deleteTree(io, name);
+    return true;
+}
+
+/// Delete every managed profile directory and report how many existed.
+pub fn deleteAllManagedProfiles(gpa: std.mem.Allocator, io: std.Io) !usize {
+    var deleted: usize = 0;
+    for (std.enums.values(Browser)) |selected|
+        if (try deleteManagedProfile(gpa, io, selected)) {
+            deleted += 1;
+        };
+    return deleted;
 }
 
 fn commandSucceeds(
