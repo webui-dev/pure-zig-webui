@@ -89,7 +89,8 @@ races, and synchronous access to the actual `port = 0` address through
 
 - WebView2, GTK/WebKit, or WKWebView.
 - Deno, Node, or Bun server-side runtimes.
-- Browser window controls and geometry.
+- Browser window controls and geometry, most of which upstream implements for
+  its native WebView only.
 - Managed browser profile deletion.
 
 These do not block the external-browser core, but they are required before
@@ -324,10 +325,12 @@ implementations.
 |---|---|
 | `webui_set_kiosk()` | `App.WindowOptions.kiosk` generates an explicit Chromium-family (`--chrome-frame --kiosk`) or Firefox (`-kiosk`) argument, and returns an error for browsers that cannot honour it. |
 | `webui_set_hide()` | `App.WindowOptions.hide` launches the browser headless through `--headless=new` or Firefox `-headless`. |
-| `webui_focus()`, `webui_minimize()`, `webui_maximize()` | Browser window lifecycle controls are not implemented. |
-| `webui_set_resizable()`, `webui_set_minimum_size()`, `webui_set_center()` | These browser window geometry controls are not implemented. |
-| `webui_set_frameless()`, `webui_set_transparent()` | Frameless and transparent browser window modes are not implemented. |
-| `webui_delete_profile()`, `webui_delete_all_profiles()` | Caller-managed profile directories are supported, but automatic profile deletion is not implemented. |
+| `webui_focus()` | Not implemented. Upstream supports it for external browsers on Windows only, by enumerating top-level windows of the child process, and documents Linux and macOS as no-ops. |
+| `webui_minimize()`, `webui_maximize()` | Not implemented. Upstream routes both to its native WebView only. |
+| `webui_set_center()` | Not implemented. Upstream computes a centred `--window-position` from the primary monitor geometry, which needs GDK on Linux; the browser-side `screen` object and the existing `Window.setPosition()` protocol can supply it without a C dependency. |
+| `webui_set_resizable()`, `webui_set_minimum_size()` | Not implemented. Upstream stores both and applies them only in its Win32 and GTK WebView window procedures, so external browsers ignore them there too. |
+| `webui_set_frameless()`, `webui_set_transparent()` | Not implemented. Upstream applies both only to its native WebView windows; external browsers ignore them there too. |
+| `webui_delete_profile()`, `webui_delete_all_profiles()` | Profile deletion is not implemented. Caller-managed directories stay caller-owned, and the managed Chromium profile under the system temporary directory is reused across runs and never removed. |
 | `webui_set_runtime()` | Deno, Node.js, and Bun execution for served files is not implemented. |
 | `webui_show_wv()`, `webui_set_close_handler_wv()`, `webui_get_hwnd()`, `webui_win32_get_hwnd()` | Native WebView hosting and native window handles are outside the pure Zig browser core. |
 
