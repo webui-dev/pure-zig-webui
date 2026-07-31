@@ -13,6 +13,7 @@ pub const Logger = @import("app.zig").Logger;
 pub const Event = @import("app.zig").Event;
 pub const EventKind = @import("app.zig").EventKind;
 pub const EventMode = @import("app.zig").EventMode;
+pub const Runtime = @import("app.zig").Runtime;
 pub const EventHandler = @import("app.zig").EventHandler;
 pub const EvalResult = @import("app.zig").EvalResult;
 pub const Content = @import("app.zig").Content;

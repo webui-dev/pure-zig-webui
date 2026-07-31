@@ -50,6 +50,8 @@ The current phase provides:
   validation for `.external_url`;
 - optional path-scoped `HttpOnly` cookie authorization through
   `App.Options.use_cookies`;
+- optional Deno, Node.js, or Bun interpretation of served `.js` and `.ts`
+  files through `App.WindowOptions.runtime`;
 - loopback-only listening by default and caller-provided TLS for explicit
   public listening;
 - app-mode window launching through installed-browser discovery, with a
@@ -197,6 +199,19 @@ Serve a directory by setting
 `.content = .{ .directory = "path/to/public" }`. The path is opened when the
 app starts and closed when it stops. Custom resources receive `webui.Request`
 and `webui.Response` directly.
+
+Set `.runtime = .deno`, `.node_js`, or `.bun` in `App.WindowOptions` to run
+served `.js` and `.ts` files through an external interpreter instead of
+sending them to the browser. A request for a directory resolves `index.ts`
+and then `index.js`. The interpreter is spawned as argv, never through a
+shell, and receives the script path followed by the raw query string, so a
+query can never become a command. Standard output is answered as
+`text/plain` and bounded by `Limits.max_runtime_output`; a run is abandoned
+after 30 seconds. Matching upstream, a missing interpreter, a timeout, or
+oversized output answers an empty `200` so one absent runtime does not break
+the page — every such case is reported through the window logger, as is a
+non-zero exit status. Percent escapes in the request path are never decoded,
+so they cannot become path separators or hide a traversal.
 
 Set `App.Options.default_directory` to let windows created without `.content`
 inherit one static directory. Explicit window content takes precedence. A

@@ -8,6 +8,8 @@ const default_max_pending_evals = 64;
 const default_max_pending_replies = 64;
 const default_max_pending_events = 64;
 const max_icon_size = 8 << 20;
+/// Interpreter diagnostics retained for one log line.
+const max_runtime_diagnostics = 8 << 10;
 const capability_len = 32;
 const cookie_len = 32;
 const cookie_name = "webui_auth";
@@ -28,8 +30,11 @@ pub const Limits = struct {
     max_binding_name_size: usize = 256,
     max_event_size: usize = 8 << 10,
     max_script_size: usize = 256 << 10,
+    /// Maximum output captured from a `Runtime` interpreter per request.
+    max_runtime_output: usize = 16 << 20,
 
     fn validate(self: Limits) !void {
+        if (self.max_runtime_output == 0) return error.InvalidLimits;
         const max_payload = self.max_ws_message_size -| protocol.header_len;
         if (self.max_connections == 0 or
             self.max_unauthenticated_connections == 0 or
@@ -78,6 +83,33 @@ pub const EventKind = enum {
 pub const EventMode = enum(u8) {
     serial,
     concurrent,
+};
+
+/// External interpreter used to serve `.js` and `.ts` files from directory
+/// content instead of sending them to the browser.
+pub const Runtime = enum {
+    deno,
+    node_js,
+    bun,
+
+    /// Interpreter argv preceding the script path. Upstream WebUI grants Deno
+    /// these permissions explicitly; Node.js and Bun need no equivalent.
+    fn command(self: Runtime) []const []const u8 {
+        return switch (self) {
+            .deno => &.{
+                "deno",
+                "run",
+                "--quiet",
+                "--allow-read",
+                "--allow-write",
+                "--allow-net",
+                "--allow-env",
+                "--allow-ffi",
+            },
+            .node_js => &.{"node"},
+            .bun => &.{"bun"},
+        };
+    }
 };
 
 pub const Event = struct {
@@ -486,6 +518,7 @@ const WindowState = struct {
     event_binding: ?EventBinding = null,
     logger: ?Logger,
     logger_user_data: ?*anyopaque,
+    runtime: ?Runtime,
     browser_controls: browser.WindowControls,
     controls_mutex: std.Io.Mutex = .init,
     mutex: std.Io.Mutex = .init,
@@ -1921,6 +1954,9 @@ pub const App = struct {
         profile_directory: ?[]const u8 = null,
         /// Browser proxy rule, copied by the app and passed as one argument.
         proxy_server: ?[]const u8 = null,
+        /// External interpreter for `.js` and `.ts` files served from
+        /// directory content. Null serves those files verbatim.
+        runtime: ?Runtime = null,
         /// One client by default; values above one explicitly enable
         /// bounded multi-client mode.
         max_clients: usize = 1,
@@ -2012,6 +2048,7 @@ pub const App = struct {
             .event_mode = .init(options.event_mode),
             .logger = self.options.logger,
             .logger_user_data = self.options.logger_user_data,
+            .runtime = options.runtime,
             .browser_controls = browser_controls,
         };
         try self.windows.append(self.gpa, state);
@@ -2354,6 +2391,132 @@ fn setCookie(
     ));
 }
 
+/// Longest directory-index path accepted for interpreter dispatch, bounded so
+/// the lookup needs no allocation.
+const max_script_sub_path = 512;
+
+/// Wall-clock budget for one interpreter run, so a hanging script releases its
+/// connection instead of holding it forever.
+const runtime_timeout: std.Io.Clock.Duration = .{
+    .raw = std.Io.Duration.fromSeconds(30),
+    .clock = .awake,
+};
+
+/// Return the sub-path of the script this request should run through the
+/// interpreter, or null when the request is not a readable script. Directory
+/// requests fall back to `index.ts` and then `index.js`, matching upstream.
+/// Percent escapes are never decoded, so an escape can neither become a path
+/// separator nor hide a traversal; the request path is matched verbatim.
+fn runtimeScript(
+    dir: std.Io.Dir,
+    io: std.Io,
+    resource: []const u8,
+    buffer: []u8,
+) ?[]const u8 {
+    if (resource.len == 0 or resource[resource.len - 1] == '/') {
+        for ([_][]const u8{ "index.ts", "index.js" }) |name| {
+            const candidate = std.fmt.bufPrint(
+                buffer,
+                "{s}{s}",
+                .{ resource, name },
+            ) catch return null;
+            if (readableScript(dir, io, candidate)) return candidate;
+        }
+        return null;
+    }
+    const extension = std.fs.path.extension(resource);
+    if (!std.mem.eql(u8, extension, ".js") and
+        !std.mem.eql(u8, extension, ".ts"))
+    {
+        return null;
+    }
+    if (!readableScript(dir, io, resource)) return null;
+    return resource;
+}
+
+fn readableScript(dir: std.Io.Dir, io: std.Io, sub_path: []const u8) bool {
+    if (!safeSubPath(sub_path)) return false;
+    dir.access(io, sub_path, .{ .read = true }) catch return false;
+    return true;
+}
+
+fn safeSubPath(sub_path: []const u8) bool {
+    if (sub_path.len == 0 or std.fs.path.isAbsolute(sub_path)) return false;
+    if (std.mem.indexOfScalar(u8, sub_path, 0) != null) return false;
+    // A backslash is a separator on Windows and an ordinary name byte
+    // elsewhere, so rejecting it keeps one meaning on every platform.
+    if (std.mem.indexOfScalar(u8, sub_path, '\\') != null) return false;
+    var components = std.mem.splitScalar(u8, sub_path, '/');
+    while (components.next()) |component|
+        if (std.mem.eql(u8, component, "..")) return false;
+    return true;
+}
+
+/// Run one script through its interpreter and answer with the captured
+/// standard output. The script receives its own path and the raw query string
+/// as two arguments; no shell is involved, so a query can never be a command.
+fn interpretScript(
+    window: *WindowState,
+    io: std.Io,
+    runtime: Runtime,
+    root: []const u8,
+    sub_path: []const u8,
+    query: []const u8,
+    response: *Linsang.Response,
+) !void {
+    const gpa = window.gpa;
+    const full_path = try std.fs.path.join(gpa, &.{ root, sub_path });
+    defer gpa.free(full_path);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, runtime.command());
+    try argv.appendSlice(gpa, &.{ full_path, query });
+
+    const result = std.process.run(gpa, io, .{
+        .argv = argv.items,
+        .stdout_limit = .limited(window.limits.max_runtime_output),
+        .stderr_limit = .limited(max_runtime_diagnostics),
+        .timeout = .{ .duration = runtime_timeout },
+    }) catch |err| switch (err) {
+        // Upstream answers an empty 200 when the interpreter is missing or
+        // its run fails, so one absent runtime never breaks the served page.
+        // Log the reason instead of failing silently.
+        error.FileNotFound,
+        error.AccessDenied,
+        error.InvalidExe,
+        error.Timeout,
+        error.StreamTooLong,
+        => {
+            window.log(
+                .warn,
+                "Runtime {s} could not run {s}: {}",
+                .{ @tagName(runtime), sub_path, err },
+            );
+            return respondScript(response, "");
+        },
+        else => return err,
+    };
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    const failed = switch (result.term) {
+        .exited => |code| code != 0,
+        else => true,
+    };
+    if (failed) window.log(
+        .warn,
+        "Runtime {s} exited with {any} for {s}: {s}",
+        .{ @tagName(runtime), result.term, sub_path, result.stderr },
+    );
+    return respondScript(response, result.stdout);
+}
+
+fn respondScript(response: *Linsang.Response, body: []const u8) !void {
+    try response.setHeader("Content-Type", "text/plain; charset=utf-8");
+    try response.setHeader("X-Content-Type-Options", "nosniff");
+    try response.write(body);
+}
+
 fn route(app: *const App, path: []const u8) ?Route {
     if (path.len < capability_len + 2 or
         path[0] != '/' or
@@ -2451,6 +2614,33 @@ fn onRequest(
         },
         .directory => |directory| blk: {
             const dir = directory.dir orelse break :blk failResponse(response);
+            if (window.runtime) |runtime| {
+                var script_buffer: [max_script_sub_path]u8 = undefined;
+                if (runtimeScript(
+                    dir,
+                    io,
+                    resolved.resource,
+                    &script_buffer,
+                )) |sub_path| {
+                    interpretScript(
+                        window,
+                        io,
+                        runtime,
+                        directory.path,
+                        sub_path,
+                        request.query,
+                        response,
+                    ) catch |err| {
+                        window.log(
+                            .warn,
+                            "Runtime interpretation of {s} failed: {}",
+                            .{ sub_path, err },
+                        );
+                        break :blk failResponse(response);
+                    };
+                    break :blk .respond;
+                }
+            }
             // ponytail: Linsang StaticFiles has no mount prefix yet. Rewrite
             // only the validated path slice; use strip_prefix when available.
             @constCast(request).path = request.path[capability_len + 1 ..];
@@ -3851,6 +4041,217 @@ test "selected browser launch applies window controls and owns process" {
         window.browserProcessId(&running),
     );
     try std.testing.expectError(error.NotRunning, window.open(io, &running));
+}
+
+test "runtime script lookup resolves indexes and rejects escapes" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "nested");
+    for ([_][]const u8{
+        "index.ts",
+        "index.js",
+        "page.js",
+        "page.mjs",
+        "nested/index.js",
+    }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+
+    var buffer: [max_script_sub_path]u8 = undefined;
+    // A directory request prefers index.ts, exactly like upstream.
+    try std.testing.expectEqualStrings(
+        "index.ts",
+        runtimeScript(tmp.dir, io, "", &buffer).?,
+    );
+    try std.testing.expectEqualStrings(
+        "nested/index.js",
+        runtimeScript(tmp.dir, io, "nested/", &buffer).?,
+    );
+    try std.testing.expectEqualStrings(
+        "page.js",
+        runtimeScript(tmp.dir, io, "page.js", &buffer).?,
+    );
+    // Not a script extension, missing, or outside the directory.
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        runtimeScript(tmp.dir, io, "page.mjs", &buffer),
+    );
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        runtimeScript(tmp.dir, io, "absent.js", &buffer),
+    );
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        runtimeScript(tmp.dir, io, "../page.js", &buffer),
+    );
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        runtimeScript(tmp.dir, io, "nested/../../page.js", &buffer),
+    );
+    try std.testing.expect(!safeSubPath(""));
+    try std.testing.expect(!safeSubPath("/etc/passwd"));
+    try std.testing.expect(!safeSubPath("nested\\page.js"));
+    try std.testing.expect(!safeSubPath("page\x00.js"));
+    // Percent escapes stay literal, so they never become a traversal.
+    try std.testing.expect(safeSubPath("%2e%2e/page.js"));
+    try std.testing.expect(safeSubPath("nested/page.js"));
+    try std.testing.expect(safeSubPath("a..b.js"));
+}
+
+test "runtime interpreters serve script output" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "scripts");
+    // The interpreter receives the script path and then the raw query, so the
+    // query is the first script-visible argument on every runtime.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scripts/index.js",
+        .data =
+        \\const args = typeof Deno !== "undefined" ? Deno.args : process.argv.slice(2);
+        \\console.log("interpreted:" + args[0]);
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scripts/broken.js",
+        .data =
+        \\console.log("partial-output");
+        \\throw new Error("deliberate failure");
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scripts/page.html",
+        .data = "<p>static</p>",
+    });
+    const directory = try std.fmt.allocPrint(
+        gpa,
+        ".zig-cache/tmp/{s}/scripts",
+        .{tmp.sub_path},
+    );
+    defer gpa.free(directory);
+
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const runtimes = [_]Runtime{ .deno, .node_js, .bun };
+    var windows: [runtimes.len]Window = undefined;
+    for (runtimes, &windows) |runtime, *window| window.* = try app.createWindow(.{
+        .content = .{ .directory = directory },
+        .runtime = runtime,
+    });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+
+    for (runtimes, windows) |runtime, window| {
+        const capability = &window.state.capability;
+        const installed = try runtimeInstalled(gpa, io, runtime);
+        var response: [4096]u8 = undefined;
+
+        const index_target = try std.fmt.allocPrint(
+            gpa,
+            "/{s}/?name=zig",
+            .{capability},
+        );
+        defer gpa.free(index_target);
+        const index_body = try getTestPath(
+            running.inner.address,
+            io,
+            index_target,
+            "interpreted:",
+            &response,
+        );
+        try std.testing.expect(std.mem.startsWith(
+            u8,
+            index_body,
+            "HTTP/1.1 200",
+        ));
+        if (installed) {
+            // The directory index resolved to index.js and saw the query.
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                index_body,
+                "interpreted:name=zig",
+            ) != null);
+        } else {
+            // A missing interpreter answers an empty 200 rather than failing
+            // the page, matching upstream.
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                index_body,
+                "interpreted:",
+            ) == null);
+        }
+
+        // A failing script still serves whatever it wrote before dying.
+        const broken_target = try std.fmt.allocPrint(
+            gpa,
+            "/{s}/broken.js",
+            .{capability},
+        );
+        defer gpa.free(broken_target);
+        const broken_body = try getTestPath(
+            running.inner.address,
+            io,
+            broken_target,
+            "partial-output",
+            &response,
+        );
+        try std.testing.expectEqual(
+            installed,
+            std.mem.indexOf(u8, broken_body, "partial-output") != null,
+        );
+
+        // Non-script files are still served verbatim.
+        const static_target = try std.fmt.allocPrint(
+            gpa,
+            "/{s}/page.html",
+            .{capability},
+        );
+        defer gpa.free(static_target);
+        const static_body = try getTestPath(
+            running.inner.address,
+            io,
+            static_target,
+            "</p>",
+            &response,
+        );
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            static_body,
+            "<p>static</p>",
+        ) != null);
+    }
+
+    try running.stop();
+}
+
+fn runtimeInstalled(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    runtime: Runtime,
+) !bool {
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ runtime.command()[0], "--version" },
+        .stdout_limit = .limited(4 << 10),
+        .stderr_limit = .limited(4 << 10),
+    }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.InvalidExe => return false,
+        else => return err,
+    };
+    gpa.free(result.stdout);
+    gpa.free(result.stderr);
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
 }
 
 test "directory monitor reloads changed window only" {

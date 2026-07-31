@@ -29,14 +29,14 @@ deleted.
 |---|---|
 | Server and security | HTTP, WebSocket, TLS, loopback/public policy, capabilities, Origin checks, cookies, and protocol limits are implemented. |
 | Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, browser-native high-contrast detection, and multiple clients are implemented. |
-| Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, logging, and deterministic shutdown are implemented. |
+| Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, Deno/Node.js/Bun script interpretation, logging, and deterministic shutdown are implemented. |
 | Browser integration | App-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed profile directories, Chromium-family proxy rules, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
 | Current validation | `zig build test`, native builds, Windows x86_64 builds, macOS aarch64 builds, and Windows/macOS test-module cross-compilation pass. |
 
 Remaining work is limited to the remaining browser window controls and
-geometry, managed profile deletion, server-side runtimes, optional native
-WebViews and handles, and the final parity validation gates. The coverage
-ledger below is the authoritative method-level list.
+geometry, managed profile deletion, optional native WebViews and handles, and
+the final parity validation gates. The coverage ledger below is the
+authoritative method-level list.
 
 ## Original Baseline
 
@@ -88,7 +88,6 @@ races, and synchronous access to the actual `port = 0` address through
 ### Remaining capability parity
 
 - WebView2, GTK/WebKit, or WKWebView.
-- Deno, Node, or Bun server-side runtimes.
 - Browser window controls and geometry, most of which upstream implements for
   its native WebView only.
 - Managed browser profile deletion.
@@ -331,7 +330,6 @@ implementations.
 | `webui_set_resizable()`, `webui_set_minimum_size()` | Not implemented. Upstream stores both and applies them only in its Win32 and GTK WebView window procedures, so external browsers ignore them there too. |
 | `webui_set_frameless()`, `webui_set_transparent()` | Not implemented. Upstream applies both only to its native WebView windows; external browsers ignore them there too. |
 | `webui_delete_profile()`, `webui_delete_all_profiles()` | Profile deletion is not implemented. Caller-managed directories stay caller-owned, and the managed Chromium profile under the system temporary directory is reused across runs and never removed. |
-| `webui_set_runtime()` | Deno, Node.js, and Bun execution for served files is not implemented. |
 | `webui_show_wv()`, `webui_set_close_handler_wv()`, `webui_get_hwnd()`, `webui_win32_get_hwnd()` | Native WebView hosting and native window handles are outside the pure Zig browser core. |
 
 ### Browser Bridge APIs
@@ -362,6 +360,7 @@ not implementation gaps:
 | `webui_get_child_process_id()` | `Window.openWithBrowser()` returns the retained direct child's `BrowserProcessId`; `Window.browserProcessId()` retrieves it later. |
 | `webui_get_parent_process_id()` | Root-level `parentProcessId()` returns the current Zig backend's numeric process ID without a redundant window argument. Unsupported process targets return an explicit error. |
 | `webui_set_default_root_folder()` | `App.Options.default_directory` supplies directory content to windows created without explicit content. |
+| `webui_set_runtime()` | `App.WindowOptions.runtime` selects Deno, Node.js, or Bun for served `.js` and `.ts` files, including `index.ts`/`index.js` directory resolution. The interpreter is spawned as argv rather than through a shell, so a query string cannot be injected as a command. |
 | `webui_set_config(folder_monitor)` | `App.Options.folder_monitor_interval` enables portable recursive directory polling and reloads the affected window's connected clients. |
 | `webui_set_icon()`, `webui_set_icon_file()` | `Window.setIcon()` copies inline data and MIME type; `Window.setIconFile()` loads a supported image file as the window favicon. |
 | `webui_set_profile()` | `App.WindowOptions.profile_directory` is copied and mapped to Chromium-family `--user-data-dir` or Firefox `--profile`. Chromium-family launches without it use a managed temporary profile such as `/tmp/.WebUI/WebUIChromeProfile`, which is what keeps the app window independent of a running browser instance. The caller owns directory lifecycle; zig-webui never deletes a profile. |
