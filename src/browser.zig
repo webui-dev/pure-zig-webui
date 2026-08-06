@@ -116,6 +116,76 @@ pub fn parentProcessId() !u32 {
     };
 }
 
+/// Bring the visible top-level window owned by a retained browser child to
+/// the foreground. Upstream only supports external-browser focus on Windows.
+pub fn focusProcess(process: ProcessId) !void {
+    return switch (builtin.os.tag) {
+        .windows => focusWindowsProcess(process),
+        else => error.UnsupportedPlatform,
+    };
+}
+
+fn focusWindowsProcess(process: ProcessId) !void {
+    const process_id = Win32.GetProcessId(process);
+    if (process_id == 0) return error.BrowserProcessUnavailable;
+
+    var context = Win32.FocusContext{ .process_id = process_id };
+    _ = Win32.EnumWindows(
+        Win32.focusWindow,
+        @bitCast(@intFromPtr(&context)),
+    );
+    if (!context.found) return error.BrowserWindowNotFound;
+    if (!context.focused) return error.BrowserFocusFailed;
+}
+
+const Win32 = struct {
+    const windows = std.os.windows;
+    const sw_restore = 9;
+
+    const FocusContext = struct {
+        process_id: windows.DWORD,
+        found: bool = false,
+        focused: bool = false,
+    };
+
+    fn focusWindow(
+        window: windows.HWND,
+        context_value: windows.LPARAM,
+    ) callconv(.winapi) windows.BOOL {
+        var window_process_id: windows.DWORD = 0;
+        _ = GetWindowThreadProcessId(window, &window_process_id);
+        if (window_process_id != context(context_value).process_id or
+            !IsWindowVisible(window).toBool())
+        {
+            return .TRUE;
+        }
+
+        const focus = context(context_value);
+        focus.found = true;
+        if (IsIconic(window).toBool()) _ = ShowWindow(window, sw_restore);
+        focus.focused = SetForegroundWindow(window).toBool();
+        return .FALSE;
+    }
+
+    fn context(value: windows.LPARAM) *FocusContext {
+        return @ptrFromInt(@as(usize, @bitCast(value)));
+    }
+
+    extern "kernel32" fn GetProcessId(process: windows.HANDLE) callconv(.winapi) windows.DWORD;
+    extern "user32" fn EnumWindows(
+        callback: *const fn (windows.HWND, windows.LPARAM) callconv(.winapi) windows.BOOL,
+        context_value: windows.LPARAM,
+    ) callconv(.winapi) windows.BOOL;
+    extern "user32" fn GetWindowThreadProcessId(
+        window: windows.HWND,
+        process_id: ?*windows.DWORD,
+    ) callconv(.winapi) windows.DWORD;
+    extern "user32" fn IsWindowVisible(window: windows.HWND) callconv(.winapi) windows.BOOL;
+    extern "user32" fn IsIconic(window: windows.HWND) callconv(.winapi) windows.BOOL;
+    extern "user32" fn ShowWindow(window: windows.HWND, command: c_int) callconv(.winapi) windows.BOOL;
+    extern "user32" fn SetForegroundWindow(window: windows.HWND) callconv(.winapi) windows.BOOL;
+};
+
 /// Open a non-empty URL with the operating system's default handler.
 pub fn openUrl(
     gpa: std.mem.Allocator,
@@ -352,9 +422,9 @@ pub fn managedProfileDirectory(
         .windows => blk: {
             const temp = (std.process.Environ{ .block = .global })
                 .getAlloc(gpa, "TEMP") catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return null,
-                };
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return null,
+            };
             defer gpa.free(temp);
             break :blk try std.fmt.allocPrint(
                 gpa,
@@ -761,6 +831,20 @@ test "parent process ID identifies the backend process" {
             @as(u32, @intCast(std.os.linux.getpid())),
             actual,
         );
+}
+
+test "browser focus has an explicit platform contract" {
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectError(
+            error.BrowserProcessUnavailable,
+            focusProcess(@ptrFromInt(1)),
+        );
+    } else {
+        try std.testing.expectError(
+            error.UnsupportedPlatform,
+            focusProcess(@as(ProcessId, 1)),
+        );
+    }
 }
 
 test "browser candidates and preference order cover every browser" {

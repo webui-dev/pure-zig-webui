@@ -64,6 +64,8 @@ The current phase provides:
 - per-window browser profile directories with deletable managed profiles,
   and Chromium-family proxy rules;
 - per-window browser child identifiers and deterministic process cleanup;
+- Windows external-browser focus with explicit errors on unsupported
+  platforms and unavailable windows;
 - current backend process ID through `parentProcessId()`;
 - default-browser launching and deterministic shutdown.
 
@@ -150,6 +152,13 @@ The returned `BrowserProcessId`, also available through
 `Window.browserProcessId()`, is a PID on POSIX and a process handle on
 Windows. Each window retains at most one launched child; launching another
 replaces it, and `Running.stop()` kills and reaps every retained child.
+
+`Window.focus(&running)` restores a minimized retained browser window and
+brings it to the foreground on Windows. It returns `error.NoManagedBrowser`
+before a browser is launched, `error.BrowserProcessUnavailable` for an invalid
+child handle, `error.BrowserWindowNotFound` when the child has no visible
+top-level window, and `error.BrowserFocusFailed` when Windows refuses the
+foreground request. Linux and macOS return `error.UnsupportedPlatform`.
 
 `parentProcessId()` returns the numeric ID of the current Zig backend process,
 which is the parent of browsers launched directly by this package. It is

@@ -1763,6 +1763,14 @@ pub const Window = struct {
         return running.app.browserId(running.inner.io, self.state);
     }
 
+    /// Bring this window's retained browser process to the foreground.
+    /// External-browser focus is available on Windows only.
+    pub fn focus(self: Window, running: *const Running) !void {
+        if (running.stopped or !running.app.started) return error.NotRunning;
+        if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
+        return running.app.focusBrowser(running.inner.io, self.state);
+    }
+
     /// Return whether at least one browser client is connected.
     pub fn isShown(self: Window, io: std.Io) bool {
         return self.state.hasClients(io);
@@ -2270,6 +2278,15 @@ pub const App = struct {
         for (self.managed_browsers.items) |*managed|
             if (managed.window == window) return managed.child.id;
         return null;
+    }
+
+    fn focusBrowser(self: *App, io: std.Io, window: *WindowState) !void {
+        self.browser_mutex.lockUncancelable(io);
+        defer self.browser_mutex.unlock(io);
+        for (self.managed_browsers.items) |*managed|
+            if (managed.window == window)
+                return browser.focusProcess(managed.child.id.?);
+        return error.NoManagedBrowser;
     }
 
     fn stopBrowsers(self: *App, io: std.Io) void {
@@ -4127,6 +4144,11 @@ test "selected browser launch applies window controls and owns process" {
             .executable = "",
         }),
     );
+    try std.testing.expectError(error.NoManagedBrowser, window.focus(&running));
+    try std.testing.expectError(
+        error.UnknownWindow,
+        foreign_window.focus(&running),
+    );
     try std.testing.expectEqual(
         @as(usize, 0),
         try window.setSize(io, .{ .width = 1366, .height = 768 }),
@@ -4159,6 +4181,7 @@ test "selected browser launch applies window controls and owns process" {
     );
     defer gpa.free(expected_first);
     try std.testing.expectEqualStrings(expected_first, first_argv);
+    try std.testing.expectError(error.UnsupportedPlatform, window.focus(&running));
 
     const second_id = try window.openWithBrowser(&running, .{
         .browser = .chromium,
@@ -4270,6 +4293,7 @@ test "selected browser launch applies window controls and owns process" {
         error.NotRunning,
         window.browserProcessId(&running),
     );
+    try std.testing.expectError(error.NotRunning, window.focus(&running));
     try std.testing.expectError(error.NotRunning, window.open(io, &running));
 }
 
