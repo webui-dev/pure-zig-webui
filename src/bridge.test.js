@@ -131,6 +131,17 @@ test("bridge handles commands and external script origins", async () => {
             "run",
         );
 
+        const anonymous = { id: "" };
+        const sendsBeforeEmptyClick = socket.sendCount;
+        clickListener({
+            target: {
+                closest(selector) {
+                    return selector === "[id]" ? anonymous : null;
+                },
+            },
+        });
+        assert.equal(socket.sendCount, sendsBeforeEmptyClick);
+
         let prevented = false;
         const link = { href: "http://localhost/next" };
         clickListener({
@@ -228,6 +239,28 @@ test("bridge handles commands and external script origins", async () => {
             new TextDecoder().decode(eventPacket.subarray(8)),
             "http://localhost/history",
         );
+
+        // Backend-initiated navigation must bypass the navigate listener
+        // instead of bouncing back to Zig as a navigation event.
+        await navigationSocket.onmessage({
+            data: frame(0xfb, encoder.encode("http://localhost/backend")),
+        });
+        assert.equal(globalThis.location.href, "http://localhost/backend");
+        prevented = false;
+        const sendsAfterBackendNavigation = navigationSocket.sendCount;
+        navigationListener({
+            cancelable: true,
+            destination: { url: "http://localhost/backend" },
+            preventDefault() {
+                prevented = true;
+            },
+        });
+        assert.equal(prevented, false);
+        assert.equal(
+            navigationSocket.sendCount,
+            sendsAfterBackendNavigation,
+        );
+        globalThis.webui.allowNavigation(false);
         globalThis.webui.allowNavigation(true);
         prevented = false;
         const sendsBeforeAllowedNavigation = navigationSocket.sendCount;
