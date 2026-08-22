@@ -141,6 +141,7 @@ fn focusWindowsProcess(process: ProcessId) !void {
 const Win32 = struct {
     const windows = std.os.windows;
     const sw_restore = 9;
+    const sw_shownormal = 1;
 
     const FocusContext = struct {
         process_id: windows.DWORD,
@@ -172,6 +173,15 @@ const Win32 = struct {
     }
 
     extern "kernel32" fn GetProcessId(process: windows.HANDLE) callconv(.winapi) windows.DWORD;
+    /// Returns a value above 32 on success and an error code otherwise.
+    extern "shell32" fn ShellExecuteW(
+        window: ?windows.HWND,
+        operation: ?[*:0]const u16,
+        file: [*:0]const u16,
+        parameters: ?[*:0]const u16,
+        directory: ?[*:0]const u16,
+        show_command: c_int,
+    ) callconv(.winapi) usize;
     extern "user32" fn EnumWindows(
         callback: *const fn (windows.HWND, windows.LPARAM) callconv(.winapi) windows.BOOL,
         context_value: windows.LPARAM,
@@ -193,13 +203,37 @@ pub fn openUrl(
     url: []const u8,
 ) !void {
     if (url.len == 0) return error.InvalidUrl;
-    const argv: []const []const u8 = switch (builtin.os.tag) {
-        .windows => &.{ "explorer.exe", url },
-        .macos => &.{ "open", url },
-        else => &.{ "xdg-open", url },
-    };
-    if (!try commandSucceeds(gpa, io, argv))
-        return error.BrowserOpenFailed;
+    switch (builtin.os.tag) {
+        .windows => {
+            // `explorer.exe` exits with code 1 even after delegating the URL
+            // successfully, so the default handler is invoked through
+            // `ShellExecuteW`, matching upstream, and judged by its
+            // documented result value.
+            const wide = std.unicode.utf8ToUtf16LeAllocZ(gpa, url) catch |err|
+                return switch (err) {
+                    error.InvalidUtf8 => error.InvalidUrl,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+            defer gpa.free(wide);
+            const result = Win32.ShellExecuteW(
+                null,
+                std.unicode.utf8ToUtf16LeStringLiteral("open"),
+                wide,
+                null,
+                null,
+                Win32.sw_shownormal,
+            );
+            if (result <= 32) return error.BrowserOpenFailed;
+        },
+        .macos => {
+            if (!try commandSucceeds(gpa, io, &.{ "open", url }))
+                return error.BrowserOpenFailed;
+        },
+        else => {
+            if (!try commandSucceeds(gpa, io, &.{ "xdg-open", url }))
+                return error.BrowserOpenFailed;
+        },
+    }
 }
 
 /// Return whether a browser is registered or available as an executable.
@@ -277,11 +311,12 @@ pub fn launch(
     };
 
     // Caller-supplied arguments replace the defaults instead of being merged
-    // with them, so an explicit argv is never contradicted.
+    // with them, so an explicit argv is never contradicted. Firefox gets no
+    // default arguments: upstream removed `-purgecaches` after it broke
+    // recent Firefox launches (upstream commit 52f9e75).
     const use_defaults = options.arguments.len == 0;
     if (use_defaults) switch (options.browser) {
-        .firefox => try argv.append(gpa, "-purgecaches"),
-        .safari => {},
+        .firefox, .safari => {},
         else => try argv.appendSlice(gpa, &chromium_defaults),
     };
 

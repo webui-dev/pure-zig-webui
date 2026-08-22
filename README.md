@@ -49,7 +49,8 @@ The current phase provides:
 - same-origin WebSocket validation for hosted content and external-page Origin
   validation for `.external_url`;
 - optional path-scoped `HttpOnly` cookie authorization through
-  `App.Options.use_cookies`;
+  `App.Options.use_cookies`, locking single-client windows to their first
+  client;
 - optional Deno, Node.js, or Bun interpretation of served `.js` and `.ts`
   files through `App.WindowOptions.runtime`;
 - loopback-only listening by default and caller-provided TLS for explicit
@@ -124,6 +125,12 @@ using the library does not require Node or npm. CI and release validation
 should run `zig build test-bridge`, which fails when Node is unavailable.
 `Window.evalAll` returns owned results; call `deinit` on them after consuming
 every per-client outcome.
+
+`Running.wait()` returns once every client is gone: a backend `Window.close()`
+or `Client.close()` ends it as soon as the last client disconnects, while any
+other disconnect — a page reload, a navigation, a closed browser window —
+gets a 1.5-second reconnect grace period first, so reloads and
+`Window.setContent()` do not stop the application.
 
 `Window.open()` discovers the best installed browser and launches it as a
 standalone app window, exactly like `Window.openWithBrowser()` with that
@@ -267,7 +274,10 @@ window content.
 navigation events. `Event.data` contains the element ID for clicks, the target
 URL for navigation, and is empty for connected or disconnected events.
 Navigation attempts are intercepted while an event handler is installed; call
-`Event.client.navigate` from the handler to continue them.
+`Event.client.navigate` from the handler to continue them. Backend-initiated
+navigation bypasses that interception. Install bindings and the event handler
+before `App.start()`; while the application runs, `Window.bind()` and
+`Window.onEvent` return `error.AlreadyStarted`.
 
 Handlers run in `.serial` mode by default. `Window.setEventMode(.concurrent)`
 changes newly received binding calls and browser events to independent tasks.

@@ -63,7 +63,7 @@
     if (globalThis.__zigWebuiEvents || globalThis.__zigWebuiDomBindings) {
         document.addEventListener("click", (event) => {
             const element = event.target?.closest?.("[id]");
-            if (element) sendEvent(commandClick, element.id);
+            if (element && element.id) sendEvent(commandClick, element.id);
 
             if (globalThis.__zigWebuiEvents &&
                 !allowNavigation &&
@@ -132,6 +132,10 @@
             return;
         }
         if (bytes[7] === commandNavigation) {
+            // Backend-initiated navigation bypasses our own interception,
+            // matching upstream, which re-allows navigation before leaving;
+            // otherwise the navigate listener would bounce it back to Zig.
+            allowNavigation = true;
             location.href = decoder.decode(bytes.subarray(8));
             return;
         }

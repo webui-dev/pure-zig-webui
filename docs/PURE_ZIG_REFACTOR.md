@@ -364,10 +364,10 @@ not implementation gaps:
 | `webui_set_icon()`, `webui_set_icon_file()` | `Window.setIcon()` copies inline data and MIME type; `Window.setIconFile()` loads a supported image file as the window favicon. |
 | `webui_set_profile()` | `App.WindowOptions.profile_directory` is copied and mapped to Chromium-family `--user-data-dir` or Firefox `--profile`. Chromium-family launches without it use a managed temporary profile such as `/tmp/.WebUI/WebUIChromeProfile`, which is what keeps the app window independent of a running browser instance. Caller-provided directories remain caller-owned; generated profiles are removed only through the explicit deletion APIs. |
 | `webui_set_proxy()` | `App.WindowOptions.proxy_server` is copied and passed as one Chromium-family `--proxy-server` argument. Unsupported browsers return an explicit error. |
-| `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. |
+| `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. Matching upstream `WEBUI_RELOAD_TIMEOUT`, a disconnect that was not requested by a backend `close` gets a 1.5-second reconnect grace period before the wait ends, so reloads and navigations survive. |
 | `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `Running.stop()`, and `App.deinit()`. |
 | `webui_set_context()`, `webui_get_context()` | Binding and event-handler `user_data`. |
-| `webui_bind()` | `Window.bind()` handles explicit `webui.call()` requests and zero-argument DOM clicks from elements with a matching ID. |
+| `webui_bind()` | `Window.bind()` handles explicit `webui.call()` requests and zero-argument DOM clicks from elements with a matching ID. Bindings and `Window.onEvent` are installed before `App.start()`; runtime installation returns `error.AlreadyStarted` because upstream's runtime `webui_bind()` and `CMD_ADD_ID` push are not implemented. |
 | `webui_get_count()`, `webui_get_size()`, `webui_get_size_at()` | `Call.arguments.len` and `Call.bytes(index).len`. |
 | `webui_get_string()`, `webui_get_string_at()`, `webui_get_int()`, `webui_get_int_at()`, `webui_get_float()`, `webui_get_float_at()`, `webui_get_bool()`, `webui_get_bool_at()` | `Call.string()`, `Call.int()`, `Call.float()`, and `Call.boolean()`. |
 | `webui_return_string()`, `webui_return_int()`, `webui_return_float()`, `webui_return_bool()` | `Call.reply()`, `Call.replyInt()`, `Call.replyFloat()`, and `Call.replyBool()`. |
@@ -379,7 +379,7 @@ not implementation gaps:
 | `webui_close_client()`, `webui_navigate_client()`, `webui_send_raw_client()` | `Client.close()`, `Client.navigate()`, and `Client.sendRaw()`. |
 | `webui_navigate()`, `webui_send_raw()` | `Window.navigate()` and `Window.sendRaw()`. |
 | `webui_set_config(multi_client)` | `WindowOptions.max_clients`. |
-| `webui_set_config(use_cookies)` | `App.Options.use_cookies` adds a per-window, path-scoped `HttpOnly` authorization cookie while retaining capability URLs and protocol authentication. |
+| `webui_set_config(use_cookies)` | `App.Options.use_cookies` adds a per-window, path-scoped `HttpOnly` authorization cookie while retaining capability URLs and protocol authentication. Matching upstream, a single-client window is locked to the first client that receives the cookie: later cookieless content requests answer `403` and cookieless WebSocket upgrades are refused. Multi-client windows hand the cookie to every client and never block. |
 | `webui_set_logger()` | `App.Options.logger` and `logger_user_data`; messages use `std.log.Level` and fall back to `std.log` when no callback is set. |
 | `webui_set_public()` | `App.Options.public` permits non-loopback listening only with TLS; Origin and explicit connection and protocol limits are enforced. |
 | `webui_set_tls_certificate()` | `App.Options.tls` accepts caller-provided PEM certificate and private-key bytes. |
