@@ -49,7 +49,7 @@ pub const WindowControls = struct {
                 return error.InvalidWindowSize;
         if (self.profile_directory) |directory| {
             if (directory.len == 0 or
-                std.mem.indexOfScalar(u8, directory, 0) != null)
+                std.mem.findScalar(u8, directory, 0) != null)
             {
                 return error.InvalidBrowserProfile;
             }
