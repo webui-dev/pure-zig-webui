@@ -36,6 +36,8 @@ The current phase provides:
 - bounded delayed replies through `WindowOptions.max_pending_replies`;
 - explicit connection, WebSocket message, call, argument, binding, event, and
   script limits through `App.Options.limits`;
+- automatic browser-to-Zig protocol fragmentation for large calls and
+  JavaScript results, bounded by `Limits.max_ws_message_size`;
 - window navigation, close, raw-data, and JavaScript broadcasts with
   per-client results;
 - targeted and broadcast fire-and-forget JavaScript through `Client.run` and
@@ -304,6 +306,11 @@ before `App.deinit()`.
 The browser-side `webui` object also provides connection events, runtime
 logging, Base64 helpers, navigation control, and native high-contrast media
 query detection.
+
+Browser-to-Zig protocol packets of at least 65,500 bytes are sent as ordered
+`MULTI` chunks and reassembled per client. The announced total size is strictly
+parsed and bounded by `Limits.max_ws_message_size`; incomplete state is released
+when the client disconnects.
 
 Use `Client.run` or `Window.run` when JavaScript results and errors are not
 needed. These methods use the protocol's `JS_QUICK` command and do not consume

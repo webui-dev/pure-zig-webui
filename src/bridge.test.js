@@ -9,6 +9,7 @@ test("bridge handles commands and external script origins", async () => {
             this.url = url;
             this.closed = false;
             this.sent = undefined;
+            this.sentPackets = [];
             this.sendCount = 0;
             WebSocketMock.instance = this;
         }
@@ -19,14 +20,17 @@ test("bridge handles commands and external script origins", async () => {
 
         send(data) {
             this.sent = data;
+            this.sentPackets.push(data);
             this.sendCount += 1;
         }
     }
 
     const encoder = new TextEncoder();
-    const frame = (command, payload = new Uint8Array()) => {
+    const frame = (command, payload = new Uint8Array(), id = 0) => {
         const bytes = new Uint8Array(8 + payload.length);
+        const view = new DataView(bytes.buffer);
         bytes[0] = 0xdd;
+        view.setUint16(5, id, true);
         bytes[7] = command;
         bytes.set(payload, 8);
         return bytes;
@@ -106,6 +110,42 @@ test("bridge handles commands and external script origins", async () => {
         assert.deepEqual(bridgeEvents, [globalThis.webui.event.CONNECTED]);
         assert(logs.includes("WebUI -> Log Enabled."));
         assert(logs.includes("WebUI -> Connected"));
+        const largeArgument = new Uint8Array(65_500).fill(0x61);
+        const sendsBeforeMulti = socket.sentPackets.length;
+        const largeCall = globalThis.webui.call("large", largeArgument);
+        const multiPackets = socket.sentPackets.slice(sendsBeforeMulti);
+        assert.equal(multiPackets.length, 3);
+        const prePacket = new Uint8Array(multiPackets[0]);
+        assert.equal(prePacket[7], 0xf6);
+        assert.equal(prePacket.at(-1), 0);
+        const announcedLength = Number(
+            new TextDecoder().decode(prePacket.subarray(8, prePacket.length - 1)),
+        );
+        const chunks = multiPackets.slice(1).map((data) => new Uint8Array(data));
+        assert.equal(chunks[0].length, 65_500);
+        const rebuilt = new Uint8Array(
+            chunks.reduce((total, chunk) => total + chunk.length, 0),
+        );
+        let rebuiltAt = 0;
+        for (const chunk of chunks) {
+            rebuilt.set(chunk, rebuiltAt);
+            rebuiltAt += chunk.length;
+        }
+        assert.equal(rebuilt.length, announcedLength);
+        assert.equal(rebuilt[7], 0xf9);
+        assert.deepEqual(
+            rebuilt.subarray(
+                rebuilt.length - largeArgument.length - 1,
+                rebuilt.length - 1,
+            ),
+            largeArgument,
+        );
+        const largeCallId = new DataView(rebuilt.buffer).getUint16(5, true);
+        await socket.onmessage({
+            data: frame(0xf9, encoder.encode("large-ok"), largeCallId),
+        });
+        assert.equal(await largeCall, "large-ok");
+
         const sendsBeforeQuick = socket.sendCount;
         await socket.onmessage({
             data: frame(

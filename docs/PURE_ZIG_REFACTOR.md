@@ -19,7 +19,7 @@ the Zig standard library and launching an installed browser remain in scope.
 
 ## Current Rewrite Status
 
-Status snapshot: 2026-08-04.
+Status snapshot: 2026-09-03.
 
 The external-browser core is now implemented in Zig on top of pinned Linsang.
 The legacy wrapper, C API, compatibility files, and examples have been
@@ -28,7 +28,7 @@ deleted.
 | Area | Status |
 |---|---|
 | Server and security | HTTP, WebSocket, TLS, loopback/public policy, capabilities, Origin checks, cookies, and protocol limits are implemented. |
-| Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, browser-native high-contrast detection, and multiple clients are implemented. |
+| Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, browser-native high-contrast detection, bounded `MULTI` packet fragmentation, and multiple clients are implemented. |
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, Deno/Node.js/Bun script interpretation, logging, and deterministic shutdown are implemented. |
 | Browser integration | Centring, app-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed and deletable managed profile directories, Chromium-family proxy rules, Windows external-browser focus, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
 | Current validation | `zig build test`, native builds, Windows x86_64 builds, macOS aarch64 builds, and Windows/macOS test-module cross-compilation pass. |
@@ -131,8 +131,10 @@ the front end and back end do not change simultaneously:
 ```
 
 Support `CHECK_TK`, `CALL_FUNC`, `CLICK`, `JS`, `JS_QUICK`, `NAVIGATION`,
-`CLOSE`, and `SEND_RAW` first. Implement `MULTI` only if messages actually
-exceed the WebSocket message limit.
+`CLOSE`, `SEND_RAW`, and `MULTI`. The bridge splits browser-to-Zig protocol
+packets at 65,500 bytes; Zig strictly validates the announced total length,
+reassembles chunks per authenticated client, and applies the configured
+WebSocket message limit to the complete packet.
 
 `CHECK_TK` carries the 128-bit window capability in its payload. Successful
 authentication permanently associates that WebSocket connection with one
@@ -411,6 +413,8 @@ This completes the behavior represented by `webui_set_public()`,
 
 - Implements the complete public bridge surface.
 - Preserves string, number, boolean, and `Uint8Array` call arguments.
+- Implements bounded `MULTI` fragmentation for large browser-to-Zig calls and
+  JavaScript results, including strict length parsing and per-client cleanup.
 
 This completes `webui_bind()`, the remaining typed argument and return
 methods, and the public browser bridge surface.
@@ -510,6 +514,8 @@ zig build -Dtarget=aarch64-macos
   npm dependencies.
 - Integration tests cover HTTP content, WebSocket handshake, JavaScript-to-Zig,
   Zig-to-JavaScript, disconnect, and shutdown.
+- Integration tests cover fragmented browser calls across multiple WebSocket
+  messages and verify the reassembled argument and reply.
 - Fuzz input never panics or reads out of bounds. Messages and pending calls
   have explicit limits.
 - `rg 'webui_new|pub extern fn webui_' src` returns no results.

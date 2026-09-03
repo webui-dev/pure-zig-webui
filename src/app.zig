@@ -316,10 +316,39 @@ const PendingEval = struct {
     done: std.Io.Event = .unset,
 };
 
+const MultiPacket = struct {
+    bytes: []u8,
+    received: usize = 0,
+
+    fn init(gpa: std.mem.Allocator, size: usize) !MultiPacket {
+        return .{ .bytes = try gpa.alloc(u8, size) };
+    }
+
+    fn deinit(self: *MultiPacket, gpa: std.mem.Allocator) void {
+        gpa.free(self.bytes);
+        self.* = undefined;
+    }
+
+    fn append(self: *MultiPacket, data: []const u8) !bool {
+        if (data.len > self.bytes.len - self.received)
+            return error.MessageTooLarge;
+        @memcpy(self.bytes[self.received..][0..data.len], data);
+        self.received += data.len;
+        return self.received == self.bytes.len;
+    }
+};
+
+const IncomingMessage = union(enum) {
+    direct: []const u8,
+    incomplete,
+    owned: []u8,
+};
+
 const ConnectedClient = struct {
     id: u64,
     key: usize,
     peer: Linsang.WebSocketPeer,
+    multi: ?MultiPacket = null,
 };
 
 const DirectorySnapshot = struct {
@@ -562,7 +591,10 @@ const WindowState = struct {
         std.debug.assert(self.pending_events == 0);
         std.debug.assert(self.event_tasks.token.load(.acquire) == null);
         self.pending_evals.deinit(self.gpa);
-        for (self.clients.items) |*connected| connected.peer.deinit();
+        for (self.clients.items) |*connected| {
+            if (connected.multi) |*multi| multi.deinit(self.gpa);
+            connected.peer.deinit();
+        }
         self.clients.deinit(self.gpa);
         for (self.bindings.items) |item| self.gpa.free(item.name);
         self.bindings.deinit(self.gpa);
@@ -811,6 +843,42 @@ const WindowState = struct {
         return .{ .state = self, .client_id = self.clients.items[index].id };
     }
 
+    fn receiveMessage(
+        self: *WindowState,
+        connection: *Linsang.Connection,
+        data: []const u8,
+    ) !IncomingMessage {
+        self.mutex.lockUncancelable(connection.io);
+        defer self.mutex.unlock(connection.io);
+        const index = self.clientIndexByKey(@intFromPtr(connection)) orelse
+            return error.ConnectionClosed;
+        const connected = &self.clients.items[index];
+        const multi = if (connected.multi) |*value| value else return .{ .direct = data };
+        const complete = multi.append(data) catch |err| {
+            multi.deinit(self.gpa);
+            connected.multi = null;
+            return err;
+        };
+        if (!complete) return .incomplete;
+        const owned = multi.bytes;
+        connected.multi = null;
+        return .{ .owned = owned };
+    }
+
+    fn beginMulti(
+        self: *WindowState,
+        connection: *Linsang.Connection,
+        size: usize,
+    ) !void {
+        self.mutex.lockUncancelable(connection.io);
+        defer self.mutex.unlock(connection.io);
+        const index = self.clientIndexByKey(@intFromPtr(connection)) orelse
+            return error.ConnectionClosed;
+        const connected = &self.clients.items[index];
+        if (connected.multi != null) return error.MultiPacketInProgress;
+        connected.multi = try MultiPacket.init(self.gpa, size);
+    }
+
     fn disconnected(
         self: *WindowState,
         connection: *Linsang.Connection,
@@ -820,6 +888,7 @@ const WindowState = struct {
         const index = self.clientIndexByKey(@intFromPtr(connection)) orelse
             return null;
         var disconnected_client = self.clients.swapRemove(index);
+        if (disconnected_client.multi) |*multi| multi.deinit(self.gpa);
         disconnected_client.peer.deinit();
         for (self.pending_evals.items) |pending| {
             if (pending.client_id == disconnected_client.id) {
@@ -2877,14 +2946,30 @@ fn onMessage(
         return;
     }
     const app = appFrom(user_data);
-    const packet = protocol.decode(message.data) catch {
+    const authenticated = app.windowForConnection(connection);
+    var owned_message: ?[]u8 = null;
+    defer if (owned_message) |bytes| app.gpa.free(bytes);
+    const incoming_data: []const u8 = if (authenticated) |window|
+        switch (window.receiveMessage(connection, message.data) catch {
+            connection.wsClose(.message_too_big, "");
+            return;
+        }) {
+            .direct => |bytes| bytes,
+            .incomplete => return,
+            .owned => |bytes| blk: {
+                owned_message = bytes;
+                break :blk bytes;
+            },
+        }
+    else
+        message.data;
+    const packet = protocol.decode(incoming_data) catch {
         connection.wsClose(.protocol_error, "");
         return;
     };
 
     // ponytail: Linsang does not retain the upgrade route; bind the connection
     // with the capability in its first authenticated protocol packet.
-    const authenticated = app.windowForConnection(connection);
     if (packet.header.command == .check_token) {
         const window = app.windowByCapability(packet.payload) orelse {
             send(connection, app.gpa, packet.header, &.{0}) catch {};
@@ -2917,6 +3002,29 @@ fn onMessage(
             }) catch |err|
                 window.log(.err, "WebUI event dispatch failed: {}", .{err});
         }
+        return;
+    }
+    if (packet.header.command == .multi) {
+        const window = authenticated orelse {
+            connection.wsClose(.policy_violation, "");
+            return;
+        };
+        const expected = protocol.decodeMultiLength(
+            packet.payload,
+            app.options.limits.max_ws_message_size,
+        ) catch |err| {
+            connection.wsClose(
+                if (err == error.MessageTooLarge)
+                    .message_too_big
+                else
+                    .protocol_error,
+                "",
+            );
+            return;
+        };
+        window.beginMulti(connection, expected) catch {
+            connection.wsClose(.protocol_error, "");
+        };
         return;
     }
     const window = authenticated orelse {
@@ -3025,6 +3133,18 @@ fn onClose(connection: *Linsang.Connection, user_data: ?*anyopaque) void {
         const previous = app.unauthenticated_connections.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
     }
+}
+
+test "multi packet accumulator completes exactly and rejects overflow" {
+    const gpa = std.testing.allocator;
+    var multi = try MultiPacket.init(gpa, 9);
+    defer multi.deinit(gpa);
+
+    try std.testing.expect(!try multi.append("abc"));
+    try std.testing.expect(!try multi.append("defgh"));
+    try std.testing.expectError(error.MessageTooLarge, multi.append("ij"));
+    try std.testing.expect(try multi.append("i"));
+    try std.testing.expectEqualStrings("abcdefghi", multi.bytes);
 }
 
 const LoggerCapture = struct {
@@ -3415,6 +3535,14 @@ fn integrationHandler(call: *Call, user_data: ?*anyopaque) !void {
     try call.reply("Hello from Zig");
 }
 
+fn largeIntegrationHandler(call: *Call, user_data: ?*anyopaque) !void {
+    const argument = try call.bytes(0);
+    const received: *std.atomic.Value(usize) =
+        @ptrCast(@alignCast(user_data.?));
+    received.store(argument.len, .release);
+    try call.replyInt(argument.len);
+}
+
 const DeferredReplyCapture = struct {
     ready: std.atomic.Value(bool) = .init(false),
     limit_hit: std.atomic.Value(bool) = .init(false),
@@ -3713,14 +3841,23 @@ fn sendClientFrame(
     io: std.Io,
     payload: []const u8,
 ) !void {
-    if (payload.len > 125) return error.TestPayloadTooLarge;
-    var frame: [131]u8 = undefined;
+    if (payload.len > std.math.maxInt(u16)) return error.TestPayloadTooLarge;
+    var frame: [std.math.maxInt(u16) + 8]u8 = undefined;
     const mask = [4]u8{ 1, 2, 3, 4 };
     frame[0] = 0x82;
-    frame[1] = 0x80 | @as(u8, @intCast(payload.len));
-    @memcpy(frame[2..6], &mask);
-    for (payload, 0..) |byte, index| frame[6 + index] = byte ^ mask[index & 3];
-    try writeAll(stream, io, frame[0 .. payload.len + 6]);
+    const payload_at: usize = if (payload.len <= 125) blk: {
+        frame[1] = 0x80 | @as(u8, @intCast(payload.len));
+        @memcpy(frame[2..6], &mask);
+        break :blk 6;
+    } else blk: {
+        frame[1] = 0x80 | 126;
+        std.mem.writeInt(u16, frame[2..4], @intCast(payload.len), .big);
+        @memcpy(frame[4..8], &mask);
+        break :blk 8;
+    };
+    for (payload, 0..) |byte, index|
+        frame[payload_at + index] = byte ^ mask[index & 3];
+    try writeAll(stream, io, frame[0 .. payload.len + payload_at]);
 }
 
 fn readServerFrame(
@@ -5145,6 +5282,8 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
     try second_window.onEvent(integrationEventHandler, &secondary_events);
     var called_client_id: std.atomic.Value(u64) = .init(0);
     try window.bind("greet", integrationHandler, &called_client_id);
+    var large_argument_received: std.atomic.Value(usize) = .init(0);
+    try window.bind("large", largeIntegrationHandler, &large_argument_received);
     var dom_binding_called: std.atomic.Value(bool) = .init(false);
     try window.bind(
         "primary",
@@ -5455,6 +5594,44 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
     const reply_packet = try protocol.decode(replied);
     try std.testing.expectEqual(@as(u16, 9), reply_packet.header.id);
     try std.testing.expectEqualStrings("Hello from Zig", reply_packet.payload);
+
+    const large_argument = try gpa.alloc(u8, 65_500);
+    defer gpa.free(large_argument);
+    @memset(large_argument, 'x');
+    packet.clearRetainingCapacity();
+    try protocol.append(&packet, gpa, .{
+        .token = window.state.token,
+        .id = 10,
+        .command = .call,
+    }, "large\x0065500\x00");
+    try packet.appendSlice(gpa, large_argument);
+    try packet.append(gpa, 0);
+    try std.testing.expect(packet.items.len > 65_500);
+
+    var expected_buffer: [32]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buffer,
+        "{d}\x00",
+        .{packet.items.len},
+    );
+    var pre_packet: std.ArrayList(u8) = .empty;
+    defer pre_packet.deinit(gpa);
+    try protocol.append(&pre_packet, gpa, .{
+        .token = 0,
+        .command = .multi,
+    }, expected);
+    try sendClientFrame(client, io, pre_packet.items);
+    try sendClientFrame(client, io, packet.items[0..65_500]);
+    try sendClientFrame(client, io, packet.items[65_500..]);
+
+    const large_replied = try readServerFrame(client, io, &response_payload);
+    const large_reply_packet = try protocol.decode(large_replied);
+    try std.testing.expectEqual(@as(u16, 10), large_reply_packet.header.id);
+    try std.testing.expectEqualStrings("65500", large_reply_packet.payload);
+    try std.testing.expectEqual(
+        @as(usize, 65_500),
+        large_argument_received.load(.acquire),
+    );
     try std.testing.expect(primary_events.connected.load(.acquire));
     try std.testing.expect(primary_events.clicked.load(.acquire));
     try std.testing.expect(primary_events.navigated.load(.acquire));

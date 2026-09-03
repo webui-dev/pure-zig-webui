@@ -12,6 +12,7 @@ pub const Command = enum(u8) {
     close = 0xfa,
     call = 0xf9,
     raw = 0xf8,
+    multi = 0xf6,
     check_token = 0xf5,
     _,
 };
@@ -40,6 +41,7 @@ pub fn decode(bytes: []const u8) DecodeError!Packet {
         .close,
         .call,
         .raw,
+        .multi,
         .check_token,
         => {},
         _ => return error.UnknownCommand,
@@ -52,6 +54,25 @@ pub fn decode(bytes: []const u8) DecodeError!Packet {
         },
         .payload = bytes[header_len..],
     };
+}
+
+pub const MultiLengthError = error{ InvalidPacket, MessageTooLarge };
+
+/// Decode the decimal, NUL-terminated total length carried by `MULTI`.
+/// The announced size includes the original eight-byte protocol header.
+pub fn decodeMultiLength(payload: []const u8, max_size: usize) MultiLengthError!usize {
+    if (payload.len < 2 or payload[payload.len - 1] != 0)
+        return error.InvalidPacket;
+    const text = payload[0 .. payload.len - 1];
+    if (text.len == 0 or std.mem.indexOfScalar(u8, text, 0) != null)
+        return error.InvalidPacket;
+    for (text) |byte|
+        if (!std.ascii.isDigit(byte)) return error.InvalidPacket;
+    const size = std.fmt.parseInt(usize, text, 10) catch
+        return error.MessageTooLarge;
+    if (size < header_len) return error.InvalidPacket;
+    if (size > max_size) return error.MessageTooLarge;
+    return size;
 }
 
 pub fn append(
@@ -151,6 +172,41 @@ test "packet and call payload decode" {
     try std.testing.expectEqualStrings("1234", call.args[1]);
     try std.testing.expectEqualStrings("button", try decodeEventText("button"));
     try std.testing.expectEqualStrings("button", try decodeEventText("button\x00"));
+}
+
+test "multi packet lengths are strictly decoded and bounded" {
+    try std.testing.expectEqual(
+        @as(usize, 65_500),
+        try decodeMultiLength("65500\x00", 1 << 20),
+    );
+    try std.testing.expectError(
+        error.InvalidPacket,
+        decodeMultiLength("", 1 << 20),
+    );
+    try std.testing.expectError(
+        error.InvalidPacket,
+        decodeMultiLength("65500", 1 << 20),
+    );
+    try std.testing.expectError(
+        error.InvalidPacket,
+        decodeMultiLength("65\x00500\x00", 1 << 20),
+    );
+    try std.testing.expectError(
+        error.InvalidPacket,
+        decodeMultiLength("+65500\x00", 1 << 20),
+    );
+    try std.testing.expectError(
+        error.InvalidPacket,
+        decodeMultiLength("7\x00", 1 << 20),
+    );
+    try std.testing.expectError(
+        error.MessageTooLarge,
+        decodeMultiLength("1048577\x00", 1 << 20),
+    );
+    try std.testing.expectError(
+        error.MessageTooLarge,
+        decodeMultiLength("999999999999999999999999999999999999\x00", 1 << 20),
+    );
 }
 
 test "untrusted packets are rejected" {

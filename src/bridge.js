@@ -7,6 +7,8 @@
     const commandClose = 0xfa;
     const commandCall = 0xf9;
     const commandRaw = 0xf8;
+    const commandMulti = 0xf6;
+    const multiChunkSize = 65_500;
     const commandCheckToken = 0xf5;
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
@@ -42,9 +44,24 @@
         return bytes;
     }
 
+    function sendData(bytes) {
+        if (bytes.length < multiChunkSize) {
+            socket.send(bytes);
+            return;
+        }
+        const length = encoder.encode(`${bytes.length}\0`);
+        const prePacket = new Uint8Array(8 + length.length);
+        prePacket[0] = signature;
+        prePacket[7] = commandMulti;
+        prePacket.set(length, 8);
+        socket.send(prePacket);
+        for (let offset = 0; offset < bytes.length; offset += multiChunkSize)
+            socket.send(bytes.subarray(offset, offset + multiChunkSize));
+    }
+
     function sendEvent(command, value) {
         if (connected)
-            socket.send(packet(command, 0, encoder.encode(value)));
+            sendData(packet(command, 0, encoder.encode(value)));
     }
 
     function log(message) {
@@ -87,7 +104,7 @@
 
     socket.onopen = () => {
         log("Connected");
-        socket.send(
+        sendData(
             packet(commandCheckToken, 0, encoder.encode(globalThis.__zigWebuiCapability)),
         );
     };
@@ -128,7 +145,7 @@
             const response = new Uint8Array(value.length + 2);
             response[0] = failed;
             response.set(value, 1);
-            socket.send(packet(commandJs, id, response));
+            sendData(packet(commandJs, id, response));
             return;
         }
         if (bytes[7] === commandNavigation) {
@@ -192,7 +209,7 @@
             return new Promise((resolve, reject) => {
                 pending.set(id, { resolve, reject });
                 try {
-                    socket.send(packet(commandCall, id, payload));
+                    sendData(packet(commandCall, id, payload));
                 } catch (error) {
                     pending.delete(id);
                     reject(error);
