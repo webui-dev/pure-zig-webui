@@ -71,7 +71,7 @@ The current phase provides:
 - Windows external-browser focus with explicit errors on unsupported
   platforms and unavailable windows;
 - current backend process ID through `parentProcessId()`;
-- default-browser launching and deterministic shutdown.
+- default-browser launching and deterministic shutdown;
 - optional native WKWebView, GTK3/WebKitGTK 4.1, and WebView2 hosting through
   system APIs, with native controls, close veto, and borrowed window handles.
 
@@ -480,9 +480,9 @@ External-browser examples warn and shut down when no browser connects.
 Node, Deno, and Bun, runs the core and bridge suites, executes native smoke gates
 on Linux/macOS/Windows, and cross-builds all five ledger targets.
 
-See the
-[pure Zig refactor plan](docs/PURE_ZIG_REFACTOR.md) for the complete scope and
-implementation order.
+The [capability ledger](docs/PURE_ZIG_REFACTOR.md#completion-evidence) records the
+completed rewrite and exact cross-platform validation evidence. The experimental
+warning still applies; no stable release or production-readiness claim is implied.
 
 ## License
 

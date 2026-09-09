@@ -267,9 +267,15 @@ Linux 依赖测试 107/107 通过。
 单独的 ABI/所有权审查修正了跨窗口关闭派发、GTK 已显示窗口居中、Windows
 样式位保留和宿主透明路径，以及 WebKit 关闭通知不能实现提前否决的问题。
 JavaScript 关闭请求由 document-start 原生消息桥接处理；否决时页面和连接保持
-可用。macOS 与 Linux 已完成真实双窗口 smoke；Windows 运行门禁待 CI 证据。
+可用。macOS、Linux 与 Windows 均已完成真实双窗口 smoke；最终 CI 全部通过。
 
 补充修复：复现了超时 eval 的迟到回复在 16 位 ID 回绕后错误完成新请求
 （期望 `new` 却得到 `old`）。现在每个执行过 eval 的客户端用 8 KiB 有界
 位图隔离仍可能收到迟到回复的 ID；收到旧回复或断连才释放，耗尽明确报错。
 对应真实 WebSocket 回归覆盖错误归属、ID 恢复及完全耗尽后的恢复。
+
+最终验收：[CI 34342120131](https://github.com/webui-dev/pure-zig-webui/actions/runs/34342120131)
+所有平台任务与五目标交叉构建通过。Linux 核心测试 54/54、桥接测试 15/15；
+协议 fuzz 实际执行 101,191 次无失败。Windows 已校验真实页面渲染、初始标题和
+OS 关闭路径；本机 macOS 屏幕捕获受限，但其原生窗口与 JavaScript/控制门禁通过。
+覆盖账本已关闭实现和验收缺口，实验性/非生产就绪声明仍保留。

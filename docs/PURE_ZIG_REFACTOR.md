@@ -31,12 +31,13 @@ deleted.
 | Browser bridge | Runtime bindings and events with `ADD_ID` replay, typed arguments/replies, bounded FIFO or concurrent handlers, deferred replies, total-deadline evaluation, raw data, navigation, high contrast, bounded `MULTI`, multiple clients, keepalive, reconnect, and status UI are implemented. |
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, Deno/Node.js/Bun script interpretation, logging, and deterministic shutdown are implemented. |
 | Browser integration | Centring, app-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed and deletable managed profile directories, Chromium-family proxy rules, Windows external-browser focus, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
-| Native integration | Optional Zig-only WKWebView, GTK3/WebKitGTK 4.1 and Win32/WebView2 backends implement native controls, main-thread dispatch, close veto/history-safe JavaScript close, multiwindow pumping, and borrowed handles. macOS runtime smoke has passed; remaining runtime gates are tracked below. |
-| Current validation | Local macOS core gate: 46 passed, 6 Linux-specific skips; bridge: 15 passed; native build and actual WKWebView smoke passed. Linux/Windows native builds pass. Hardened Linsang passes all 107 tests on Linux. Full platform runtime and release gates remain in progress. |
+| Native integration | Optional Zig-only WKWebView, GTK3/WebKitGTK 4.1 and Win32/WebView2 backends implement native controls, UI-thread dispatch, close veto/history-safe JavaScript close, multiwindow pumping, and borrowed handles. Actual runtime gates pass on all three platforms. |
+| Current validation | Linux CI: 54/54 core tests and 15/15 bridge tests. Native smoke passes on Linux/macOS/Windows; Linux missing-display and Windows missing-loader checks pass. All five cross-target builds pass. Protocol fuzzing completed 101,191 executions without failure; hardened Linsang passes all 107 Linux tests. |
 
-The ledger's implementation gaps are filled. Overall completion still requires
-the native/runtime and cross-target validation gates below; compilation alone
-does not close those gates.
+The pure Zig rewrite is complete against this ledger: every capability has a
+concrete implementation or an intentional Zig-native replacement, and the
+required runtime/build gates have passed. The package remains experimental;
+capability completion is not a production-readiness or bug-free guarantee.
 The coverage ledger below is the authoritative method-level list.
 
 ## Original Baseline
@@ -301,7 +302,7 @@ protocol input never panics.
 |---|---|
 | `webui.newWindow()` | `app.createWindow(options)` |
 | `window.show(content)` | Set initial content and call `window.open()`; use `window.setContent()` while running. |
-| `window.bind()` / `binding()` | `window.bind(name, handler, user_data)` |
+| `window.bind()` / `binding()` | `window.bind(io, name, handler, user_data)` |
 | `Event.get*At()` | `Call.string/int/float/bool/bytes(index)` |
 | `Event.return*()` | `Call.reply*()` |
 | `window.run()` | `Window.eval()` |
@@ -537,6 +538,8 @@ Keep at least one direct test for every non-trivial parser. The final gate is:
 ```text
 zig build test
 zig build test-bridge
+zig build fuzz --fuzz=100K
+zig build test-native -Dnative=true
 zig build -Dtarget=x86_64-linux
 zig build -Dtarget=aarch64-linux
 zig build -Dtarget=x86_64-windows
@@ -574,8 +577,31 @@ zig build -Dtarget=aarch64-macos
    fallback or successful no-op. Never close a validation gate with only a
    cross-build or a skipped test.
 
-## Final Validation Work
+## Completion Evidence
 
-Complete Linux/Windows native execution, missing-runtime paths, protocol
-fuzzing, browser reconnection/registration scenarios, and the full build matrix.
-Record exact results here before declaring complete rewrite parity.
+Completion snapshot: 2026-09-09.
+
+[The final platform gate](https://github.com/webui-dev/pure-zig-webui/actions/runs/34342120131)
+passed every job: Ubuntu 24.04, macOS 15, Windows Server 2022, and the
+five-target cross-build matrix.
+
+| Gate | Evidence |
+|---|---|
+| Core and bridge | Linux CI runs all 54 core tests with no skips and all 15 Node bridge tests. Node, Deno, and Bun are installed rather than accepted as skipped coverage. |
+| Native runtime | Real WKWebView, GTK/WebKitGTK and WebView2 execute bridge calls, runtime binding/event updates, geometry and controls, UI-thread dispatch, close veto after navigation, multiwindow close, and clean shutdown. |
+| Dependency absence | Linux without a display and Windows with a nonexistent WebView2 loader return documented unavailable errors and shut down cleanly. |
+| Native rendering | The Windows gate captures the actual native window, checks its initial caption, and closes it through the OS. The rendered page and connected bridge were visually confirmed from the artifact. macOS pixel capture was unavailable on the local host; its actual window/JavaScript/control smoke passed locally and in CI. |
+| Protocol robustness | `zig build fuzz --fuzz=100000` completed 101,191 executions without failure; deterministic malformed-input coverage is also part of normal tests. |
+| Cross-target builds | `x86_64-linux`, `aarch64-linux`, `x86_64-windows`, `x86_64-macos`, and `aarch64-macos` all pass. Optional Windows and GNU/Linux native examples also cross-compile. |
+| Ownership and isolation | Regression gates cover OOM cleanup, upgrade-bound authorization, server authentication expiry, handler cancellation, managed child/profile isolation, eval send deadlines and late-ID quarantine. Browser smoke also confirmed capacity recovery and clean reconnect shutdown. |
+| Pure-source boundary | No legacy `webui_new`/C-wrapper exports remain. Default builds have no GUI linkage; optional adapters use Zig declarations for installed system APIs only. |
+
+Linsang is pinned to `db11eb05e897e4dccdab701e110dc8a6948cb690`.
+[Upstream PR #3](https://github.com/jinzhongjia/Linsang/pull/3) contains the
+required authorization-context, deadline, canonical-path, immutable TLS-reader,
+and concurrency fixes. That exact revision is already consumed and verified;
+building this repository does not depend on the PR being merged first.
+
+The permanent exclusions remain unchanged: no C ABI compatibility layer, no
+old-Zig compatibility code, and no automatic self-signed certificate. Platform
+limitations above are explicit results, not silent fallbacks.
