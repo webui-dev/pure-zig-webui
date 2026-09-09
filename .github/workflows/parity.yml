@@ -1,0 +1,117 @@
+name: Pure Zig parity gates
+on:
+  push:
+    branches: [main, 'rewrite/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed
+        with:
+          deno-version: v2.x
+      - name: Install Zig 0.16 on POSIX
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          os=linux
+          if [ "$RUNNER_OS" = macOS ]; then os=macos; fi
+          if [ "$arch" = arm64 ]; then arch=aarch64; fi
+          archive="zig-${arch}-${os}-0.16.0.tar.xz"
+          curl --fail --location --max-time 120 "https://ziglang.org/download/0.16.0/$archive" --output "$RUNNER_TEMP/zig.tar.xz"
+          tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-${arch}-${os}-0.16.0" >> "$GITHUB_PATH"
+      - name: Install Zig 0.16 and WebView2 on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest 'https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip' -OutFile "$env:RUNNER_TEMP/zig.zip" -TimeoutSec 120
+          Expand-Archive "$env:RUNNER_TEMP/zig.zip" -DestinationPath "$env:RUNNER_TEMP/zig"
+          "$env:RUNNER_TEMP/zig/zig-x86_64-windows-0.16.0" | Out-File $env:GITHUB_PATH -Append
+          Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.2903.40/microsoft.web.webview2.1.0.2903.40.nupkg' -OutFile "$env:RUNNER_TEMP/webview2.zip" -TimeoutSec 120
+          Expand-Archive "$env:RUNNER_TEMP/webview2.zip" -DestinationPath "$env:RUNNER_TEMP/webview2"
+          $loader = "$env:RUNNER_TEMP/webview2/build/native/x64/WebView2Loader.dll"
+          if (!(Test-Path $loader)) { throw 'WebView2 SDK loader missing' }
+          "WEBUI_WEBVIEW2_LOADER=$loader" | Out-File $env:GITHUB_ENV -Append
+          $runtime = Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue
+          if (!$runtime.pv -or $runtime.pv -eq '0.0.0.0') {
+            Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile "$env:RUNNER_TEMP/WebView2Setup.exe" -TimeoutSec 120
+            if ((Get-AuthenticodeSignature "$env:RUNNER_TEMP/WebView2Setup.exe").Status -ne 'Valid') { throw 'Invalid WebView2 installer signature' }
+            $installer = Start-Process "$env:RUNNER_TEMP/WebView2Setup.exe" -ArgumentList '/silent','/install' -PassThru
+            if (!$installer.WaitForExit(180000)) { Stop-Process -Id $installer.Id -Force; throw 'WebView2 installation timed out' }
+            if ($installer.ExitCode -ne 0) { throw "WebView2 installer failed: $($installer.ExitCode)" }
+          }
+      - name: Install GTK WebKit native runtime
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-0 libwebkit2gtk-4.1-0 xvfb xauth dbus-x11 openbox xcompmgr
+      - name: Core, bridge and example gates
+        run: |
+          zig version
+          zig build test --summary all
+          zig build test-bridge
+          zig build -Dnative=true
+      - name: Linux native WebView gate
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          xvfb-run -a -s '-screen 0 1280x800x24' dbus-run-session -- bash -c '
+            openbox --sm-disable & wm=$!
+            xcompmgr -a & compositor=$!
+            trap "kill $wm $compositor 2>/dev/null || true; wait || true" EXIT
+            sleep 1
+            zig-out/bin/native --smoke
+          '
+          env -u DISPLAY -u WAYLAND_DISPLAY zig-out/bin/native --expect-unavailable
+      - name: macOS native WebView gate
+        if: runner.os == 'macOS'
+        timeout-minutes: 3
+        run: zig-out/bin/native --smoke
+      - name: Windows native WebView and missing-loader gates
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          & zig-out/bin/native.exe --smoke --loader "$env:WEBUI_WEBVIEW2_LOADER"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & zig-out/bin/native.exe --expect-unavailable --loader "$env:RUNNER_TEMP/nonexistent-WebView2Loader.dll"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  cross:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Zig
+        run: |
+          curl --fail --location --max-time 120 https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz --output "$RUNNER_TEMP/zig.tar.xz"
+          tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+      - name: Cross-target core builds
+        run: |
+          zig build -Dtarget=x86_64-linux
+          zig build -Dtarget=aarch64-linux
+          zig build -Dtarget=x86_64-windows
+          zig build -Dtarget=x86_64-macos
+          zig build -Dtarget=aarch64-macos
+      - name: Reject legacy C interface
+        run: |
+          if grep -R -E 'webui_new|pub extern fn webui_' src; then exit 1; fi

@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Server-side runtime</title>
+<h1>Node.js resource execution</h1>
+<button onclick="loadTime()">Run server-side JavaScript</button>
+<output id="result"></output>
+<script src="webui.js"></script>
+<script>
+async function loadTime() {
+    const response = await fetch('time.js?example=runtime');
+    result.textContent = response.ok ? await response.text() : `Interpreter failed: HTTP ${response.status}`;
+}
+</script>
