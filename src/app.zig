@@ -2718,15 +2718,25 @@ fn interpretScript(
     try argv.appendSlice(gpa, runtime.command());
     try argv.appendSlice(gpa, &.{ full_path, query });
 
+    return runScript(window, io, runtime, sub_path, argv.items, runtime_timeout, response);
+}
+
+fn runScript(
+    window: *WindowState,
+    io: std.Io,
+    runtime: Runtime,
+    sub_path: []const u8,
+    argv: []const []const u8,
+    timeout: std.Io.Clock.Duration,
+    response: *Linsang.Response,
+) !void {
+    const gpa = window.gpa;
     const result = std.process.run(gpa, io, .{
-        .argv = argv.items,
+        .argv = argv,
         .stdout_limit = .limited(window.limits.max_runtime_output),
         .stderr_limit = .limited(max_runtime_diagnostics),
-        .timeout = .{ .duration = runtime_timeout },
+        .timeout = .{ .duration = timeout },
     }) catch |err| switch (err) {
-        // Upstream answers an empty 200 when the interpreter is missing or
-        // its run fails, so one absent runtime never breaks the served page.
-        // Log the reason instead of failing silently.
         error.FileNotFound,
         error.AccessDenied,
         error.InvalidExe,
@@ -2738,7 +2748,13 @@ fn interpretScript(
                 "Runtime {s} could not run {s}: {}",
                 .{ @tagName(runtime), sub_path, err },
             );
-            return respondScript(response, "");
+            const status: Linsang.Status = switch (err) {
+                error.FileNotFound, error.AccessDenied, error.InvalidExe => .service_unavailable,
+                error.Timeout => @enumFromInt(504),
+                error.StreamTooLong => @enumFromInt(502),
+                else => unreachable,
+            };
+            return respondScript(response, status, "");
         },
         else => return err,
     };
@@ -2748,15 +2764,23 @@ fn interpretScript(
         .exited => |code| code != 0,
         else => true,
     };
-    if (failed) window.log(
-        .warn,
-        "Runtime {s} exited with {any} for {s}: {s}",
-        .{ @tagName(runtime), result.term, sub_path, result.stderr },
-    );
-    return respondScript(response, result.stdout);
+    if (failed) {
+        window.log(
+            .warn,
+            "Runtime {s} exited with {any} for {s}: {s}",
+            .{ @tagName(runtime), result.term, sub_path, result.stderr },
+        );
+        return respondScript(response, @enumFromInt(502), "");
+    }
+    return respondScript(response, .ok, result.stdout);
 }
 
-fn respondScript(response: *Linsang.Response, body: []const u8) !void {
+fn respondScript(
+    response: *Linsang.Response,
+    status: Linsang.Status,
+    body: []const u8,
+) !void {
+    response.status = status;
     try response.setHeader("Content-Type", "text/plain; charset=utf-8");
     try response.setHeader("X-Content-Type-Options", "nosniff");
     try response.write(body);
@@ -4581,7 +4605,6 @@ test "selected browser launch applies window controls and owns process" {
 }
 
 test "runtime script lookup resolves indexes and rejects escapes" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
     defer threaded.deinit();
@@ -4639,156 +4662,288 @@ test "runtime script lookup resolves indexes and rejects escapes" {
     try std.testing.expect(safeSubPath("a..b.js"));
 }
 
-test "runtime interpreters serve script output" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+test "runtime unavailable executables return 503 without diagnostics" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const missing = try std.fmt.allocPrint(
+        gpa,
+        ".zig-cache/tmp/{s}/missing-interpreter",
+        .{tmp.sub_path},
+    );
+    defer gpa.free(missing);
+    // An explicit path avoids depending on, or changing, process-wide PATH.
+    try expectRuntimeResponse(io, &.{missing}, 64, runtime_timeout, .service_unavailable, "");
+
+    if (@import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos) {
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "invalid-interpreter",
+            .data = "not an executable\n",
+            .flags = .{ .permissions = .executable_file },
+        });
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "inaccessible-interpreter",
+            .data = "inaccessible executable\n",
+        });
+        for ([_][]const u8{ "invalid-interpreter", "inaccessible-interpreter" }) |name| {
+            const executable = try std.fmt.allocPrint(
+                gpa,
+                ".zig-cache/tmp/{s}/{s}",
+                .{ tmp.sub_path, name },
+            );
+            defer gpa.free(executable);
+            try expectRuntimeResponse(io, &.{executable}, 64, runtime_timeout, .service_unavailable, "");
+        }
+    }
+}
+
+test "runtime failures discard output and successful output respects the limit" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos)
+        return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{
+        .async_limit = .unlimited,
+        .environ = std.testing.environ,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+    try requireTestRuntime(gpa, io, .node_js);
+    const cases = [_]struct {
+        script: []const u8,
+        limit: usize = 64,
+        status: Linsang.Status = @enumFromInt(502),
+        body: []const u8 = "",
+    }{
+        .{ .script = "require('fs').writeSync(1, '12345678');", .limit = 8, .status = .ok, .body = "12345678" },
+        .{ .script = "require('fs').writeSync(1, 'partial-output'); require('fs').writeSync(2, 'secret-diagnostic'); process.exit(7);" },
+        .{ .script = "require('fs').writeSync(1, 'partial-output'); process.kill(process.pid, 'SIGTERM');" },
+        .{ .script = "require('fs').writeSync(1, '123456789');", .limit = 8 },
+        .{ .script = "require('fs').writeSync(1, 'partial-output'); require('fs').writeSync(2, 'x'.repeat(9000));" },
+    };
+    for (cases) |case| try expectRuntimeResponse(
+        io,
+        &.{ "node", "-e", case.script },
+        case.limit,
+        runtime_timeout,
+        case.status,
+        case.body,
+    );
+}
+
+test "runtime timeout returns 504 without partial output" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos)
+        return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{
+        .async_limit = .unlimited,
+        .environ = std.testing.environ,
+    });
+    defer threaded.deinit();
+    try requireTestRuntime(gpa, threaded.io(), .node_js);
+    try expectRuntimeResponse(
+        threaded.io(),
+        &.{ "node", "-e", "require('fs').writeSync(1, 'partial-output'); setInterval(() => {}, 1000);" },
+        64,
+        .{ .raw = .fromMilliseconds(100), .clock = .awake },
+        @enumFromInt(504),
+        "",
+    );
+}
+
+fn expectRuntimeResponse(
+    io: std.Io,
+    argv: []const []const u8,
+    output_limit: usize,
+    timeout: std.Io.Clock.Duration,
+    status: Linsang.Status,
+    body: []const u8,
+) !void {
+    const gpa = std.testing.allocator;
+    var app = App.init(gpa, .{ .limits = .{ .max_runtime_output = output_limit } });
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "" } });
+    var response = Response.init(gpa);
+    defer response.deinit();
+    try runScript(window.state, io, .node_js, "test.js", argv, timeout, &response);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try response.serialize(&wire, gpa, false);
+    try expectRuntimeHttpResponse(wire.items, status, body);
+}
+
+fn expectRuntimeHttpResponse(
+    response: []const u8,
+    status: Linsang.Status,
+    body: []const u8,
+) !void {
+    var prefix: [32]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        response,
+        try std.fmt.bufPrint(&prefix, "HTTP/1.1 {d} ", .{@intFromEnum(status)}),
+    ));
+    const body_at = (std.mem.indexOf(u8, response, "\r\n\r\n") orelse
+        return error.MissingHttpHeaders) + 4;
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        response[0..body_at],
+        "Content-Type: text/plain; charset=utf-8\r\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        response[0..body_at],
+        "X-Content-Type-Options: nosniff\r\n",
+    ) != null);
+    try std.testing.expectEqualStrings(body, response[body_at..]);
+}
+
+test "runtime Deno serves successful scripts and rejects failed scripts over HTTP" {
+    try testRuntimeHttp(.deno);
+}
+
+test "runtime Node.js serves successful scripts and rejects failed scripts over HTTP" {
+    try testRuntimeHttp(.node_js);
+}
+
+test "runtime Bun serves successful scripts and rejects failed scripts over HTTP" {
+    try testRuntimeHttp(.bun);
+}
+
+fn testRuntimeHttp(runtime: Runtime) !void {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{
+        .async_limit = .unlimited,
+        .environ = std.testing.environ,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+    try requireTestRuntime(gpa, io, runtime);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "scripts");
-    // The interpreter receives the script path and then the raw query, so the
-    // query is the first script-visible argument on every runtime.
+    // The interpreter receives the script path and then the raw query.
     try tmp.dir.writeFile(io, .{
-        .sub_path = "scripts/index.js",
+        .sub_path = "index.js",
         .data =
         \\const args = typeof Deno !== "undefined" ? Deno.args : process.argv.slice(2);
         \\console.log("interpreted:" + args[0]);
         ,
     });
     try tmp.dir.writeFile(io, .{
-        .sub_path = "scripts/broken.js",
+        .sub_path = "broken.js",
         .data =
         \\console.log("partial-output");
-        \\throw new Error("deliberate failure");
+        \\throw new Error("secret-diagnostic");
         ,
     });
     try tmp.dir.writeFile(io, .{
-        .sub_path = "scripts/page.html",
+        .sub_path = "oversized.js",
+        .data = "console.log('x'.repeat(1024));",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "page.html",
         .data = "<p>static</p>",
     });
-    const directory = try std.fmt.allocPrint(
-        gpa,
-        ".zig-cache/tmp/{s}/scripts",
-        .{tmp.sub_path},
-    );
+    const directory = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer gpa.free(directory);
-
-    var app = App.init(gpa, .{});
+    var app = App.init(gpa, .{ .limits = .{ .max_runtime_output = 64 } });
     defer app.deinit();
-    const runtimes = [_]Runtime{ .deno, .node_js, .bun };
-    var windows: [runtimes.len]Window = undefined;
-    for (runtimes, &windows) |runtime, *window| window.* = try app.createWindow(.{
+    const window = try app.createWindow(.{
         .content = .{ .directory = directory },
         .runtime = runtime,
     });
     var running = try app.start(io);
     defer running.stop() catch {};
-
-    for (runtimes, windows) |runtime, window| {
-        const capability = &window.state.capability;
-        const installed = try runtimeInstalled(gpa, io, runtime);
+    const cases = [_]struct {
+        resource: []const u8,
+        status: Linsang.Status,
+        body: []const u8,
+    }{
+        .{ .resource = "?name=zig", .status = .ok, .body = "interpreted:name=zig\n" },
+        .{ .resource = "broken.js", .status = @enumFromInt(502), .body = "" },
+        .{ .resource = "oversized.js", .status = @enumFromInt(502), .body = "" },
+    };
+    for (cases) |case| {
+        const target = try std.fmt.allocPrint(
+            gpa,
+            "/{s}/{s}",
+            .{ window.state.capability, case.resource },
+        );
+        defer gpa.free(target);
         var response: [4096]u8 = undefined;
-
-        const index_target = try std.fmt.allocPrint(
-            gpa,
-            "/{s}/?name=zig",
-            .{capability},
-        );
-        defer gpa.free(index_target);
-        const index_body = try getTestPath(
-            running.inner.address,
-            io,
-            index_target,
-            "interpreted:",
-            &response,
-        );
-        try std.testing.expect(std.mem.startsWith(
-            u8,
-            index_body,
-            "HTTP/1.1 200",
-        ));
-        if (installed) {
-            // The directory index resolved to index.js and saw the query.
-            try std.testing.expect(std.mem.indexOf(
-                u8,
-                index_body,
-                "interpreted:name=zig",
-            ) != null);
-        } else {
-            // A missing interpreter answers an empty 200 rather than failing
-            // the page, matching upstream.
-            try std.testing.expect(std.mem.indexOf(
-                u8,
-                index_body,
-                "interpreted:",
-            ) == null);
-        }
-
-        // A failing script still serves whatever it wrote before dying.
-        const broken_target = try std.fmt.allocPrint(
-            gpa,
-            "/{s}/broken.js",
-            .{capability},
-        );
-        defer gpa.free(broken_target);
-        const broken_body = try getTestPath(
-            running.inner.address,
-            io,
-            broken_target,
-            "partial-output",
-            &response,
-        );
-        try std.testing.expectEqual(
-            installed,
-            std.mem.indexOf(u8, broken_body, "partial-output") != null,
-        );
-
-        // Non-script files are still served verbatim.
-        const static_target = try std.fmt.allocPrint(
-            gpa,
-            "/{s}/page.html",
-            .{capability},
-        );
-        defer gpa.free(static_target);
-        const static_body = try getTestPath(
-            running.inner.address,
-            io,
-            static_target,
-            "</p>",
-            &response,
-        );
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            static_body,
-            "<p>static</p>",
-        ) != null);
+        // No NUL is expected: read through Connection: close, not partial output.
+        const wire = try getTestPath(running.inner.address, io, target, "\x00", &response);
+        try expectRuntimeHttpResponse(wire, case.status, case.body);
     }
-
-    try running.stop();
+    // A failed script must not prevent a later static request.
+    try expectRuntimeStaticResponse(io, &running, window);
 }
 
-fn runtimeInstalled(
+test "runtime selection serves static HTTP requests without executing scripts" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "page.html", .data = "<p>static</p>" });
+    const directory = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(directory);
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{
+        .content = .{ .directory = directory },
+        .runtime = .node_js,
+    });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    try expectRuntimeStaticResponse(io, &running, window);
+}
+
+fn expectRuntimeStaticResponse(io: std.Io, running: *Running, window: Window) !void {
+    const gpa = std.testing.allocator;
+    const target = try std.fmt.allocPrint(gpa, "/{s}/page.html", .{window.state.capability});
+    defer gpa.free(target);
+    var response: [4096]u8 = undefined;
+    const wire = try getTestPath(running.inner.address, io, target, "\x00", &response);
+    try std.testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 200 "));
+    const body_at = (std.mem.indexOf(u8, wire, "\r\n\r\n") orelse
+        return error.MissingHttpHeaders) + 4;
+    try std.testing.expectEqualStrings("<p>static</p>", wire[body_at..]);
+}
+
+fn requireTestRuntime(
     gpa: std.mem.Allocator,
     io: std.Io,
     runtime: Runtime,
-) !bool {
+) !void {
     const result = std.process.run(gpa, io, .{
         .argv = &.{ runtime.command()[0], "--version" },
         .stdout_limit = .limited(4 << 10),
         .stderr_limit = .limited(4 << 10),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } },
     }) catch |err| switch (err) {
-        error.FileNotFound, error.AccessDenied, error.InvalidExe => return false,
+        error.FileNotFound, error.AccessDenied, error.InvalidExe, error.Timeout, error.StreamTooLong => {
+            std.debug.print("Skipping {s} HTTP runtime test: version probe failed ({s}).\n", .{
+                @tagName(runtime), @errorName(err),
+            });
+            return error.SkipZigTest;
+        },
         else => return err,
     };
-    gpa.free(result.stdout);
-    gpa.free(result.stderr);
-    return switch (result.term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    std.debug.print("Skipping {s} HTTP runtime test: version probe exited with {any}.\n", .{
+        @tagName(runtime), result.term,
+    });
+    return error.SkipZigTest;
 }
 
 test "directory monitor reloads changed window only" {

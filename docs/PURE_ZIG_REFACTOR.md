@@ -19,7 +19,7 @@ the Zig standard library and launching an installed browser remain in scope.
 
 ## Current Rewrite Status
 
-Status snapshot: 2026-09-03.
+Status snapshot: 2026-09-09.
 
 The external-browser core is now implemented in Zig on top of pinned Linsang.
 The legacy wrapper, C API, compatibility files, and examples have been
@@ -31,10 +31,11 @@ deleted.
 | Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, browser-native high-contrast detection, bounded `MULTI` packet fragmentation, and multiple clients are implemented. |
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, Deno/Node.js/Bun script interpretation, logging, and deterministic shutdown are implemented. |
 | Browser integration | Centring, app-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed and deletable managed profile directories, Chromium-family proxy rules, Windows external-browser focus, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
-| Current validation | `zig build test`, native builds, Windows x86_64 builds, macOS aarch64 builds, and Windows/macOS test-module cross-compilation pass. |
+| Current validation | 2026-09-09 local validation: `zig build test` passes (25 Zig tests passed, 8 platform-gated tests skipped; all 3 bridge tests passed), and `zig build` passes. The focused runtime run passes all 10 tests, including installed Deno, Node.js, and Bun. Real Chromium completed 65,536 calls across ID wrap without losing a deferred reply; live HTTP checks covered `200`, `502`, `503`, and `504`. Cross-target release gates were not rerun in this change. |
 
-Remaining work is limited to native browser-window controls and geometry,
-optional native WebViews and handles, and the final parity validation gates.
+Remaining work includes bridge keepalive and reconnect recovery, runtime
+binding updates, native browser-window controls and geometry, optional native
+WebViews and handles, and the final parity validation gates.
 The coverage ledger below is the authoritative method-level list.
 
 ## Original Baseline
@@ -339,6 +340,11 @@ and `atob()`, while high-contrast detection uses native browser media
 queries. The upstream bridge's `callCore()` method remains an internal
 implementation detail.
 
+Call correlation reserves IDs 1–65,535 until completion, send failure, or
+disconnect. Allocation skips outstanding IDs on wrap and rejects only the new
+call when exhausted, instead of overwriting an earlier promise as upstream can.
+Automatic reconnect, keepalive, and connection-loss UI are not yet implemented.
+
 ### Intentional Zig Replacements
 
 The following upstream methods are covered by the current Zig design and are
@@ -361,7 +367,7 @@ not implementation gaps:
 | `webui_get_child_process_id()` | `Window.openWithBrowser()` returns the retained direct child's `BrowserProcessId`; `Window.browserProcessId()` retrieves it later. |
 | `webui_get_parent_process_id()` | Root-level `parentProcessId()` returns the current Zig backend's numeric process ID without a redundant window argument. Unsupported process targets return an explicit error. |
 | `webui_set_default_root_folder()` | `App.Options.default_directory` supplies directory content to windows created without explicit content. |
-| `webui_set_runtime()` | `App.WindowOptions.runtime` selects Deno, Node.js, or Bun for served `.js` and `.ts` files, including `index.ts`/`index.js` directory resolution. The interpreter is spawned as argv rather than through a shell, so a query string cannot be injected as a command. |
+| `webui_set_runtime()` | `App.WindowOptions.runtime` selects Deno, Node.js, or Bun for served `.js` and `.ts` files, including `index.ts`/`index.js` directory resolution. The interpreter is spawned as argv rather than through a shell. Unlike upstream's empty `200`, unavailable executables answer `503`, timeouts `504`, and output-limit violations or unsuccessful exits `502`; failed stdout and diagnostics are never served. |
 | `webui_set_config(folder_monitor)` | `App.Options.folder_monitor_interval` enables portable recursive directory polling and reloads the affected window's connected clients. |
 | `webui_set_icon()`, `webui_set_icon_file()` | `Window.setIcon()` copies inline data and MIME type; `Window.setIconFile()` loads a supported image file as the window favicon. |
 | `webui_set_profile()` | `App.WindowOptions.profile_directory` is copied and mapped to Chromium-family `--user-data-dir` or Firefox `--profile`. Chromium-family launches without it use a managed temporary profile such as `/tmp/.WebUI/WebUIChromeProfile`, which is what keeps the app window independent of a running browser instance. Caller-provided directories remain caller-owned; generated profiles are removed only through the explicit deletion APIs. |
@@ -409,15 +415,16 @@ the coverage ledger in the same commit.
 This completes the behavior represented by `webui_set_public()`,
 `webui_set_tls_certificate()`, and `webui_set_config(use_cookies)`.
 
-### Calls, bindings, and browser bridge (complete)
+### Calls, bindings, and browser bridge (partial)
 
-- Implements the complete public bridge surface.
+- Implements the public bridge methods listed above; automatic connection
+  recovery and runtime binding updates remain incomplete.
 - Preserves string, number, boolean, and `Uint8Array` call arguments.
 - Implements bounded `MULTI` fragmentation for large browser-to-Zig calls and
   JavaScript results, including strict length parsing and per-client cleanup.
 
-This completes `webui_bind()`, the remaining typed argument and return
-methods, and the public browser bridge surface.
+Typed argument and return methods are implemented. Runtime `webui_bind()`
+updates and `CMD_ADD_ID`, keepalive, reconnect, and connection-loss UI remain.
 
 ### Handler and event lifecycle (complete)
 
@@ -468,6 +475,10 @@ This completes `webui_set_config(folder_monitor)`.
 - Run served JavaScript and TypeScript through explicitly selected Deno,
   Node.js, or Bun executables.
 - Keep runtime execution disabled by default and pass commands as argv.
+- Return explicit interpreter failure responses: `503` for unavailable
+  executables, `504` for timeout, and `502` for output limits or unsuccessful
+  exits. Keep diagnostics in the logger, not the HTTP body. This deliberately
+  improves upstream's misleading empty-success behavior.
 
 This completes `webui_set_runtime()`.
 
@@ -539,5 +550,8 @@ zig build -Dtarget=aarch64-macos
 
 Continue capability parity:
 
-1. Design the optional native WebView boundary required by minimize, maximize,
+1. Add authenticated bridge keepalive, reconnect, and connection-loss UI with
+   deterministic token, event, and pending-call lifecycle handling.
+2. Add synchronized runtime bindings and `CMD_ADD_ID` updates.
+3. Design the optional native WebView boundary required by minimize, maximize,
    resizable, and minimum-size behavior.

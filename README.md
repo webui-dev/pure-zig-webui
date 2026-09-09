@@ -239,13 +239,15 @@ served `.js` and `.ts` files through an external interpreter instead of
 sending them to the browser. A request for a directory resolves `index.ts`
 and then `index.js`. The interpreter is spawned as argv, never through a
 shell, and receives the script path followed by the raw query string, so a
-query can never become a command. Standard output is answered as
-`text/plain` and bounded by `Limits.max_runtime_output`; a run is abandoned
-after 30 seconds. Matching upstream, a missing interpreter, a timeout, or
-oversized output answers an empty `200` so one absent runtime does not break
-the page — every such case is reported through the window logger, as is a
-non-zero exit status. Percent escapes in the request path are never decoded,
-so they cannot become path separators or hide a traversal.
+query can never become a command. Successful standard output is answered as
+`200 text/plain` and bounded by `Limits.max_runtime_output`; a run is abandoned
+after 30 seconds. Unlike upstream's empty-success fallback, unavailable
+interpreters (missing, inaccessible, or invalid executables) answer `503`,
+timeouts answer `504`, and output-limit violations or unsuccessful exits answer
+`502`. Failed runs never return partial stdout or interpreter diagnostics to
+the browser; diagnostics remain in the window logger. Static resources are
+unaffected. Percent escapes in the request path are never decoded, so they
+cannot become path separators or hide a traversal.
 
 Set `App.Options.default_directory` to let windows created without `.content`
 inherit one static directory. Explicit window content takes precedence. A
@@ -306,6 +308,11 @@ before `App.deinit()`.
 The browser-side `webui` object also provides connection events, runtime
 logging, Base64 helpers, navigation control, and native high-contrast media
 query detection.
+
+`webui.call()` reserves a nonzero 16-bit request ID until its response arrives,
+the send fails, or the connection closes. Allocation skips pending IDs when
+wrapping; with all 65,535 IDs occupied, only the new call is rejected and no
+packet is sent. A slow deferred reply cannot be overwritten by later calls.
 
 Browser-to-Zig protocol packets of at least 65,500 bytes are sent as ordered
 `MULTI` chunks and reassembled per client. The announced total size is strictly

@@ -174,9 +174,9 @@ Zig 化的所有权/错误设计、以及文档中声明过的有意收紧（严
 
 ## 次要偏差（可接受，但应知情或在文档中声明）
 
-- **call id 回绕碰撞**（`src/bridge.js:187`）：id 在 65536 次调用后回绕，如果
-  旧调用仍未完成，`pending.set` 会覆盖旧 promise，使其永不 settle。上游用递减
-  的 16 位 id，同类问题。低概率，可在回绕时跳过仍挂起的 id。
+- **call id 回绕碰撞（2026-09-09 已修复）**：调用 ID 在 1–65535 之间循环，
+  跳过仍挂起的 ID；全部占用时仅拒绝新调用，不发包、不覆盖旧 promise。
+  回复、发送失败和断连释放相应挂起状态，不再照搬上游的覆盖行为。
 - **无 keepalive ping**：上游 bridge 每 20s 发 'ping' 文本帧并开启 civetweb
   ping-pong。回环场景无影响；`public` + TLS 场景中间设备（反向代理/NAT）会
   掐空闲连接。注意我们的 `onMessage` 会对文本帧直接断连
@@ -209,8 +209,10 @@ Zig 化的所有权/错误设计、以及文档中声明过的有意收紧（严
   格式，上游 `%u` 反而在负坐标时有 bug）、`--user-data-dir` / `--profile`、
   `--proxy-server`、chromium 默认参数集、`--app=` / `-new-window`。
 - Safari/Firefox 不支持项返回显式错误（上游静默忽略）——ledger 已声明。
-- 运行时解释（Deno/Node/Bun）：missing runtime/失败回空 200、404 语义、
-  text/plain、query 作为第二个 argv、目录 index.ts→index.js 回退。
+- 运行时解释的 argv、query 参数和目录 index.ts→index.js 回退语义保持。
+  **2026-09-09 有意偏离上游**：解释器不可用返回 503，超时返回 504，
+  输出超限或非正常退出返回 502，不再以空 200 掩盖失败，也不向浏览器泄露
+  失败进程的部分 stdout 或诊断。成功输出仍为 200 text/plain，静态资源不受影响。
 - cookie 解析、Origin 校验（我们更严：上游 `Access-Control-Allow-Origin: *`
   且不校验 WS Origin）、回环默认监听、TLS 显式配置。
 - 目录监视重载广播、favicon 注入与服务、`webui_show_client` 的单客户端导航
@@ -220,5 +222,11 @@ Zig 化的所有权/错误设计、以及文档中声明过的有意收紧（严
 
 B1–B8 已全部修复（2026-08-22）：`zig build test` 通过（含扩展后的
 `bridge.test.js` 与新增的 cookie 锁定、运行期 bind 拒绝测试），五个门禁
-目标交叉编译通过，x86_64-windows 测试模块编译通过。次要偏差清单保持
-未处理，留待后续决策。
+目标交叉编译通过，x86_64-windows 测试模块编译通过。次要偏差中的 call id
+碰撞及运行时失败响应已在 2026-09-09 修正；其余未处理项仍保留。
+
+2026-09-09 验证：运行时定向测试 10/10 通过，bridge 测试 3/3 通过；
+`zig build test` 的 Zig 测试 25 通过、8 项受平台限制跳过，`zig build` 通过。
+Chromium 经真实 Zig 后端完成 65,536 次调用后仍正确收到原始延迟回复；
+实际 HTTP 验证成功 200、解释器缺失 503、异常退出/超限 502 和 30 秒超时
+504，失败正文为空且静态资源仍可访问。本轮未重新执行跨平台发布门禁。
