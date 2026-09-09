@@ -313,6 +313,7 @@ const PendingEval = struct {
     buffer: []u8,
     len: usize = 0,
     status: EvalStatus = .waiting,
+    sent: bool = false,
     done: std.Io.Event = .unset,
 };
 
@@ -349,6 +350,9 @@ const ConnectedClient = struct {
     key: usize,
     peer: Linsang.WebSocketPeer,
     multi: ?MultiPacket = null,
+    /// Timed-out wire IDs stay unavailable until their late reply or disconnect.
+    /// Allocated once on the first evaluation: 8 KiB bounds all 16-bit IDs.
+    retired_eval_ids: std.DynamicBitSetUnmanaged = .{},
 };
 
 const DirectorySnapshot = struct {
@@ -607,6 +611,7 @@ const WindowState = struct {
         self.pending_evals.deinit(self.gpa);
         for (self.clients.items) |*connected| {
             if (connected.multi) |*multi| multi.deinit(self.gpa);
+            connected.retired_eval_ids.deinit(self.gpa);
             connected.peer.deinit();
         }
         self.clients.deinit(self.gpa);
@@ -1010,6 +1015,7 @@ const WindowState = struct {
             return null;
         var disconnected_client = self.clients.swapRemove(index);
         if (disconnected_client.multi) |*multi| multi.deinit(self.gpa);
+        disconnected_client.retired_eval_ids.deinit(self.gpa);
         disconnected_client.peer.deinit();
         for (self.pending_evals.items) |pending| {
             if (pending.client_id == disconnected_client.id) {
@@ -1239,7 +1245,11 @@ const WindowState = struct {
         const pending = for (self.pending_evals.items) |candidate| {
             if (candidate.id == id and candidate.client_id == client_id)
                 break candidate;
-        } else return;
+        } else {
+            const retired = &self.clients.items[client_index].retired_eval_ids;
+            if (retired.bit_length != 0) retired.unset(id);
+            return;
+        };
         if (pending.status != .waiting) return;
 
         var value = payload[1..];
@@ -1265,6 +1275,10 @@ const WindowState = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const index = self.pendingIndex(pending) orelse return;
+        if (pending.sent and pending.status == .waiting) {
+            if (self.clientIndexById(pending.client_id)) |client_index|
+                self.clients.items[client_index].retired_eval_ids.set(pending.id);
+        }
         _ = self.pending_evals.swapRemove(index);
     }
 
@@ -1288,15 +1302,17 @@ const WindowState = struct {
         };
     }
 
-    fn nextEvalId(self: *WindowState) u16 {
-        while (true) {
+    fn nextEvalId(self: *WindowState, connected: *const ConnectedClient) !u16 {
+        for (0..std.math.maxInt(u16)) |_| {
             const id = self.next_eval_id;
             self.next_eval_id +%= 1;
             if (self.next_eval_id == 0) self.next_eval_id = 1;
+            if (connected.retired_eval_ids.isSet(id)) continue;
             for (self.pending_evals.items) |pending| {
                 if (pending.id == id) break;
             } else return id;
         }
+        return error.EvaluationIdsExhausted;
     }
 
     fn snapshotClients(
@@ -1449,21 +1465,22 @@ const WindowState = struct {
         defer selected.peer.deinit();
 
         var pending: PendingEval = undefined;
-        try self.mutex.lock(io);
-        if (self.pending_evals.items.len >= self.max_pending_evals) {
-            self.mutex.unlock(io);
-            return error.TooManyPendingEvals;
+        {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            if (self.pending_evals.items.len >= self.max_pending_evals)
+                return error.TooManyPendingEvals;
+            const client_index = self.clientIndexById(selected.id) orelse return error.ConnectionClosed;
+            const connected = &self.clients.items[client_index];
+            if (connected.retired_eval_ids.bit_length == 0)
+                connected.retired_eval_ids = try std.DynamicBitSetUnmanaged.initEmpty(self.gpa, 1 << 16);
+            pending = .{
+                .id = try self.nextEvalId(connected),
+                .client_id = selected.id,
+                .buffer = result_buffer,
+            };
+            try self.pending_evals.append(self.gpa, &pending);
         }
-        pending = .{
-            .id = self.nextEvalId(),
-            .client_id = selected.id,
-            .buffer = result_buffer,
-        };
-        self.pending_evals.append(self.gpa, &pending) catch |err| {
-            self.mutex.unlock(io);
-            return err;
-        };
-        self.mutex.unlock(io);
         errdefer self.removeEval(io, &pending);
 
         var packet: std.ArrayList(u8) = .empty;
@@ -1477,6 +1494,7 @@ const WindowState = struct {
             error.Closed => return error.ConnectionClosed,
             else => return err,
         };
+        pending.sent = true;
 
         while (true) {
             pending.done.waitTimeout(io, .{ .deadline = deadline }) catch |wait_error| {
@@ -7499,4 +7517,94 @@ test "managed browser replacement reaps its previous child before relaunch" {
         .executable = missing_executable,
     }));
     try std.testing.expectEqual(@as(?BrowserProcessId, null), try window.browserProcessId(&running));
+}
+
+test "late timed out evaluation cannot resolve a later request after ID wrap" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "late evaluation" } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    const stream = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    defer stream.close(io);
+    var wire: [125]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &wire));
+    var first_buffer: [16]u8 = undefined;
+    var first = try io.concurrent(Window.eval, .{ window, io, "return 'late'", &first_buffer, std.Io.Duration.fromMilliseconds(50) });
+    defer _ = first.cancel(io) catch {};
+    const stale = (try protocol.decode(try readServerFrame(stream, io, &wire))).header;
+    try std.testing.expectError(error.Timeout, first.await(io));
+
+    // Advance directly to the wrap boundary without 65,535 network round trips.
+    window.state.mutex.lockUncancelable(io);
+    window.state.next_eval_id = stale.id;
+    window.state.mutex.unlock(io);
+    var second_buffer: [16]u8 = undefined;
+    var second = try io.concurrent(Window.eval, .{ window, io, "return 'new'", &second_buffer, std.Io.Duration.fromSeconds(2) });
+    defer _ = second.cancel(io) catch {};
+    const current = (try protocol.decode(try readServerFrame(stream, io, &wire))).header;
+    var reply: std.ArrayList(u8) = .empty;
+    defer reply.deinit(gpa);
+    try protocol.append(&reply, gpa, stale, "\x00old");
+    try sendClientFrame(stream, io, reply.items);
+    reply.clearRetainingCapacity();
+    try protocol.append(&reply, gpa, current, "\x00new");
+    try sendClientFrame(stream, io, reply.items);
+    try std.testing.expectEqualStrings("new", (try second.await(io)).value);
+
+    // Once its late reply was consumed, the old ID becomes available again.
+    window.state.mutex.lockUncancelable(io);
+    window.state.next_eval_id = stale.id;
+    window.state.mutex.unlock(io);
+    var third_buffer: [16]u8 = undefined;
+    var third = try io.concurrent(Window.eval, .{ window, io, "return 'fresh'", &third_buffer, std.Io.Duration.fromSeconds(2) });
+    defer _ = third.cancel(io) catch {};
+    const reused = (try protocol.decode(try readServerFrame(stream, io, &wire))).header;
+    try std.testing.expectEqual(stale.id, reused.id);
+    reply.clearRetainingCapacity();
+    try protocol.append(&reply, gpa, reused, "\x00fresh");
+    try sendClientFrame(stream, io, reply.items);
+    try std.testing.expectEqualStrings("fresh", (try third.await(io)).value);
+}
+
+test "exhausted evaluation wire IDs recover after a discarded late reply" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "ID capacity" } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    const stream = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    defer stream.close(io);
+    var wire: [125]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &wire));
+    window.state.mutex.lockUncancelable(io);
+    window.state.clients.items[0].retired_eval_ids = std.DynamicBitSetUnmanaged.initFull(gpa, 1 << 16) catch |err| {
+        window.state.mutex.unlock(io);
+        return err;
+    };
+    window.state.mutex.unlock(io);
+    var output: [16]u8 = undefined;
+    try std.testing.expectError(error.EvaluationIdsExhausted, window.eval(io, "return 1", &output, .fromSeconds(1)));
+    var packet: std.ArrayList(u8) = .empty;
+    defer packet.deinit(gpa);
+    try protocol.append(&packet, gpa, .{ .token = window.state.token, .id = 42, .command = .js }, "\x00discarded");
+    try sendClientFrame(stream, io, packet.items);
+    // Authentication is an ordered barrier after the late result.
+    try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &wire));
+    var evaluation = try io.concurrent(Window.eval, .{ window, io, "return 'restored'", &output, std.Io.Duration.fromSeconds(2) });
+    defer _ = evaluation.cancel(io) catch {};
+    const request = (try protocol.decode(try readServerFrame(stream, io, &wire))).header;
+    try std.testing.expectEqual(@as(u16, 42), request.id);
+    packet.clearRetainingCapacity();
+    try protocol.append(&packet, gpa, request, "\x00restored");
+    try sendClientFrame(stream, io, packet.items);
+    try std.testing.expectEqualStrings("restored", (try evaluation.await(io)).value);
 }

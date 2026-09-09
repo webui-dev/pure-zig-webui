@@ -355,6 +355,9 @@ expose `webui.<binding>()`, without overwriting core or prototype properties.
 Call correlation reserves IDs 1–65,535 until completion, send failure, or
 disconnect. Allocation skips outstanding IDs on wrap and rejects only the new
 call when exhausted, instead of overwriting an earlier promise as upstream can.
+Backend evaluation IDs are also quarantined after timeout/cancellation until a
+late result or disconnect releases them. Exhaustion returns an explicit error;
+late results cannot resolve unrelated requests after wrap.
 The bridge retries transport loss after 500ms and reauthenticates each socket,
 with a five-second connection/authentication deadline. Authenticated text
 `ping`/`pong` exchanges run every 20 seconds with a ten-second reply deadline.

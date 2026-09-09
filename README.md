@@ -304,6 +304,10 @@ received work independently. Both modes own queued data, obey
 `WindowOptions.max_pending_events`, and are canceled and joined by
 `Running.stop()`. Evaluation's total deadline includes connection waiting,
 send-lock contention, transmission, and waiting for the JavaScript response.
+Sent evaluations that time out or are canceled keep their wire ID reserved until
+the late result is discarded or the client disconnects. IDs cannot be reused to
+misattribute an old result after 16-bit wrap; exhausting that space returns
+`error.EvaluationIdsExhausted`. Tracking is bounded to 8 KiB per evaluated client.
 
 Set `App.Options.logger` and optional `logger_user_data` to receive formatted
 internal messages with a `std.log.Level`. The message slice is valid only
