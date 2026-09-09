@@ -95,6 +95,46 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & zig-out/bin/native.exe --expect-unavailable --loader "$env:RUNNER_TEMP/nonexistent-WebView2Loader.dll"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Capture Windows native surface
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $process = Start-Process "$PWD/zig-out/bin/native.exe" -ArgumentList @('--loader', ('"' + $env:WEBUI_WEBVIEW2_LOADER + '"')) -PassThru -NoNewWindow
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(20)
+            while (!$process.HasExited -and $process.MainWindowHandle -eq [IntPtr]::Zero -and [DateTime]::UtcNow -lt $deadline) {
+              Start-Sleep -Milliseconds 100
+              $process.Refresh()
+            }
+            if ($process.HasExited -or $process.MainWindowHandle -eq [IntPtr]::Zero) { throw 'Native window did not appear' }
+            Start-Sleep -Seconds 3
+            $screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bitmap = [System.Drawing.Bitmap]::new($screen.Width, $screen.Height)
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            try {
+              $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
+              $bitmap.Save("$env:RUNNER_TEMP/native-visual.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            } finally {
+              $graphics.Dispose()
+              $bitmap.Dispose()
+            }
+            if (!$process.CloseMainWindow()) { throw 'Native OS-close request failed' }
+            if (!$process.WaitForExit(10000)) { throw 'Native OS-close did not terminate cleanly' }
+            if ($process.ExitCode -ne 0) { throw "Native visual process failed: $($process.ExitCode)" }
+          } finally {
+            if (!$process.HasExited) { $process.Kill(); $process.WaitForExit() }
+            $process.Dispose()
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && runner.os == 'Windows'
+        with:
+          name: windows-native-surface
+          path: ${{ runner.temp }}/native-visual.png
+          if-no-files-found: ignore
   cross:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

@@ -7,6 +7,8 @@ const Page = struct {
     window: webui.Window,
     native: ?webui.native.Window = null,
     ready: std.atomic.Value(bool) = .init(false),
+    runtime_calls: std.atomic.Value(usize) = .init(0),
+    runtime_events: std.atomic.Value(usize) = .init(0),
     allow_close: bool = false,
     close_requests: usize = 0,
     reentrant_destroy_rejected: bool = false,
@@ -29,6 +31,18 @@ fn ready(call: *webui.Call, data: ?*anyopaque) !void {
     const page: *Page = @ptrCast(@alignCast(data.?));
     page.ready.store(true, .release);
     try call.reply("Connected to Zig");
+}
+
+fn runtimeBinding(call: *webui.Call, data: ?*anyopaque) !void {
+    const page: *Page = @ptrCast(@alignCast(data.?));
+    _ = page.runtime_calls.fetchAdd(1, .acq_rel);
+    try call.reply("runtime binding");
+}
+
+fn runtimeEvent(event: *const webui.Event, data: ?*anyopaque) !void {
+    const page: *Page = @ptrCast(@alignCast(data.?));
+    if (event.kind == .click and std.mem.eql(u8, event.data, "runtime-event"))
+        _ = page.runtime_events.fetchAdd(1, .acq_rel);
 }
 
 fn closeRequested(data: ?*anyopaque) bool {
@@ -141,6 +155,18 @@ fn smoke(io: std.Io, first: *Page, second: *Page) !void {
     try pumpUntil(io, a, first, null);
     try pumpUntil(io, a, second, null);
     try evaluate(io, a, first.window, "return await webui.call('ready')", "Connected to Zig");
+    try first.window.bind(io, "late", runtimeBinding, first);
+    try evaluate(io, a, first.window, "return await webui.late()", "runtime binding");
+    try first.window.onEvent(io, runtimeEvent, first);
+    try evaluate(io, a, first.window, "for (const id of ['late','runtime-event']) { const b=document.createElement('button'); b.id=id; document.body.appendChild(b); b.click(); } return 'clicked';", "clicked");
+    const registration_deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(5) });
+    while (first.runtime_calls.load(.acquire) < 2 or first.runtime_events.load(.acquire) < 1) {
+        if (!try a.poll()) return error.NativeClosedEarly;
+        if (registration_deadline.compare(.lte, .now(io, .awake))) return error.NativeRegistrationFailed;
+        try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+    }
+    if (first.runtime_calls.load(.acquire) != 2 or first.runtime_events.load(.acquire) != 1)
+        return error.NativeDuplicateDispatch;
     try a.setSize(.{ .width = 900, .height = 640 });
     try expectSize(io, a, .{ .width = 900, .height = 640 });
     try a.setMinimumSize(.{ .width = 320, .height = 240 });
