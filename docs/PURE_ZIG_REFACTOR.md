@@ -27,14 +27,16 @@ deleted.
 
 | Area | Status |
 |---|---|
-| Server and security | HTTP, WebSocket, TLS, loopback/public policy, capabilities, Origin checks, cookies, and protocol limits are implemented. |
-| Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, high-contrast detection, bounded `MULTI` fragmentation, multiple clients, authenticated keepalive, reconnect, and connection-loss UI are implemented. |
+| Server and security | HTTP, WebSocket, TLS, loopback/public policy, capabilities, upgrade-bound Origin/cookie authorization, bounded authentication/liveness, and protocol limits are implemented. |
+| Browser bridge | Runtime bindings and events with `ADD_ID` replay, typed arguments/replies, bounded FIFO or concurrent handlers, deferred replies, total-deadline evaluation, raw data, navigation, high contrast, bounded `MULTI`, multiple clients, keepalive, reconnect, and status UI are implemented. |
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, Deno/Node.js/Bun script interpretation, logging, and deterministic shutdown are implemented. |
 | Browser integration | Centring, app-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed and deletable managed profile directories, Chromium-family proxy rules, Windows external-browser focus, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
-| Current validation | 2026-09-09 local validation: `zig build test` passes (29 Zig tests passed, 8 platform-gated tests skipped; all 11 bridge tests passed), and `zig build` passes. Four focused heartbeat integration scenarios pass without skips. Real Chromium verified scheduled `ping`/`pong`, disconnect rejection without replay, authenticated reconnect, recovery/terminal UI, reload, and clean backend-requested shutdown. Cross-target release gates were not rerun in this change. |
+| Native integration | Optional Zig-only WKWebView, GTK3/WebKitGTK 4.1 and Win32/WebView2 backends implement native controls, main-thread dispatch, close veto/history-safe JavaScript close, multiwindow pumping, and borrowed handles. macOS runtime smoke has passed; remaining runtime gates are tracked below. |
+| Current validation | Local macOS core gate: 46 passed, 6 Linux-specific skips; bridge: 15 passed; native build and actual WKWebView smoke passed. Linux/Windows native builds pass. Hardened Linsang passes all 107 tests on Linux. Full platform runtime and release gates remain in progress. |
 
-Remaining work includes runtime binding updates, native browser-window controls
-and geometry, optional native WebViews and handles, and final parity validation.
+The ledger's implementation gaps are filled. Overall completion still requires
+the native/runtime and cross-target validation gates below; compilation alone
+does not close those gates.
 The coverage ledger below is the authoritative method-level list.
 
 ## Original Baseline
@@ -84,15 +86,18 @@ races, and synchronous access to the actual `port = 0` address through
 - Zig 0.14 or 0.15 compatibility. Zig 0.16 is the baseline.
 - Automatic self-signed certificate generation.
 
-### Remaining capability parity
+### Native platform boundaries
 
-- WebView2, GTK/WebKit, or WKWebView.
-- Native WebView window controls and geometry. External-browser focus already
-  matches upstream's Windows-only support and reports unsupported platforms
-  explicitly.
+Native window APIs live in `webui.native`, never in a bundled C implementation.
+All operations run on the UI owner thread; bounded dispatch connects worker
+callbacks to that thread. Linux uses dynamically loaded GTK3/WebKitGTK 4.1,
+Windows uses an installed WebView2 runtime/loader, and macOS uses system
+AppKit/WebKit frameworks. Missing dependencies return explicit errors.
 
-These do not block the external-browser core, but they are required before
-declaring complete upstream capability parity.
+Upstream's transparent native windows are implemented on Windows and composited
+X11. Public macOS WKWebView APIs do not offer that capability, and upstream's
+macOS adapter does not implement it either. Wayland coordinate queries/moves and
+arbitrary macOS native profile paths return explicit unsupported errors.
 
 ## Do Not Translate `webui.c` Line by Line
 
@@ -161,7 +166,7 @@ defer app.deinit();
 const window = try app.createWindow(.{
     .content = .{ .html = @embedFile("index.html") },
 });
-try window.bind("sum", sum, null);
+try window.bind(io, "sum", sum, null);
 
 var running = try app.start(io);
 defer running.stop() catch {};
@@ -319,16 +324,21 @@ Coverage is determined only from `src/root.zig` and its reachable pure Zig
 modules. Deleted legacy wrapper, test, and example files do not count as
 implementations.
 
-### Missing or Partial Backend Capabilities
+### Native and Browser Window Capabilities
 
-| Upstream API | Current gap |
+Native implementation entries below require the platform runtime gates in
+addition to compilation. Native API options/geometry are independent of
+external-browser launch flags.
+
+| Upstream API | Zig implementation |
 |---|---|
-| `webui_set_kiosk()` | `App.WindowOptions.kiosk` generates an explicit Chromium-family (`--chrome-frame --kiosk`) or Firefox (`-kiosk`) argument, and returns an error for browsers that cannot honour it. |
-| `webui_set_hide()` | `App.WindowOptions.hide` launches the browser headless through `--headless=new` or Firefox `-headless`. |
-| `webui_minimize()`, `webui_maximize()` | Not implemented. Upstream routes both to its native WebView only. |
-| `webui_set_resizable()`, `webui_set_minimum_size()` | Not implemented. Upstream stores both and applies them only in its Win32 and GTK WebView window procedures, so external browsers ignore them there too. |
-| `webui_set_frameless()`, `webui_set_transparent()` | Not implemented. Upstream applies both only to its native WebView windows; external browsers ignore them there too. |
-| `webui_show_wv()`, `webui_set_close_handler_wv()`, `webui_get_hwnd()`, `webui_win32_get_hwnd()` | Native WebView hosting and native window handles are outside the pure Zig browser core. |
+| `webui_set_kiosk()` | `App.WindowOptions.kiosk` for supported external browsers; `native.Window.setKiosk()` for native windows. |
+| `webui_set_hide()` | `App.WindowOptions.hide` for headless external browsers; `native.Options.hidden` and `native.Window.setVisible()` for native windows. |
+| `webui_minimize()`, `webui_maximize()` | `native.Window.minimize()`, `maximize()`, and `restore()`. |
+| `webui_set_resizable()`, `webui_set_minimum_size()` | `native.Options` and `native.Window.setResizable()` / `setMinimumSize()`. |
+| `webui_set_frameless()`, `webui_set_transparent()` | Native options and setters. Windows transparency configures both host composition and WebView background; X11 requires RGBA/compositing. macOS transparency is explicitly unsupported, as upstream's native adapter does not implement it. |
+| `webui_show_wv()`, `webui_set_close_handler_wv()` | `native.Window.open()` plus `setCloseHandler()`. User/JavaScript close can be vetoed before destroying the page; `native.Window.close()` force-closes. |
+| `webui_get_hwnd()`, `webui_win32_get_hwnd()` | `native.Window.handle()` returns a borrowed tagged Cocoa/Gtk/Win32 handle, invalid after close/deinit. |
 
 ### Browser Bridge APIs
 
@@ -338,6 +348,9 @@ The browser-side `webui` object implements `call()`, `isConnected()`,
 and `atob()`, while high-contrast detection uses native browser media
 queries. The upstream bridge's `callCore()` method remains an internal
 implementation detail.
+`Window.bind(io, ...)` and `Window.onEvent(io, ...)` support synchronized
+runtime replacement. Registration replay precedes `CONNECTED`; safe names also
+expose `webui.<binding>()`, without overwriting core or prototype properties.
 
 Call correlation reserves IDs 1–65,535 until completion, send failure, or
 disconnect. Allocation skips outstanding IDs on wrap and rejects only the new
@@ -378,12 +391,12 @@ not implementation gaps:
 | `webui_set_runtime()` | `App.WindowOptions.runtime` selects Deno, Node.js, or Bun for served `.js` and `.ts` files, including `index.ts`/`index.js` directory resolution. The interpreter is spawned as argv rather than through a shell. Unlike upstream's empty `200`, unavailable executables answer `503`, timeouts `504`, and output-limit violations or unsuccessful exits `502`; failed stdout and diagnostics are never served. |
 | `webui_set_config(folder_monitor)` | `App.Options.folder_monitor_interval` enables portable recursive directory polling and reloads the affected window's connected clients. |
 | `webui_set_icon()`, `webui_set_icon_file()` | `Window.setIcon()` copies inline data and MIME type; `Window.setIconFile()` loads a supported image file as the window favicon. |
-| `webui_set_profile()` | `App.WindowOptions.profile_directory` is copied and mapped to Chromium-family `--user-data-dir` or Firefox `--profile`. Chromium-family launches without it use a managed temporary profile such as `/tmp/.WebUI/WebUIChromeProfile`, which is what keeps the app window independent of a running browser instance. Caller-provided directories remain caller-owned; generated profiles are removed only through the explicit deletion APIs. |
+| `webui_set_profile()` | Caller-managed browser profiles remain supported. Default Chromium processes use distinct per-window capability leaves under managed family roots, preventing cross-window process handoff. Replacement stops/reaps the previous child before launch; explicit deletion never removes a caller profile. |
 | `webui_set_proxy()` | `App.WindowOptions.proxy_server` is copied and passed as one Chromium-family `--proxy-server` argument. Unsupported browsers return an explicit error. |
 | `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. Matching upstream `WEBUI_RELOAD_TIMEOUT`, a disconnect that was not requested by a backend `close` gets a 1.5-second reconnect grace period before the wait ends, so reloads and navigations survive. |
 | `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `Running.stop()`, and `App.deinit()`. |
 | `webui_set_context()`, `webui_get_context()` | Binding and event-handler `user_data`. |
-| `webui_bind()` | `Window.bind()` handles explicit `webui.call()` requests and zero-argument DOM clicks from elements with a matching ID. Bindings and `Window.onEvent` are installed before `App.start()`; runtime installation returns `error.AlreadyStarted` because upstream's runtime `webui_bind()` and `CMD_ADD_ID` push are not implemented. |
+| `webui_bind()` | `Window.bind(io, name, handler, user_data)` supports explicit calls, DOM clicks, and runtime replacement. `Window.onEvent(io, handler, user_data)` updates event handling. `CMD_ADD_ID` pushes new registrations and authentication replays current state; in-flight work keeps its handler snapshot. |
 | `webui_get_count()`, `webui_get_size()`, `webui_get_size_at()` | `Call.arguments.len` and `Call.bytes(index).len`. |
 | `webui_get_string()`, `webui_get_string_at()`, `webui_get_int()`, `webui_get_int_at()`, `webui_get_float()`, `webui_get_float_at()`, `webui_get_bool()`, `webui_get_bool_at()` | `Call.string()`, `Call.int()`, `Call.float()`, and `Call.boolean()`. |
 | `webui_return_string()`, `webui_return_int()`, `webui_return_float()`, `webui_return_bool()` | `Call.reply()`, `Call.replyInt()`, `Call.replyFloat()`, and `Call.replyBool()`. |
@@ -423,21 +436,22 @@ the coverage ledger in the same commit.
 This completes the behavior represented by `webui_set_public()`,
 `webui_set_tls_certificate()`, and `webui_set_config(use_cookies)`.
 
-### Calls, bindings, and browser bridge (partial)
+### Calls, bindings, and browser bridge (complete)
 
 - Implements the public bridge methods listed above, authenticated keepalive,
-  reconnection, and connection-loss UI. Runtime binding updates remain incomplete.
+  reconnection, connection-loss UI, synchronized runtime bindings and replay.
 - Preserves string, number, boolean, and `Uint8Array` call arguments.
 - Implements bounded `MULTI` fragmentation for large browser-to-Zig calls and
   JavaScript results, including strict length parsing and per-client cleanup.
 
-Typed argument and return methods are implemented. Runtime `webui_bind()`
-updates and `CMD_ADD_ID` remain.
+Typed argument/return methods, runtime `webui_bind()` updates, and `CMD_ADD_ID`
+are implemented and covered by integration and bridge regressions.
 
 ### Handler and event lifecycle (complete)
 
-Implements asynchronous replies, per-window event scheduling, explicit
-connection waiting, and caller-provided logging.
+Implements asynchronous replies, bounded FIFO serial or independent concurrent
+handlers, connection waiting, and logging. The receiver never executes user
+handlers inline, so a serial handler may evaluate JavaScript on its own client.
 
 ### Dynamic content and client state (complete)
 
@@ -467,9 +481,9 @@ child tracking methods in the ledger.
 - Windows external-browser focus enumerates visible top-level windows owned by
   the retained browser child, restores a minimized match, and requests the
   foreground. Other platforms return `error.UnsupportedPlatform`.
-- Implement minimize, maximize, resizable, remaining geometry, frameless, and
-  transparent controls in the optional native WebView module. Upstream does
-  not apply them to external browsers.
+- Native options/setters implement minimize, maximize, resizable, minimum size,
+  geometry, frameless, visible and transparent behavior through the optional
+  platform adapters; explicit platform limitations are listed above.
 
 ### File monitoring (complete)
 
@@ -492,24 +506,26 @@ This completes `webui_set_runtime()`.
 
 ### Native WebViews
 
-- Keep WebView support in an optional module so the browser core remains pure
-  Zig and has no bundled C, C++, or Objective-C implementation.
-- Implement WebView2, GTK/WebKit, and WKWebView adapters using system
-  frameworks.
-- Add close interception and native window-handle access.
+- `src/native.zig` owns the public UI-thread facade and bounded dispatch queue.
+- `src/native/{macos,linux,windows}.zig` implements system framework ABIs without
+  bundled C, C++, or Objective-C.
+- Close interception uses document-start native messaging so veto and navigation
+  history remain valid; one toolkit pump services other windows too.
+- Reentrant destruction during callbacks is rejected. COM late completions and
+  native delegate/signal ownership have explicit cleanup.
 
-This completes `webui_show_wv()`, `webui_set_close_handler_wv()`,
-`webui_get_hwnd()`, and `webui_win32_get_hwnd()`. Platform ABI declarations
-inside the optional module require a separate design review; the public
-zig-webui API remains Zig-native.
+This implements `webui_show_wv()`, `webui_set_close_handler_wv()`, and native
+handles. A separate ABI/ownership review was performed for every platform;
+the public API stays Zig-native, and runtime verification remains mandatory.
 
 ### Parity closure
 
-- Give every ledger row an implemented or replacement status.
-- Add retained examples for bindings, dynamic content, public TLS, managed
-  browsers, runtimes, and WebViews.
-- Run protocol fuzzing, browser end-to-end tests, leak checks, and all target
-  builds before publishing the breaking release.
+- All ledger rows now have a concrete implementation or intentional replacement.
+- Retained examples cover bindings, dynamic content, public TLS, managed
+  browsers, runtimes, and native WebViews.
+- `zig build fuzz --fuzz=100K`, real browser/native scenarios, leak checks, and
+  the five-target builds form the release gate; CI installs optional runtimes
+  rather than treating executable absence as coverage.
 
 ## Tests and Completion Criteria
 
@@ -550,14 +566,13 @@ zig build -Dtarget=aarch64-macos
    as untrusted and must not copy C's NUL-scanning behavior.
 3. **Cross-platform browser behavior:** Guarantee URL opening first, then add
    platform-specific app-window flags.
-4. **WebView is outside the core rewrite:** If required later, separately
-   decide whether system framework or C ABI linking is acceptable. It must not
-   block the pure Zig browser version.
+4. **Native platform dependencies:** Optional adapters require real system
+   frameworks/runtimes. Missing support is an explicit result, not a browser
+   fallback or successful no-op. Never close a validation gate with only a
+   cross-build or a skipped test.
 
-## Next Implementation Work
+## Final Validation Work
 
-Continue capability parity:
-
-1. Add synchronized runtime bindings and `CMD_ADD_ID` updates.
-2. Design the optional native WebView boundary required by minimize, maximize,
-   resizable, and minimum-size behavior.
+Complete Linux/Windows native execution, missing-runtime paths, protocol
+fuzzing, browser reconnection/registration scenarios, and the full build matrix.
+Record exact results here before declaring complete rewrite parity.

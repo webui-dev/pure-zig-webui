@@ -4,8 +4,8 @@
 > This is an experimental project under active development and is not suitable
 > for production use.
 
-zig-webui is being rebuilt as a pure Zig WebUI implementation. The core no
-longer compiles or links the upstream WebUI C library or CivetWeb.
+zig-webui is a Zig-native reimplementation of WebUI. The core does not
+compile or link the upstream WebUI C library or CivetWeb.
 [Linsang](https://github.com/jinzhongjia/Linsang) provides HTTP and WebSocket
 support.
 
@@ -25,6 +25,7 @@ The current phase provides:
   `Window.waitForConnection()`;
 - window connected/shown state through `Window.isShown()`;
 - JavaScript calls to Zig bindings with return values;
+- thread-safe runtime binding and event-handler replacement, with client replay;
 - typed integer, float, and boolean call arguments and replies;
 - owned one-shot delayed binding replies through `Call.deferReply()`;
 - window and targeted `Call.client` calls to JavaScript with results, errors,
@@ -71,6 +72,8 @@ The current phase provides:
   platforms and unavailable windows;
 - current backend process ID through `parentProcessId()`;
 - default-browser launching and deterministic shutdown.
+- optional native WKWebView, GTK3/WebKitGTK 4.1, and WebView2 hosting through
+  system APIs, with native controls, close veto, and borrowed window handles.
 
 ```zig
 const std = @import("std");
@@ -94,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
             ,
         },
     });
-    try window.bind("hello", hello, null);
+    try window.bind(io, "hello", hello, null);
 
     var running = try app.start(io);
     defer running.stop() catch {};
@@ -201,21 +204,21 @@ Firefox returns `error.UnsupportedBrowserProxy` for proxy configuration;
 Safari returns `error.UnsupportedBrowserProfile` or
 `error.UnsupportedBrowserProxy` instead of silently ignoring either option.
 
-Without `.profile_directory`, Chromium-family launches get a managed profile
-under the system temporary directory, such as
-`/tmp/.WebUI/WebUIChromeProfile`. A dedicated profile is what makes the app
-window independent: an already running browser instance otherwise adopts the
-URL, ignores every window argument, and lets the launched process exit
-immediately. The browser creates the directory on first use and reuses it
-across runs.
+Without `.profile_directory`, each Chromium-family window gets an independent
+managed profile leaf under its browser-family temporary root, for example
+`/tmp/.WebUI/WebUIChromeProfile/<window-capability>`. Different windows no
+longer hand their URL to the same browser process. Reopening a window stops and
+reaps its previous child before launching the replacement. A failed replacement
+leaves no stale child identifier.
 
-`Window.deleteProfile(&running)` removes the managed profile of the browser
-that window launched and reports whether one existed; `deleteManagedProfile`
-and `deleteAllManagedProfiles` do the same without a `Window`, and
-`managedProfileDirectory(gpa, browser)` returns the path. Deletion only ever
-touches the generated path: a window configured with `.profile_directory`
-returns `error.CallerManagedProfile`, and caller-owned directories are never
-removed.
+`Window.deleteProfile(&running)` stops the retained child and removes only that
+window's generated leaf. `managedProfileDirectory(gpa, browser)` returns the
+family root; `deleteManagedProfile` and `deleteAllManagedProfiles` remove roots
+and all their leaves, so stop every associated browser before using them.
+Caller-provided profiles remain caller-owned; `Window.deleteProfile` returns
+`error.CallerManagedProfile`. Do not share a caller profile with other live
+browser instances; identical configured profiles in one app are rejected with
+`error.BrowserProfileInUse`.
 
 `Window.setSize(io, size)` and `Window.setPosition(io, position)` persist new
 geometry, return the number of currently notified clients, and replay the
@@ -248,8 +251,12 @@ interpreters (missing, inaccessible, or invalid executables) answer `503`,
 timeouts answer `504`, and output-limit violations or unsuccessful exits answer
 `502`. Failed runs never return partial stdout or interpreter diagnostics to
 the browser; diagnostics remain in the window logger. Static resources are
-unaffected. Percent escapes in the request path are never decoded, so they
-cannot become path separators or hide a traversal.
+unaffected. Resource paths are percent-decoded and validated once before runtime
+or static dispatch; encoded script suffixes cannot expose server-side source.
+Encoded separators, invalid UTF-8, NUL, and traversal are rejected. Interpreters
+reject symlink components and nonregular scripts. The directory tree must remain
+trusted: an attacker who can rewrite executable scripts already controls that
+interpreter's code and permissions.
 
 Set `App.Options.default_directory` to let windows created without `.content`
 inherit one static directory. Explicit window content takes precedence. A
@@ -281,22 +288,29 @@ navigation events. `Event.data` contains the element ID for clicks, the target
 URL for navigation, and is empty for connected or disconnected events.
 Navigation attempts are intercepted while an event handler is installed; call
 `Event.client.navigate` from the handler to continue them. Backend-initiated
-navigation bypasses that interception. Install bindings and the event handler
-before `App.start()`; while the application runs, `Window.bind()` and
-`Window.onEvent` return `error.AlreadyStarted`.
+navigation bypasses that interception. `Window.bind(io, name, handler, user_data)`
+and `Window.onEvent(io, handler, user_data)` work before and during execution.
+New registrations reach connected clients through `ADD_ID` and are replayed
+before a reconnect's `CONNECTED` event. Existing in-flight handlers retain their
+snapshot; keep old `user_data` alive until those invocations have finished.
+Non-conflicting binding names also expose `webui.<name>(...)`; core and inherited
+properties are never overwritten, and `webui.call(name, ...)` always remains
+available.
 
-Handlers run in `.serial` mode by default. `Window.setEventMode(.concurrent)`
-changes newly received binding calls and browser events to independent tasks.
-Concurrent tasks own their event data, are bounded by
+Handlers use a bounded FIFO worker queue in `.serial` mode, leaving the network
+receiver free to process replies and heartbeats. A handler can safely evaluate
+JavaScript on its own client. `Window.setEventMode(.concurrent)` starts newly
+received work independently. Both modes own queued data, obey
 `WindowOptions.max_pending_events`, and are canceled and joined by
-`Running.stop()`.
+`Running.stop()`. Evaluation's total deadline includes connection waiting,
+send-lock contention, transmission, and waiting for the JavaScript response.
 
 Set `App.Options.logger` and optional `logger_user_data` to receive formatted
 internal messages with a `std.log.Level`. The message slice is valid only
 during the callback. The callback must be thread-safe when concurrent event
 handling is enabled. Without a callback, messages use `std.log`.
 
-`Window.bind("button", ...)` also dispatches clicks from elements with
+`Window.bind(io, "button", ...)` also dispatches clicks from elements with
 `id="button"`, including elements added after the bridge loads. DOM click
 handlers receive no arguments and their replies are ignored; explicit
 `webui.call("button", ...)` remains available.
@@ -317,6 +331,11 @@ have a five-second deadline. Authenticated connections send text `ping` every
 20 seconds and require `pong` within 10 seconds; missing replies trigger
 reconnection. The server accepts only this exact authenticated text heartbeat,
 not arbitrary text messages.
+The server independently enforces a five-second authentication deadline and a
+25-second authenticated idle limit. Temporary client-capacity rejection is
+retryable; a stale transport cannot permanently occupy a single-client window.
+Protocol authentication is pinned to the window whose HTTP upgrade passed its
+Origin and cookie policy.
 
 Disconnects reject outstanding `webui.call()` promises; they are never replayed,
 because a binding may already have produced side effects. Results from
@@ -376,6 +395,86 @@ var app = webui.App.init(gpa, .{
 
 The certificate and private key are parsed by `App.start()` and released by
 `Running.stop()`. zig-webui never generates a self-signed certificate.
+
+`use_cookies` requires hosted content. Combining it with `.external_url` returns
+`error.ExternalUrlCookiesUnsupported` rather than silently weakening Strict
+cookies or accepting a cross-site page that cannot authenticate.
+
+## Optional native WebViews
+
+`webui.native` is separate from external-browser launching. It contains only Zig
+source and calls installed platform frameworks; it never builds bundled C,
+C++, or Objective-C. Normal `zig build` does not link GUI libraries.
+
+```zig
+var view = try webui.native.Window.open(gpa, io, window, &running, .{
+    .title = "Native WebUI",
+    .size = .{ .width = 900, .height = 600 },
+    .resizable = true,
+});
+defer view.deinit() catch {};
+try view.run(); // Main/UI thread; std.Io workers serve the WebUI backend.
+```
+
+Create and operate windows on their UI owner thread (the main thread on macOS,
+one process-wide GTK thread on Linux). Use bounded `view.dispatch(callback,
+user_data)` from workers. Do not call `Running.wait()` on the UI thread; pump
+with `view.run()` or `view.poll()`, then stop the server. Join dispatch producers
+before deinit; queued user data is borrowed until execution or queue cancellation.
+Deinit from a native callback or recursive poll returns
+`error.ReentrantNativeOperation`.
+
+Native controls are methods of the returned `view`, not browser JavaScript
+geometry requests: `setSize`, `setPosition`, `center`, `setMinimumSize`,
+`setResizable`, `setFrameless`, `setTransparent`, `setVisible`, `setKiosk`,
+`minimize`, `maximize`, `restore`, and `focus`. `geometry()` reports toolkit
+logical coordinates: content size and outer-window position (Cocoa uses its
+native lower-left origin). `handle()` returns a borrowed tagged Cocoa,
+GTK, or Win32 handle, invalid after native close or deinit.
+
+`setCloseHandler(handler, user_data)` handles OS and JavaScript close requests on
+the UI thread; return `false` to veto. Document-start native integration keeps a
+vetoed page and its bridge alive, including after navigation history changes.
+`view.close()` force-closes without invoking that veto. Pumping one window also
+services native events and accepted close requests for other windows on its UI
+thread.
+
+Platform prerequisites and explicit limits:
+
+- **macOS:** link `objc`, Foundation, AppKit, and WebKit. Public WKWebView APIs do
+  not provide transparent page compositing or arbitrary profile directories;
+  those options return explicit errors, matching upstream's macOS capability
+  boundary rather than using private selectors.
+- **Linux:** link system libc and install GTK3 plus WebKitGTK 4.1. Cross-build
+  with a GNU target such as `aarch64-linux-gnu`. Libraries are loaded dynamically;
+  a missing runtime or display returns an error. Position/centering/geometry
+  require X11; transparency requires an RGBA visual and a compositor.
+- **Windows:** link `user32`, `gdi32`, `ole32`, `kernel32`, and `dwmapi`; install the
+  WebView2 Runtime and provide the architecture-matching `WebView2Loader.dll`
+  through `Options.webview2_loader` or normal DLL discovery. No runtime is
+  downloaded by the library. Initialization is bounded to 15 seconds; late COM
+  callbacks retain safe independent ownership. Transparency requires DWM
+  composition and the Controller2 interface.
+
+The build configures this linkage for the native example:
+
+```sh
+zig build run-native -Dnative=true
+zig build test-native -Dnative=true
+# Windows: append -- --loader C:/path/to/WebView2Loader.dll
+```
+
+## Examples and validation
+
+Retained examples cover runtime bindings, dynamic content, managed browsers,
+interpreter resources, caller-provided public TLS, and native WebViews:
+`zig build run-bindings`, `run-dynamic-content`, `run-managed-browser`,
+`run-runtime`, and `run-public-tls -- certificate.pem private-key.pem`.
+External-browser examples warn and shut down when no browser connects.
+
+`zig build fuzz --fuzz=100K` exercises bounded protocol parsers. CI installs
+Node, Deno, and Bun, runs the core and bridge suites, executes native smoke gates
+on Linux/macOS/Windows, and cross-builds all five ledger targets.
 
 See the
 [pure Zig refactor plan](docs/PURE_ZIG_REFACTOR.md) for the complete scope and
