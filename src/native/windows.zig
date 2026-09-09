@@ -314,7 +314,9 @@ pub const Backend = struct {
         defer gpa.free(title);
         const outer = try self.outerSize(options.size);
         const initial = options.position orelse types.Position{ .x = std.math.minInt(i32), .y = std.math.minInt(i32) };
-        self.hwnd = CreateWindowExW(if (options.transparent) 0x00200000 else 0, class_wide.ptr, title.ptr, self.style(), initial.x, initial.y, outer.x, outer.y, null, null, self.instance, self) orelse return error.NativeWindowCreationFailed;
+        // Redirection surfaces cannot be toggled after HWND creation. Reserve
+        // the composition host up front; WebView2's background controls opacity.
+        self.hwnd = CreateWindowExW(0x00200000, class_wide.ptr, title.ptr, self.style(), initial.x, initial.y, outer.x, outer.y, null, null, self.instance, self) orelse return error.NativeWindowCreationFailed;
         const profile = if (options.profile_directory) |path| try std.unicode.utf8ToUtf16LeAllocZ(gpa, path) else null;
         defer if (profile) |path| gpa.free(path);
         const start = std.Io.Clock.awake.now(io);
@@ -585,17 +587,6 @@ pub const Backend = struct {
             try check(DwmIsCompositionEnabled(&enabled));
             if (enabled == 0) return error.UnsupportedNativeOperation;
         }
-        const old: usize = @bitCast(getWindowLongPtr(hwnd, -20));
-        const no_redirection: usize = 0x00200000;
-        const updated = if (value) old | no_redirection else old & ~no_redirection;
-        SetLastError(0);
-        if (setWindowLongPtr(hwnd, -20, @bitCast(updated)) == 0 and GetLastError() != 0)
-            return error.NativeOperationFailed;
-        errdefer {
-            _ = setWindowLongPtr(hwnd, -20, @bitCast(old));
-            _ = SetWindowPos(hwnd, null, 0, 0, 0, 0, 0x37);
-        }
-        if (SetWindowPos(hwnd, null, 0, 0, 0, 0, 0x37) == 0) return error.NativeOperationFailed;
         try check(controller2.method(27, *const fn (*Com, Color) callconv(.winapi) HRESULT)(controller2, .{ .a = if (value) 0 else 255, .r = 255, .g = 255, .b = 255 }));
         self.transparent = value;
         _ = InvalidateRect(hwnd, null, 1);
