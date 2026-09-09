@@ -103,8 +103,7 @@ function isolatedCallBridge(options = {}) {
         close() { context.windowClosed = true; },
         __zigWebuiCapability: "test-capability",
         __zigWebuiToken: 7,
-        __zigWebuiEvents: options.events ?? false,
-        __zigWebuiDomBindings: options.bindings ?? false,
+        __zigWebuiBindings: [...(options.events ? [""] : []), ...(options.bindings || [])],
     };
     if (options.navigation) context.navigation = {
         addEventListener(type, listener) { addListener(navigationListeners, type, listener); },
@@ -431,7 +430,7 @@ test("commands, public helpers, external origins and large packets preserve beha
     click(link);
     assert.equal(prevented, false);
     assert.equal(bridge.socket.sentPackets.length, allowedSends);
-    const binding = isolatedCallBridge({ bindings: true });
+    const binding = isolatedCallBridge({ bindings: ["dynamic-binding"] });
     await binding.connect();
     binding.domListeners.get("click")[0]({ target: { closest: () => ({ id: "dynamic-binding" }) } });
     assert.equal(decoder.decode(binding.socket.sentPackets.at(-1).subarray(8)), "dynamic-binding");
@@ -549,4 +548,139 @@ test("argument conversion can reenter calls at capacity or disconnect without le
     } finally {
         await bridge.close();
     }
+});
+
+test("ADD_ID activates a connected empty page and keeps core and prototype methods intact", async () => {
+    const bridge = isolatedCallBridge();
+    await bridge.connect();
+    const click = (id) => bridge.domListeners.get("click")[0]({
+        target: { closest: (selector) => selector === "[id]" ? { id } : null },
+    });
+    const initialSends = bridge.socket.sentPackets.length;
+    click("later");
+    assert.equal(bridge.socket.sentPackets.length, initialSends);
+    await bridge.receive(0xf7, encoder.encode("later\0"));
+    await bridge.receive(0xf7, encoder.encode("later"));
+    click("later");
+    assert.equal(bridge.socket.sentPackets.length, initialSends + 1);
+    assert.equal(bridge.socket.sentPackets.at(-1)[7], 0xfc);
+    click("unregistered");
+    assert.equal(bridge.socket.sentPackets.length, initialSends + 1);
+    const result = bridge.webui.later("argument");
+    const request = bridge.socket.sentPackets.at(-1);
+    assert.equal(decoder.decode(request.subarray(8)), "later\0" + "8\0argument\0");
+    await bridge.reply(bridge.socket.sentIds.at(-1), "runtime");
+    assert.equal(await result, "runtime");
+
+    for (const name of ["call", "allowNavigation", "event", "__proto__", "constructor", "toString", "__webui_core_api__"]) {
+        const before = bridge.webui[name];
+        await bridge.receive(0xf7, encoder.encode(name));
+        assert.equal(bridge.webui[name], before);
+        const fallback = bridge.webui.call(name);
+        await bridge.reply(bridge.socket.sentIds.at(-1), name);
+        assert.equal(await fallback, name);
+    }
+    await bridge.receive(0xf7, Uint8Array.of(0xff));
+    await bridge.receive(0xf7, encoder.encode("bad\0name"));
+    assert.equal(Object.hasOwn(bridge.webui, "\ufffd"), false);
+    assert.equal(Object.hasOwn(bridge.webui, "bad\0name"), false);
+    bridge.dispatch("pagehide");
+});
+
+test("runtime all-events registration enables navigation without clobbering explicit policy", async () => {
+    for (const navigation of [false, true]) {
+        const bridge = isolatedCallBridge({ navigation });
+        await bridge.connect();
+        let prevented = 0;
+        function navigate() {
+            if (navigation) {
+                bridge.navigationListeners.get("navigate")[0]({
+                    cancelable: true,
+                    destination: { url: "/next" },
+                    preventDefault() { prevented++; },
+                });
+            } else {
+                bridge.domListeners.get("click")[0]({
+                    target: { closest: (selector) => selector === "a[href]" ? { href: "/next" } : null },
+                    preventDefault() { prevented++; },
+                });
+            }
+        }
+        navigate();
+        assert.equal(prevented, 0);
+        await bridge.receive(0xf7, new Uint8Array());
+        navigate();
+        assert.equal(prevented, 1);
+        assert.equal(bridge.socket.sentPackets.at(-1)[7], 0xfb);
+        bridge.webui.allowNavigation(true);
+        await bridge.receive(0xf7, Uint8Array.of(0));
+        navigate();
+        assert.equal(prevented, 1);
+        bridge.socket.lose();
+        await bridge.connect();
+        await bridge.receive(0xf7, new Uint8Array());
+        navigate();
+        assert.equal(prevented, 1);
+        bridge.webui.allowNavigation(false);
+        navigate();
+        assert.equal(prevented, 2);
+        bridge.dispatch("pagehide");
+    }
+    const explicit = isolatedCallBridge();
+    await explicit.connect();
+    explicit.webui.allowNavigation(true);
+    await explicit.receive(0xf7, new Uint8Array());
+    explicit.domListeners.get("click")[0]({
+        target: { closest: () => ({ href: "/allowed" }) },
+        preventDefault() { assert.fail("explicit policy was replaced"); },
+    });
+    explicit.dispatch("pagehide");
+});
+
+test("authentication replay exposes convenience bindings before CONNECTED and isolates stale sessions", async () => {
+    const name = "quoted\"\\\n雪,</script>";
+    const bridge = isolatedCallBridge({ bindings: [name] });
+    assert.equal(typeof bridge.webui[name], "function");
+    bridge.socket.open();
+    await bridge.receive(0xf7, encoder.encode("first"));
+    let connectedCalls = 0;
+    bridge.webui.setEventCallback((kind) => {
+        if (kind === 0) {
+            assert.equal(typeof bridge.webui.first, "function");
+            if (connectedCalls++) assert.equal(typeof bridge.webui.offlineAdded, "function");
+        }
+    });
+    await bridge.receive(0xf5, Uint8Array.of(1));
+    const old = bridge.socket;
+    old.lose();
+    await bridge.tick(500);
+    bridge.socket.open();
+    await bridge.receive(0xf7, encoder.encode("stale"), 0, old);
+    assert.equal(bridge.webui.stale, undefined);
+    await bridge.receive(0xf7, encoder.encode("first"));
+    await bridge.receive(0xf7, encoder.encode("offlineAdded"));
+    await bridge.receive(0xf5, Uint8Array.of(1));
+    assert.equal(connectedCalls, 2);
+    const pending = bridge.webui.offlineAdded();
+    await bridge.reply(bridge.socket.sentIds.at(-1), "replayed");
+    assert.equal(await pending, "replayed");
+    assert.equal(bridge.domListeners.get("click").length, 1);
+    bridge.dispatch("pagehide");
+});
+
+test("native backend close requests preserve the bridge when vetoed", async () => {
+    const bridge = isolatedCallBridge();
+    await bridge.connect();
+    let requests = 0;
+    bridge.context.__zigWebuiNativeClose = () => { requests += 1; };
+    await bridge.receive(0xfa);
+    assert.equal(requests, 1);
+    const call = bridge.call("still-live");
+    await bridge.reply(bridge.socket.sentIds.at(-1), "veto preserved connection");
+    assert.deepEqual(call, { status: "fulfilled", value: "veto preserved connection" });
+    bridge.dispatch("pagehide");
+    assert.equal(bridge.webui.isConnected(), false);
+    assert.equal(bridge.timers.size, 0);
+    await bridge.tick(60_000);
+    assert.equal(bridge.sockets.length, 1);
 });

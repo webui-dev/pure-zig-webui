@@ -7,6 +7,7 @@
     const commandClose = 0xfa;
     const commandCall = 0xf9;
     const commandRaw = 0xf8;
+    const commandAddId = 0xf7;
     const commandMulti = 0xf6;
     const multiChunkSize = 65_500;
     const commandCheckToken = 0xf5;
@@ -14,6 +15,8 @@
     const decoder = new TextDecoder();
     const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
     const pending = new Map();
+    const bindings = new Set();
+    let allEvents = false;
     const event = Object.freeze({
         CONNECTED: 0,
         DISCONNECTED: 1,
@@ -21,7 +24,8 @@
     let nextId = 1;
     let connected = false;
     let logging = false;
-    let allowNavigation = !globalThis.__zigWebuiEvents;
+    let allowNavigation = true;
+    let navigationOverridden = false;
     let eventCallback = null;
     let lastEvent = -1;
     let socket = null;
@@ -186,28 +190,39 @@
         }, 20_000);
     }
 
-    // ponytail: Zig filters IDs to avoid injecting names; send a filtered
-    // list only if pages with many unrelated IDs make click traffic matter.
-    if (globalThis.__zigWebuiEvents || globalThis.__zigWebuiDomBindings) {
-        document.addEventListener("click", (event) => {
-            const element = event.target?.closest?.("[id]");
-            if (element && element.id) sendEvent(commandClick, element.id);
-
-            if (globalThis.__zigWebuiEvents &&
-                !allowNavigation &&
-                !("navigation" in globalThis))
-            {
-                const link = event.target?.closest?.("a[href]");
-                if (link && connected) {
-                    event.preventDefault();
-                    sendEvent(commandNavigation, link.href);
-                }
-            }
-        });
+    function addBinding(name) {
+        if (bindings.has(name)) return;
+        bindings.add(name);
+        if (name === "") {
+            allEvents = true;
+            if (!navigationOverridden) allowNavigation = false;
+        } else if (!(name in globalThis.webui) && name !== "__webui_core_api__") {
+            // Never replace core methods or inherited properties, including
+            // __proto__/constructor. Explicit webui.call works for every name.
+            Object.defineProperty(globalThis.webui, name, {
+                value: (...args) => globalThis.webui.call(name, ...args),
+                enumerable: true,
+            });
+        }
     }
-    if (globalThis.__zigWebuiEvents && "navigation" in globalThis) {
+
+    // Delegation is installed even on pages with no initial registrations.
+    // State changes on ADD_ID; no repeated listeners or DOM scans are needed.
+    document.addEventListener("click", (event) => {
+        const element = event.target?.closest?.("[id]");
+        if (element?.id && (allEvents || bindings.has(element.id)))
+            sendEvent(commandClick, element.id);
+        if (allEvents && !allowNavigation && !("navigation" in globalThis)) {
+            const link = event.target?.closest?.("a[href]");
+            if (link && connected) {
+                event.preventDefault();
+                sendEvent(commandNavigation, link.href);
+            }
+        }
+    });
+    if ("navigation" in globalThis) {
         globalThis.navigation.addEventListener("navigate", (event) => {
-            if (!connected || allowNavigation) return;
+            if (!connected || !allEvents || allowNavigation) return;
             if (event.cancelable) event.preventDefault();
             sendEvent(commandNavigation, event.destination.url);
         });
@@ -275,6 +290,17 @@
             }
             return;
         }
+        if (bytes[7] === commandAddId) {
+            // Authentication replays IDs before its success acknowledgement so
+            // CONNECTED callbacks already see the complete convenience API.
+            let payload = bytes.subarray(8);
+            if (payload.at(-1) === 0) payload = payload.subarray(0, -1);
+            if (payload.includes(0)) return;
+            try {
+                addBinding(new TextDecoder("utf-8", { fatal: true }).decode(payload));
+            } catch {}
+            return;
+        }
         if (!connected) return;
         if (bytes[7] === commandJs || bytes[7] === commandJsQuick) {
             let failed = 0;
@@ -309,8 +335,14 @@
             return;
         }
         if (bytes[7] === commandClose) {
-            stop(true);
-            globalThis.close();
+            if (typeof globalThis.__zigWebuiNativeClose === "function") {
+                // A native close handler may veto. Keep the bridge live until
+                // actual pagehide instead of stranding the still-visible page.
+                globalThis.__zigWebuiNativeClose();
+            } else {
+                stop(true);
+                globalThis.close();
+            }
             return;
         }
         if (bytes[7] === commandRaw) {
@@ -408,9 +440,11 @@
             return globalThis.matchMedia?.("(prefers-contrast: more)").matches ?? false;
         },
         allowNavigation(status) {
+            navigationOverridden = true;
             allowNavigation = Boolean(status);
         },
     };
+    for (const name of globalThis.__zigWebuiBindings || []) addBinding(name);
 
     scheduleWarning(5000);
     connect();

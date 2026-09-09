@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     const window = try app.createWindow(.{
         .content = .{ .html = html },
     });
-    try window.bind("hello", hello, null);
+    try window.bind(io, "hello", hello, null);
 
     var running = try app.start(io);
     defer running.stop() catch {};
@@ -44,6 +44,7 @@ pub fn main(init: std.process.Init) !void {
 
     window.open(io, &running) catch |err| {
         std.log.warn("could not open the default browser: {}", .{err});
+        return;
     };
 
     var result_buffer: [64]u8 = undefined;
@@ -54,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
         .fromSeconds(30),
     ) catch |err| {
         std.log.warn("could not call JavaScript: {}", .{err});
-        try running.wait();
+        if (window.isShown(io)) try running.wait();
         return;
     };
     switch (evaluated) {

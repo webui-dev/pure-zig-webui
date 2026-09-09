@@ -283,15 +283,11 @@ pub fn launch(
     try argv.append(gpa, executable);
     try argv.appendSlice(gpa, options.arguments);
 
-    // Chromium-family browsers reuse an already running instance unless they
-    // get their own profile, which makes every window argument below silently
-    // ineffective and leaves the launched process without a window.
-    const managed_profile = if (controls.profile_directory == null)
-        try managedProfileDirectory(gpa, options.browser)
-    else
-        null;
-    defer if (managed_profile) |directory| gpa.free(directory);
-    const profile = controls.profile_directory orelse managed_profile;
+    // The owner supplies its retained per-window profile. Never fall back to
+    // the shared family root: Chromium would hand the URL to another process.
+    if (isChromium(options.browser) and controls.profile_directory == null)
+        return error.ManagedBrowserProfileRequired;
+    const profile = controls.profile_directory;
     const profile_argument = if (profile) |directory|
         switch (options.browser) {
             .firefox, .safari => null,
@@ -445,9 +441,8 @@ fn managedProfileName(selected: Browser) ?[]const u8 {
     };
 }
 
-/// Temporary profile directory used when the caller does not manage one. The
-/// browser creates the directory on first use; returns null when no managed
-/// profile applies. Caller owns the returned memory.
+/// Root of the generated per-window profiles for one browser family. Returns
+/// null when no managed profile applies. Caller owns the returned memory.
 pub fn managedProfileDirectory(
     gpa: std.mem.Allocator,
     selected: Browser,
@@ -473,9 +468,21 @@ pub fn managedProfileDirectory(
     };
 }
 
-/// Delete the managed profile directory of `selected` and report whether one
-/// existed. Caller-managed profile directories are never touched: only the
-/// path `managedProfileDirectory` generates is removed.
+/// A stable leaf for the lifetime of one running window. Identity is generated
+/// by App.start, not a caller-supplied filesystem path.
+pub fn managedWindowProfileDirectory(
+    gpa: std.mem.Allocator,
+    selected: Browser,
+    identity: []const u8,
+) !?[]u8 {
+    const root = try managedProfileDirectory(gpa, selected) orelse return null;
+    defer gpa.free(root);
+    return try std.fs.path.join(gpa, &.{ root, identity });
+}
+
+/// Delete the family root and all generated window leaves; report whether the
+/// root existed. Stop its browser processes first. Caller-managed profile
+/// directories are never touched: only `managedProfileDirectory` is removed.
 pub fn deleteManagedProfile(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -483,6 +490,11 @@ pub fn deleteManagedProfile(
 ) !bool {
     const path = try managedProfileDirectory(gpa, selected) orelse return false;
     defer gpa.free(path);
+    return deleteProfilePath(io, path);
+}
+
+/// Internal ownership helper; only call with a generated root or retained leaf.
+pub fn deleteProfilePath(io: std.Io, path: []const u8) !bool {
     const parent_path = std.fs.path.dirname(path) orelse return false;
     const name = std.fs.path.basename(path);
     var parent = std.Io.Dir.openDirAbsolute(io, parent_path, .{}) catch |err|
@@ -491,12 +503,15 @@ pub fn deleteManagedProfile(
             else => return err,
         };
     defer parent.close(io);
-    parent.access(io, name, .{}) catch return false;
+    parent.access(io, name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
     try parent.deleteTree(io, name);
     return true;
 }
 
-/// Delete every managed profile directory and report how many existed.
+/// Delete every family root (including all window leaves); return roots deleted.
 pub fn deleteAllManagedProfiles(gpa: std.mem.Allocator, io: std.Io) !usize {
     var deleted: usize = 0;
     for (std.enums.values(Browser)) |selected|

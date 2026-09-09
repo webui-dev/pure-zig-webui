@@ -558,6 +558,8 @@ const WindowState = struct {
     token: u32 = 0,
     bindings: std.ArrayList(Binding) = .empty,
     event_binding: ?EventBinding = null,
+    /// Lock order: registry_mutex, then mutex. Never invoke user code while held.
+    registry_mutex: std.Io.Mutex = .init,
     logger: ?Logger,
     logger_user_data: ?*anyopaque,
     runtime: ?Runtime,
@@ -570,8 +572,11 @@ const WindowState = struct {
     event_mutex: std.Io.Mutex = .init,
     event_mode: std.atomic.Value(EventMode),
     event_tasks: std.Io.Group = .init,
-    /// True between `App.start()` and `Running.stop()`; rejects
-    /// configuration that would race the dispatch paths.
+    serial_head: ?*HandlerTask = null,
+    serial_tail: ?*HandlerTask = null,
+    serial_draining: bool = false,
+
+    /// Whether registry updates should notify active browser peers.
     running: std.atomic.Value(bool) = .init(false),
     /// Set by backend `close` calls so `Running.wait()` skips the
     /// reconnect grace period.
@@ -584,6 +589,15 @@ const WindowState = struct {
     pending_events: usize = 0,
     next_client_id: u64 = 1,
     next_eval_id: u16 = 1,
+    const HandlerTask = struct {
+        next: ?*HandlerTask = null,
+        target: Client,
+        data: []u8,
+        call: ?struct { header: protocol.Header, binding: Binding } = null,
+        kind: EventKind = .click,
+        click_binding: ?Binding = null,
+        registered: ?EventBinding = null,
+    };
 
     fn deinit(self: *WindowState) void {
         std.debug.assert(self.pending_evals.items.len == 0);
@@ -671,11 +685,82 @@ const WindowState = struct {
         if (previous) |*icon| icon.deinit(self.gpa);
     }
 
-    fn binding(self: *WindowState, name: []const u8) ?Binding {
+    /// Caller holds registry_mutex; returned names remain owned until deinit.
+    fn bindingLocked(self: *WindowState, name: []const u8) ?Binding {
         // ponytail: binding counts are tiny; use a map if hundreds become normal.
         for (self.bindings.items) |item|
             if (std.mem.eql(u8, item.name, name)) return item;
         return null;
+    }
+
+    fn binding(self: *WindowState, io: std.Io, name: []const u8) ?Binding {
+        self.registry_mutex.lockUncancelable(io);
+        defer self.registry_mutex.unlock(io);
+        return self.bindingLocked(name);
+    }
+
+    /// Hold the registry lock through publication and pushes so authentication
+    /// cannot miss a registration between replay and client publication.
+    fn pushRegistration(self: *WindowState, io: std.Io, packet: []const u8) void {
+        if (packet.len == 0) return;
+        var last_id: u64 = 0;
+        // Once installed, cancellation cannot leave a live peer out of sync.
+        // Transport writes retain Linsang's configured timeout; failed writes
+        // close the transport, whose next authentication replays the registry.
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            var next: ?SelectedClient = null;
+            for (self.clients.items) |connected| {
+                if (connected.id <= last_id) continue;
+                if (next == null or connected.id < next.?.id)
+                    next = .{ .id = connected.id, .peer = connected.peer };
+            }
+            var selected = next orelse {
+                self.mutex.unlock(io);
+                return;
+            };
+            selected.peer = selected.peer.clone();
+            self.mutex.unlock(io);
+            defer selected.peer.deinit();
+            last_id = selected.id;
+            selected.peer.sendBinary(packet) catch |err| switch (err) {
+                error.Closed => continue,
+                error.Canceled, error.InvalidUtf8 => unreachable,
+            };
+        }
+    }
+
+    fn registrationPacket(self: *WindowState, io: std.Io, name: []const u8) !std.ArrayList(u8) {
+        // Registry serialization prevents a client appearing before the push.
+        if (!self.hasClients(io)) return .empty;
+        var packet: std.ArrayList(u8) = .empty;
+        errdefer packet.deinit(self.gpa);
+        try protocol.append(&packet, self.gpa, .{
+            .token = self.token,
+            .command = .add_id,
+        }, name);
+        return packet;
+    }
+
+    fn writeRegistrations(self: *WindowState, io: std.Io, response: *Response) !void {
+        self.registry_mutex.lockUncancelable(io);
+        defer self.registry_mutex.unlock(io);
+        try response.write("globalThis.__zigWebuiBindings=[");
+        var separator: []const u8 = "";
+        if (self.event_binding != null) {
+            try response.write("\"\"");
+            separator = ",";
+        }
+        for (self.bindings.items) |registered| {
+            try response.write(separator);
+            const encoded = try std.json.Stringify.valueAlloc(self.gpa, registered.name, .{});
+            defer self.gpa.free(encoded);
+            try response.write(encoded);
+            separator = ",";
+        }
+        try response.write("];\n");
     }
 
     fn log(
@@ -814,21 +899,57 @@ const WindowState = struct {
     fn authenticate(
         self: *WindowState,
         connection: *Linsang.Connection,
+        header: protocol.Header,
     ) !?Client {
+        self.registry_mutex.lockUncancelable(connection.io);
+        defer self.registry_mutex.unlock(connection.io);
         self.mutex.lockUncancelable(connection.io);
-        defer self.mutex.unlock(connection.io);
+        var locked = true;
+        defer if (locked) self.mutex.unlock(connection.io);
         const key = @intFromPtr(connection);
-        if (self.clientIndexByKey(key) != null) return null;
-        if (self.clients.items.len >= self.max_clients)
-            return error.ClientLimitReached;
-
+        const existing = self.clientIndexByKey(key) != null;
+        if (!existing) {
+            if (self.clients.items.len >= self.max_clients)
+                return error.ClientLimitReached;
+            try self.clients.ensureUnusedCapacity(self.gpa, 1);
+        }
+        // Registry serialization prevents competing admissions while the
+        // acknowledgement is sent. Do not hold the client/eval mutex over I/O.
+        self.mutex.unlock(connection.io);
+        locked = false;
         var peer = try connection.peer();
-        errdefer peer.deinit();
+        defer peer.deinit();
+        var packet: std.ArrayList(u8) = .empty;
+        defer packet.deinit(self.gpa);
+        // Immediate peer writes (not Connection's callback buffer) preserve
+        // replay -> acknowledgement -> runtime push ordering on the wire.
+        if (self.event_binding != null) {
+            try protocol.append(&packet, self.gpa, .{
+                .token = self.token,
+                .command = .add_id,
+            }, "");
+            try peer.sendBinary(packet.items);
+        }
+        for (self.bindings.items) |registered| {
+            packet.clearRetainingCapacity();
+            try protocol.append(&packet, self.gpa, .{
+                .token = self.token,
+                .command = .add_id,
+            }, registered.name);
+            try peer.sendBinary(packet.items);
+        }
+        packet.clearRetainingCapacity();
+        try protocol.append(&packet, self.gpa, header, &.{1});
+        try peer.sendBinary(packet.items);
+        if (existing) return null;
+        connection.setWebSocketDeadline(null);
+        self.mutex.lockUncancelable(connection.io);
+        locked = true;
         const client_id = self.next_client_id;
-        try self.clients.append(self.gpa, .{
+        self.clients.appendAssumeCapacity(.{
             .id = client_id,
             .key = key,
-            .peer = peer,
+            .peer = peer.clone(),
         });
         self.next_client_id +%= 1;
         if (self.next_client_id == 0) self.next_client_id = 1;
@@ -962,26 +1083,55 @@ const WindowState = struct {
             target.sendPacket(io, header, call.response.items) catch {};
     }
 
-    fn runCall(
-        self: *WindowState,
-        io: std.Io,
-        target: Client,
-        header: protocol.Header,
-        binding_value: Binding,
-        payload: []u8,
-    ) std.Io.Cancelable!void {
-        defer {
-            self.gpa.free(payload);
-            self.releaseEvent(io);
+    fn runHandler(self: *WindowState, io: std.Io, task: *HandlerTask) std.Io.Cancelable!void {
+        defer self.destroyHandler(io, task);
+        try io.checkCancel();
+        if (task.call) |call| {
+            const decoded = protocol.decodeCall(task.data) catch return;
+            self.invokeCall(io, task.target, call.header, call.binding, decoded.slice());
+        } else {
+            self.invokeEvent(io, .{
+                .kind = task.kind,
+                .client = task.target,
+                .data = task.data,
+            }, task.click_binding, task.registered);
         }
-        const decoded = protocol.decodeCall(payload) catch return;
-        self.invokeCall(
-            io,
-            target,
-            header,
-            binding_value,
-            decoded.slice(),
-        );
+    }
+
+    fn destroyHandler(self: *WindowState, io: std.Io, task: *HandlerTask) void {
+        self.gpa.free(task.data);
+        self.gpa.destroy(task);
+        self.releaseEvent(io);
+    }
+
+    fn drainSerial(self: *WindowState, io: std.Io) std.Io.Cancelable!void {
+        while (true) {
+            self.event_mutex.lockUncancelable(io);
+            const task = self.serial_head orelse {
+                self.serial_draining = false;
+                self.event_mutex.unlock(io);
+                return;
+            };
+            self.serial_head = task.next;
+            if (self.serial_head == null) self.serial_tail = null;
+            self.event_mutex.unlock(io);
+            try self.runHandler(io, task);
+        }
+    }
+
+    fn scheduleHandler(self: *WindowState, io: std.Io, task: *HandlerTask) !void {
+        if (self.event_mode.load(.acquire) == .concurrent)
+            return self.event_tasks.concurrent(io, runHandler, .{ self, io, task });
+        self.event_mutex.lockUncancelable(io);
+        defer self.event_mutex.unlock(io);
+        if (!self.serial_draining) {
+            // concurrent never executes inline; the worker waits for this
+            // short queue lock, never for a handler running in the receiver.
+            try self.event_tasks.concurrent(io, drainSerial, .{ self, io });
+            self.serial_draining = true;
+        }
+        if (self.serial_tail) |tail| tail.next = task else self.serial_head = task;
+        self.serial_tail = task;
     }
 
     fn dispatchCall(
@@ -993,37 +1143,23 @@ const WindowState = struct {
         decoded: *const protocol.CallPayload,
         payload: []const u8,
     ) !void {
-        switch (self.event_mode.load(.acquire)) {
-            .serial => {
-                self.event_mutex.lockUncancelable(io);
-                defer self.event_mutex.unlock(io);
-                self.invokeCall(
-                    io,
-                    target,
-                    header,
-                    binding_value,
-                    decoded.slice(),
-                );
-            },
-            .concurrent => {
-                try self.reserveEvent(io);
-                errdefer self.releaseEvent(io);
-                const owned = try self.gpa.dupe(u8, payload);
-                errdefer self.gpa.free(owned);
-                try self.event_tasks.concurrent(io, runCall, .{
-                    self,
-                    io,
-                    target,
-                    header,
-                    binding_value,
-                    owned,
-                });
-            },
-        }
+        _ = decoded;
+        try self.reserveEvent(io);
+        errdefer self.releaseEvent(io);
+        const task = try self.gpa.create(HandlerTask);
+        errdefer self.gpa.destroy(task);
+        task.* = .{
+            .target = target,
+            .data = try self.gpa.dupe(u8, payload),
+            .call = .{ .header = header, .binding = binding_value },
+        };
+        errdefer self.gpa.free(task.data);
+        try self.scheduleHandler(io, task);
     }
 
     fn invokeEvent(
         self: *WindowState,
+        io: std.Io,
         event: Event,
         click_binding: ?Binding,
         registered: ?EventBinding,
@@ -1032,6 +1168,7 @@ const WindowState = struct {
             var call: Call = .{
                 .gpa = self.gpa,
                 .client = event.client,
+                .io = io,
                 .arguments = &.{},
             };
             defer call.deinit();
@@ -1047,60 +1184,41 @@ const WindowState = struct {
             };
     }
 
-    fn runEvent(
-        self: *WindowState,
-        io: std.Io,
-        kind: EventKind,
-        target: Client,
-        data: []u8,
-        click_binding: ?Binding,
-        registered: ?EventBinding,
-    ) std.Io.Cancelable!void {
-        defer {
-            self.gpa.free(data);
-            self.releaseEvent(io);
-        }
-        self.invokeEvent(.{
-            .kind = kind,
-            .client = target,
-            .data = data,
-        }, click_binding, registered);
-    }
-
     fn dispatchEvent(self: *WindowState, io: std.Io, event: Event) !void {
+        self.registry_mutex.lockUncancelable(io);
         const click_binding = if (event.kind == .click)
-            self.binding(event.data)
+            self.bindingLocked(event.data)
         else
             null;
         const registered = self.event_binding;
+        self.registry_mutex.unlock(io);
         if (click_binding == null and registered == null) return;
 
-        switch (self.event_mode.load(.acquire)) {
-            .serial => {
-                self.event_mutex.lockUncancelable(io);
-                defer self.event_mutex.unlock(io);
-                self.invokeEvent(event, click_binding, registered);
-            },
-            .concurrent => {
-                try self.reserveEvent(io);
-                errdefer self.releaseEvent(io);
-                const data = try self.gpa.dupe(u8, event.data);
-                errdefer self.gpa.free(data);
-                try self.event_tasks.concurrent(io, runEvent, .{
-                    self,
-                    io,
-                    event.kind,
-                    event.client,
-                    data,
-                    click_binding,
-                    registered,
-                });
-            },
-        }
+        try self.reserveEvent(io);
+        errdefer self.releaseEvent(io);
+        const task = try self.gpa.create(HandlerTask);
+        errdefer self.gpa.destroy(task);
+        task.* = .{
+            .target = event.client,
+            .data = try self.gpa.dupe(u8, event.data),
+            .kind = event.kind,
+            .click_binding = click_binding,
+            .registered = registered,
+        };
+        errdefer self.gpa.free(task.data);
+        try self.scheduleHandler(io, task);
     }
 
     fn cancelEvents(self: *WindowState, io: std.Io) void {
         self.event_tasks.cancel(io);
+        self.event_mutex.lockUncancelable(io);
+        defer self.event_mutex.unlock(io);
+        while (self.serial_head) |task| {
+            self.serial_head = task.next;
+            self.destroyHandler(io, task);
+        }
+        self.serial_tail = null;
+        self.serial_draining = false;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         std.debug.assert(self.pending_events == 0);
@@ -1243,7 +1361,7 @@ const WindowState = struct {
         deadline: std.Io.Clock.Timestamp,
     ) !SelectedClient {
         while (true) {
-            self.mutex.lockUncancelable(io);
+            try self.mutex.lock(io);
             if (target_client_id) |target| {
                 if (self.clientIndexById(target)) |index| {
                     const selected = SelectedClient{
@@ -1290,6 +1408,38 @@ const WindowState = struct {
             .clock = .awake,
             .raw = timeout,
         });
+        const Result = union(enum) {
+            completed: anyerror!EvalResult,
+            timeout: std.Io.Cancelable!void,
+        };
+        var results: [2]Result = undefined;
+        var select = std.Io.Select(Result).init(io, &results);
+        // Cancel and join before releasing caller buffers, including when the
+        // loser is still waiting for the peer send lock or writing a frame.
+        defer select.cancelDiscard();
+        try select.concurrent(.timeout, std.Io.Timeout.sleep, .{
+            std.Io.Timeout{ .deadline = deadline }, io,
+        });
+        try select.concurrent(.completed, evalUntil, .{
+            self, io, target_client_id, script, result_buffer, deadline,
+        });
+        return switch (try select.await()) {
+            .completed => |result| result,
+            .timeout => |result| blk: {
+                try result;
+                break :blk error.Timeout;
+            },
+        };
+    }
+
+    fn evalUntil(
+        self: *WindowState,
+        io: std.Io,
+        target_client_id: ?u64,
+        script: []const u8,
+        result_buffer: []u8,
+        deadline: std.Io.Clock.Timestamp,
+    ) !EvalResult {
         var selected = try self.waitForClient(
             io,
             target_client_id,
@@ -1299,7 +1449,7 @@ const WindowState = struct {
         defer selected.peer.deinit();
 
         var pending: PendingEval = undefined;
-        self.mutex.lockUncancelable(io);
+        try self.mutex.lock(io);
         if (self.pending_evals.items.len >= self.max_pending_evals) {
             self.mutex.unlock(io);
             return error.TooManyPendingEvals;
@@ -1544,6 +1694,8 @@ pub const Client = struct {
         if (running.stopped or !running.app.started)
             return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
+        if (running.app.options.use_cookies and content == .external_url)
+            return error.ExternalUrlCookiesUnsupported;
         var peer = try self.retainPeer(running.inner.io);
         defer peer.deinit();
 
@@ -1690,48 +1842,66 @@ pub const Window = struct {
         return self.state.event_mode.load(.acquire);
     }
 
-    /// Install the browser event handler before starting the application.
-    /// Returns `error.AlreadyStarted` while the application runs, because
-    /// installation is not synchronized with event dispatch.
+    /// Install or replace the event handler before or after App.start().
+    /// A copied handler snapshot may finish after replacement: keep its
+    /// user_data alive until those in-flight callbacks finish.
+    /// Failed transports reconnect and replay; allocation errors leave it unchanged.
     pub fn onEvent(
         self: Window,
+        io: std.Io,
         handler: EventHandler,
         user_data: ?*anyopaque,
     ) !void {
-        if (self.state.running.load(.acquire)) return error.AlreadyStarted;
+        self.state.registry_mutex.lockUncancelable(io);
+        defer self.state.registry_mutex.unlock(io);
+        var packet = try self.state.registrationPacket(io, "");
+        defer packet.deinit(self.state.gpa);
         self.state.event_binding = .{
             .handler = handler,
             .user_data = user_data,
         };
+        self.state.pushRegistration(io, packet.items);
     }
 
-    /// Register or replace a binding before starting the application.
-    /// Returns `error.AlreadyStarted` while the application runs, because
-    /// registration is not synchronized with call dispatch.
+    /// Register or replace a binding before or after App.start(). Names are
+    /// copied and owned until App.deinit(). A copied handler snapshot may finish
+    /// after replacement; keep its user_data alive for those in-flight calls.
+    /// Failed transports reconnect and replay; allocation errors leave it unchanged.
     pub fn bind(
         self: Window,
+        io: std.Io,
         name: []const u8,
         handler: Handler,
         user_data: ?*anyopaque,
     ) !void {
-        if (self.state.running.load(.acquire)) return error.AlreadyStarted;
         if (name.len == 0 or std.mem.indexOfScalar(u8, name, 0) != null)
             return error.InvalidBindingName;
+        if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidUtf8;
+        self.state.registry_mutex.lockUncancelable(io);
+        defer self.state.registry_mutex.unlock(io);
         if (name.len > self.state.limits.max_binding_name_size)
             return error.BindingNameTooLarge;
-        if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidUtf8;
-        for (self.state.bindings.items) |*binding| {
-            if (std.mem.eql(u8, binding.name, name)) {
-                binding.handler = handler;
-                binding.user_data = user_data;
+        var packet = try self.state.registrationPacket(io, name);
+        defer packet.deinit(self.state.gpa);
+        for (self.state.bindings.items) |*registered| {
+            if (std.mem.eql(u8, registered.name, name)) {
+                registered.handler = handler;
+                registered.user_data = user_data;
+                self.state.pushRegistration(io, packet.items);
                 return;
             }
         }
-        try self.state.bindings.append(self.state.gpa, .{
-            .name = try self.state.gpa.dupe(u8, name),
-            .handler = handler,
-            .user_data = user_data,
-        });
+        {
+            const owned = try self.state.gpa.dupe(u8, name);
+            errdefer self.state.gpa.free(owned);
+            try self.state.bindings.ensureUnusedCapacity(self.state.gpa, 1);
+            self.state.bindings.appendAssumeCapacity(.{
+                .name = owned,
+                .handler = handler,
+                .user_data = user_data,
+            });
+        }
+        self.state.pushRegistration(io, packet.items);
     }
 
     /// Replace served content and navigate every connected client to it.
@@ -1744,6 +1914,8 @@ pub const Window = struct {
         if (running.stopped or !running.app.started)
             return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
+        if (running.app.options.use_cookies and content == .external_url)
+            return error.ExternalUrlCookiesUnsupported;
         try self.state.replaceContent(running.inner.io, content);
         const target_url = try self.url(running, self.state.gpa);
         defer self.state.gpa.free(target_url);
@@ -1811,18 +1983,12 @@ pub const Window = struct {
         const page_url = try self.url(running, self.state.gpa);
         defer self.state.gpa.free(page_url);
         const controls = self.state.browserControls(running.inner.io);
-        const child = try browser.launch(
-            self.state.gpa,
+        return running.app.launchBrowser(
             running.inner.io,
+            self.state,
             page_url,
             options,
             controls,
-        );
-        return running.app.manageBrowser(
-            running.inner.io,
-            self.state,
-            child,
-            options.browser,
         );
     }
 
@@ -1836,9 +2002,7 @@ pub const Window = struct {
         const io = running.inner.io;
         if (self.state.browserControls(io).profile_directory != null)
             return error.CallerManagedProfile;
-        const selected = running.app.launchedBrowser(io, self.state) orelse
-            return error.NoManagedBrowser;
-        return browser.deleteManagedProfile(self.state.gpa, io, selected);
+        return running.app.deleteBrowserProfile(io, self.state);
     }
 
     /// Return the platform-native identifier of the retained browser child.
@@ -2055,10 +2219,8 @@ const ManagedBrowser = struct {
     // ponytail: exited launchers are reaped on replacement or stop; add wait
     // tasks only if one bounded child per window becomes insufficient.
     window: *WindowState,
-    child: std.process.Child,
-    /// Browser that was launched, so its managed profile can be located
-    /// again after `Window.open()` picked one automatically.
-    browser: Browser,
+    child: ?std.process.Child = null,
+    profile: ?[]u8 = null,
 };
 
 pub const App = struct {
@@ -2074,6 +2236,61 @@ pub const App = struct {
     started: bool = false,
     ever_connected: std.atomic.Value(bool) = .init(false),
     unauthenticated_connections: std.atomic.Value(usize) = .init(0),
+    upgrades: std.ArrayList(Upgrade) = .empty,
+    upgrade_mutex: std.Io.Mutex = .init,
+
+    const Upgrade = struct {
+        key: usize,
+        window: *WindowState,
+        authenticated: bool = false,
+    };
+
+    fn admitUpgrade(self: *App, io: std.Io, key: usize, window: *WindowState) !void {
+        self.upgrade_mutex.lockUncancelable(io);
+        defer self.upgrade_mutex.unlock(io);
+        if (self.upgrades.items.len >= self.options.limits.max_connections or
+            self.unauthenticated_connections.load(.acquire) >=
+                self.options.limits.max_unauthenticated_connections)
+            return error.ClientLimitReached;
+        try self.upgrades.append(self.gpa, .{ .key = key, .window = window });
+        _ = self.unauthenticated_connections.fetchAdd(1, .acq_rel);
+    }
+
+    fn authorizedWindow(self: *App, io: std.Io, key: usize) ?*WindowState {
+        self.upgrade_mutex.lockUncancelable(io);
+        defer self.upgrade_mutex.unlock(io);
+        for (self.upgrades.items) |upgrade|
+            if (upgrade.key == key) return upgrade.window;
+        return null;
+    }
+
+    fn authenticatedUpgrade(self: *App, io: std.Io, key: usize) void {
+        self.upgrade_mutex.lockUncancelable(io);
+        defer self.upgrade_mutex.unlock(io);
+        for (self.upgrades.items) |*upgrade| {
+            if (upgrade.key != key or upgrade.authenticated) continue;
+            upgrade.authenticated = true;
+            const previous = self.unauthenticated_connections.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+            return;
+        }
+    }
+
+    fn removeUpgrade(self: *App, io: std.Io, key: usize) ?*WindowState {
+        self.upgrade_mutex.lockUncancelable(io);
+        defer self.upgrade_mutex.unlock(io);
+        for (self.upgrades.items, 0..) |upgrade, index| {
+            if (upgrade.key != key) continue;
+            _ = self.upgrades.swapRemove(index);
+            if (!upgrade.authenticated) {
+                const previous = self.unauthenticated_connections.fetchSub(1, .acq_rel);
+                std.debug.assert(previous > 0);
+            }
+            return upgrade.window;
+        }
+        // Rejected opens, including allocation failure, never owned admission.
+        return null;
+    }
 
     pub const Options = struct {
         address: []const u8 = "127.0.0.1",
@@ -2120,7 +2337,7 @@ pub const App = struct {
         max_pending_evals: usize = default_max_pending_evals,
         /// Maximum number of binding responses retained after their handler.
         max_pending_replies: usize = default_max_pending_replies,
-        /// Maximum number of handlers running or waiting in concurrent mode.
+        /// Maximum number of handlers running or queued in either mode.
         max_pending_events: usize = default_max_pending_events,
         /// Serial preserves arrival order per connection and prevents handler
         /// overlap across clients.
@@ -2138,6 +2355,8 @@ pub const App = struct {
         std.debug.assert(self.monitor_tasks.token.load(.acquire) == null);
         std.debug.assert(self.managed_browsers.items.len == 0);
         self.managed_browsers.deinit(self.gpa);
+        std.debug.assert(self.upgrades.items.len == 0);
+        self.upgrades.deinit(self.gpa);
         for (self.windows.items) |window| window.deinit();
         self.windows.deinit(self.gpa);
         self.* = undefined;
@@ -2179,6 +2398,8 @@ pub const App = struct {
                 .{ .directory = path }
             else
                 return error.MissingContent;
+        if (self.options.use_cookies and selected_content == .external_url)
+            return error.ExternalUrlCookiesUnsupported;
         const state = try self.gpa.create(WindowState);
         errdefer self.gpa.destroy(state);
         var content = try StoredContent.init(self.gpa, selected_content);
@@ -2219,6 +2440,10 @@ pub const App = struct {
         if (self.windows.items.len == 0) return error.NoWindow;
         try self.validateNetworkOptions();
         for (self.windows.items) |window| {
+            if (self.options.use_cookies and window.content == .external_url)
+                return error.ExternalUrlCookiesUnsupported;
+            window.registry_mutex.lockUncancelable(io);
+            defer window.registry_mutex.unlock(io);
             window.limits = self.options.limits;
             window.logger = self.options.logger;
             window.logger_user_data = self.options.logger_user_data;
@@ -2265,7 +2490,7 @@ pub const App = struct {
             .port = self.options.port,
             .max_connections = self.options.limits.max_connections,
             .max_ws_message_size = self.options.limits.max_ws_message_size,
-            .ws_idle_timeout = null,
+            .ws_idle_timeout = .fromSeconds(25),
             .tls = if (self.tls_auth) |*auth| .{ .auth = auth } else null,
             .on_request = onRequest,
             .on_ws_open = onOpen,
@@ -2325,44 +2550,66 @@ pub const App = struct {
         for (self.windows.items) |window| window.content.closeDirectory();
     }
 
-    fn manageBrowser(
+    fn launchBrowser(
         self: *App,
         io: std.Io,
         window: *WindowState,
-        child: std.process.Child,
-        selected: Browser,
+        url: []const u8,
+        options: BrowserLaunchOptions,
+        requested_controls: browser.WindowControls,
     ) !BrowserProcessId {
-        var owned = child;
-        errdefer owned.kill(io);
-        const id = owned.id.?;
+        try requested_controls.validateFor(options.browser);
+        if (options.executable) |executable|
+            if (executable.len == 0) return error.InvalidBrowserExecutable;
+        self.browser_mutex.lockUncancelable(io);
+        defer self.browser_mutex.unlock(io);
+        var controls = requested_controls;
+        const profile = if (controls.profile_directory == null)
+            try browser.managedWindowProfileDirectory(self.gpa, options.browser, &window.capability)
+        else
+            null;
+        var owns_profile = true;
+        defer if (owns_profile) if (profile) |path| self.gpa.free(path);
+        controls.profile_directory = controls.profile_directory orelse profile;
+        for (self.managed_browsers.items) |managed| {
+            if (managed.window == window or managed.child == null) continue;
+            const other = managed.profile orelse managed.window.browser_controls.profile_directory;
+            if (controls.profile_directory != null and other != null and
+                std.mem.eql(u8, controls.profile_directory.?, other.?))
+                return error.BrowserProfileInUse;
+        }
+        const managed = for (self.managed_browsers.items) |*existing| {
+            if (existing.window == window) break existing;
+        } else new: {
+            try self.managed_browsers.append(self.gpa, .{
+                .window = window,
+            });
+            break :new &self.managed_browsers.items[self.managed_browsers.items.len - 1];
+        };
+        // Stop and reap BEFORE attempting another launch on the same profile.
+        // On failure the previous browser stays stopped, the profile remains
+        // owned/deletable, and browserProcessId reports null. No stale handle.
+        if (managed.child) |*child| child.kill(io);
+        managed.child = null;
+        if (managed.profile) |path| self.gpa.free(path);
+        managed.profile = profile;
+        owns_profile = false;
+        managed.child = try browser.launch(self.gpa, io, url, options, controls);
+        return managed.child.?.id.?;
+    }
 
+    fn deleteBrowserProfile(self: *App, io: std.Io, window: *WindowState) !bool {
         self.browser_mutex.lockUncancelable(io);
         defer self.browser_mutex.unlock(io);
         for (self.managed_browsers.items) |*managed| {
             if (managed.window != window) continue;
-            managed.child.kill(io);
-            managed.child = owned;
-            managed.browser = selected;
-            return id;
+            const path = managed.profile orelse return false;
+            // Never remove a live child's profile beneath it.
+            if (managed.child) |*child| child.kill(io);
+            managed.child = null;
+            return browser.deleteProfilePath(io, path);
         }
-        try self.managed_browsers.append(self.gpa, .{
-            .window = window,
-            .child = owned,
-            .browser = selected,
-        });
-        return id;
-    }
-
-    fn launchedBrowser(
-        self: *App,
-        io: std.Io,
-        window: *WindowState,
-    ) ?Browser {
-        self.browser_mutex.lockUncancelable(io);
-        defer self.browser_mutex.unlock(io);
-        for (self.managed_browsers.items) |*managed|
-            if (managed.window == window) return managed.browser;
-        return null;
+        return error.NoManagedBrowser;
     }
 
     fn browserId(
@@ -2373,7 +2620,8 @@ pub const App = struct {
         self.browser_mutex.lockUncancelable(io);
         defer self.browser_mutex.unlock(io);
         for (self.managed_browsers.items) |*managed|
-            if (managed.window == window) return managed.child.id;
+            if (managed.window == window)
+                return if (managed.child) |child| child.id else null;
         return null;
     }
 
@@ -2381,16 +2629,20 @@ pub const App = struct {
         self.browser_mutex.lockUncancelable(io);
         defer self.browser_mutex.unlock(io);
         for (self.managed_browsers.items) |*managed|
-            if (managed.window == window)
-                return browser.focusProcess(managed.child.id.?);
+            if (managed.window == window) {
+                const child = managed.child orelse return error.NoManagedBrowser;
+                return browser.focusProcess(child.id.?);
+            };
         return error.NoManagedBrowser;
     }
 
     fn stopBrowsers(self: *App, io: std.Io) void {
         self.browser_mutex.lockUncancelable(io);
         defer self.browser_mutex.unlock(io);
-        for (self.managed_browsers.items) |*managed|
-            managed.child.kill(io);
+        for (self.managed_browsers.items) |*managed| {
+            if (managed.child) |*child| child.kill(io);
+            if (managed.profile) |path| self.gpa.free(path);
+        }
         self.managed_browsers.clearRetainingCapacity();
     }
 
@@ -2491,10 +2743,17 @@ fn appFrom(user_data: ?*anyopaque) *App {
     return @ptrCast(@alignCast(user_data.?));
 }
 
+const StaticRequest = struct {
+    directory: *DirectoryContent,
+    path_storage: []u8,
+};
+
 fn releaseStaticDirectory(user_data: ?*anyopaque) void {
-    const directory: *DirectoryContent =
-        @ptrCast(@alignCast(user_data.?));
-    directory.release();
+    const request: *StaticRequest = @ptrCast(@alignCast(user_data.?));
+    const gpa = request.directory.gpa;
+    request.directory.release();
+    gpa.free(request.path_storage);
+    gpa.destroy(request);
 }
 
 fn failResponse(response: *Linsang.Response) Linsang.Action {
@@ -2650,8 +2909,7 @@ const runtime_timeout: std.Io.Clock.Duration = .{
 /// Return the sub-path of the script this request should run through the
 /// interpreter, or null when the request is not a readable script. Directory
 /// requests fall back to `index.ts` and then `index.js`, matching upstream.
-/// Percent escapes are never decoded, so an escape can neither become a path
-/// separator nor hide a traversal; the request path is matched verbatim.
+/// The caller supplies the same canonical resource used by static serving.
 fn runtimeScript(
     dir: std.Io.Dir,
     io: std.Io,
@@ -2679,38 +2937,91 @@ fn runtimeScript(
     return resource;
 }
 
-fn readableScript(dir: std.Io.Dir, io: std.Io, sub_path: []const u8) bool {
+fn readableScript(root: std.Io.Dir, io: std.Io, sub_path: []const u8) bool {
     if (!safeSubPath(sub_path)) return false;
-    dir.access(io, sub_path, .{ .read = true }) catch return false;
-    return true;
+    // Match Linsang's component-by-component no-follow static resolver.
+    var components = std.mem.splitScalar(u8, sub_path, '/');
+    var component = components.next() orelse return false;
+    var dir = root;
+    var owns_dir = false;
+    defer if (owns_dir) dir.close(io);
+    while (components.next()) |next| {
+        const child = dir.openDir(io, component, .{ .follow_symlinks = false }) catch return false;
+        if (owns_dir) dir.close(io);
+        dir = child;
+        owns_dir = true;
+        component = next;
+    }
+    // Stat before opening avoids blocking on FIFOs and device files.
+    const stat = dir.statFile(io, component, .{ .follow_symlinks = false }) catch return false;
+    if (stat.kind != .file) return false;
+    const file = dir.openFile(io, component, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch return false;
+    defer file.close(io);
+    return (file.stat(io) catch return false).kind == .file;
 }
 
 fn safeSubPath(sub_path: []const u8) bool {
-    if (sub_path.len == 0 or std.fs.path.isAbsolute(sub_path)) return false;
-    if (std.mem.indexOfScalar(u8, sub_path, 0) != null) return false;
-    // A backslash is a separator on Windows and an ordinary name byte
-    // elsewhere, so rejecting it keeps one meaning on every platform.
-    if (std.mem.indexOfScalar(u8, sub_path, '\\') != null) return false;
+    if (sub_path.len == 0 or !std.unicode.utf8ValidateSlice(sub_path)) return false;
+    for (sub_path) |byte|
+        if (byte < 0x20 or byte == 0x7f or byte == '\\' or byte == ':') return false;
     var components = std.mem.splitScalar(u8, sub_path, '/');
     while (components.next()) |component|
-        if (std.mem.eql(u8, component, "..")) return false;
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, "..")) return false;
     return true;
+}
+
+/// Decode once, retaining literal percent names (including double escapes).
+/// Like Linsang, reject ambiguous components and platform separators; encoded
+/// separators are rejected rather than changing the resource hierarchy.
+fn canonicalResource(buffer: []u8, encoded: []const u8) ?[]const u8 {
+    if (buffer.len < encoded.len) return null;
+    var source: usize = 0;
+    var length: usize = 0;
+    while (source < encoded.len) {
+        const byte = if (encoded[source] == '%') decoded: {
+            if (encoded.len - source < 3) return null;
+            const high = std.fmt.charToDigit(encoded[source + 1], 16) catch return null;
+            const low = std.fmt.charToDigit(encoded[source + 2], 16) catch return null;
+            const value: u8 = high * 16 + low;
+            if (value == '/') return null;
+            source += 3;
+            break :decoded value;
+        } else decoded: {
+            const value = encoded[source];
+            source += 1;
+            break :decoded value;
+        };
+        buffer[length] = byte;
+        length += 1;
+    }
+    const path = buffer[0..length];
+    if (path.len == 0) return path;
+    const relative = if (path[path.len - 1] == '/') path[0 .. path.len - 1] else path;
+    if (!safeSubPath(relative)) return null;
+    return path;
 }
 
 /// Run one script through its interpreter and answer with the captured
 /// standard output. The script receives its own path and the raw query string
 /// as two arguments; no shell is involved, so a query can never be a command.
+/// No-follow validation prevents ordinary symlink escape. The interpreter
+/// reopens this path: this is not a TOCTOU sandbox against filesystem writers,
+/// who already control executable scripts and must be trusted.
 fn interpretScript(
     window: *WindowState,
     io: std.Io,
     runtime: Runtime,
-    root: []const u8,
+    root: std.Io.Dir,
     sub_path: []const u8,
     query: []const u8,
     response: *Linsang.Response,
 ) !void {
     const gpa = window.gpa;
-    const full_path = try std.fs.path.join(gpa, &.{ root, sub_path });
+    const full_path = try std.fmt.allocPrint(gpa, "./{s}", .{sub_path});
     defer gpa.free(full_path);
 
     var argv: std.ArrayList([]const u8) = .empty;
@@ -2718,7 +3029,7 @@ fn interpretScript(
     try argv.appendSlice(gpa, runtime.command());
     try argv.appendSlice(gpa, &.{ full_path, query });
 
-    return runScript(window, io, runtime, sub_path, argv.items, runtime_timeout, response);
+    return runScript(window, io, runtime, sub_path, argv.items, .{ .dir = root }, runtime_timeout, response);
 }
 
 fn runScript(
@@ -2727,12 +3038,14 @@ fn runScript(
     runtime: Runtime,
     sub_path: []const u8,
     argv: []const []const u8,
+    cwd: std.process.Child.Cwd,
     timeout: std.Io.Clock.Duration,
     response: *Linsang.Response,
 ) !void {
     const gpa = window.gpa;
     const result = std.process.run(gpa, io, .{
         .argv = argv,
+        .cwd = cwd,
         .stdout_limit = .limited(window.limits.max_runtime_output),
         .stderr_limit = .limited(max_runtime_diagnostics),
         .timeout = .{ .duration = timeout },
@@ -2820,7 +3133,15 @@ fn onRequest(
     user_data: ?*anyopaque,
 ) Linsang.Action {
     const app = appFrom(user_data);
-    const resolved = route(app, request.path) orelse {
+    var resolved = route(app, request.path) orelse {
+        response.status = .not_found;
+        return .respond;
+    };
+    const path_storage = app.gpa.alloc(u8, resolved.resource.len) catch
+        return failResponse(response);
+    var owns_path = true;
+    defer if (owns_path) app.gpa.free(path_storage);
+    resolved.resource = canonicalResource(path_storage, resolved.resource) orelse {
         response.status = .not_found;
         return .respond;
     };
@@ -2864,14 +3185,7 @@ fn onRequest(
             "globalThis.__zigWebuiCapability=\"{s}\";\n",
             .{window.capability},
         ) catch return failResponse(response);
-        response.print(
-            "globalThis.__zigWebuiEvents={};\n",
-            .{window.event_binding != null},
-        ) catch return failResponse(response);
-        response.print(
-            "globalThis.__zigWebuiDomBindings={};\n",
-            .{window.bindings.items.len != 0},
-        ) catch return failResponse(response);
+        window.writeRegistrations(io, response) catch return failResponse(response);
         response.write(bridge) catch return failResponse(response);
         return .respond;
     }
@@ -2900,7 +3214,7 @@ fn onRequest(
                         window,
                         io,
                         runtime,
-                        directory.path,
+                        dir,
                         sub_path,
                         request.query,
                         response,
@@ -2914,15 +3228,24 @@ fn onRequest(
                     };
                     break :blk .respond;
                 }
+                const extension = std.fs.path.extension(resolved.resource);
+                if (std.mem.eql(u8, extension, ".js") or std.mem.eql(u8, extension, ".ts")) {
+                    // An unreadable, symlinked or nonregular script must never
+                    // fall through to a source response.
+                    response.status = .not_found;
+                    break :blk .respond;
+                }
             }
-            // ponytail: Linsang StaticFiles has no mount prefix yet. Rewrite
-            // only the validated path slice; use strip_prefix when available.
-            @constCast(request).path = request.path[capability_len + 1 ..];
+            const static_request = app.gpa.create(StaticRequest) catch
+                break :blk failResponse(response);
+            static_request.* = .{ .directory = directory, .path_storage = path_storage };
+            owns_path = false;
             directory.retain();
             break :blk .{ .files = .{
                 .dir = dir,
+                .canonical_path = resolved.resource,
                 .on_complete = releaseStaticDirectory,
-                .user_data = directory,
+                .user_data = static_request,
             } };
         },
         .custom => |custom| blk: {
@@ -2955,9 +3278,19 @@ fn send(
 
 fn onOpen(connection: *Linsang.Connection, user_data: ?*anyopaque) void {
     const app = appFrom(user_data);
-    const previous = app.unauthenticated_connections.fetchAdd(1, .acq_rel);
-    if (previous >= app.options.limits.max_unauthenticated_connections)
+    connection.setWebSocketDeadline(.fromNow(connection.io, .{
+        .clock = .awake,
+        .raw = .fromSeconds(5),
+    }));
+    // Linsang guarantees req remains valid through this callback. Copy only
+    // stable identity: no request/header/path slice survives the callback.
+    const resolved = route(app, connection.req.path) orelse {
         connection.wsClose(.policy_violation, "");
+        return;
+    };
+    app.admitUpgrade(connection.io, @intFromPtr(connection), resolved.window) catch |err| {
+        connection.wsClose(if (err == error.ClientLimitReached) @enumFromInt(1013) else .internal_error, "");
+    };
 }
 
 fn onMessage(
@@ -3000,32 +3333,28 @@ fn onMessage(
         return;
     };
 
-    // ponytail: Linsang does not retain the upgrade route; bind the connection
-    // with the capability in its first authenticated protocol packet.
     if (packet.header.command == .check_token) {
-        const window = app.windowByCapability(packet.payload) orelse {
-            send(connection, app.gpa, packet.header, &.{0}) catch {};
-            return;
-        };
-        if (packet.header.token != window.token or
-            (authenticated != null and authenticated.? != window))
-        {
-            send(connection, app.gpa, packet.header, &.{0}) catch {};
-            return;
-        }
-        const new_client = window.authenticate(connection) catch {
-            send(connection, app.gpa, packet.header, &.{0}) catch {};
+        const window = app.authorizedWindow(connection.io, @intFromPtr(connection)) orelse {
             connection.wsClose(.policy_violation, "");
             return;
         };
-        send(connection, app.gpa, packet.header, &.{1}) catch {};
+        if (!std.mem.eql(u8, packet.payload, &window.capability) or
+            packet.header.token != window.token)
+        {
+            send(connection, app.gpa, packet.header, &.{0}) catch {};
+            connection.wsClose(.policy_violation, "");
+            return;
+        }
+        const new_client = window.authenticate(connection, packet.header) catch |err| {
+            // Capacity is temporary: a failed CHECK_TOKEN would make the
+            // bridge stop reconnecting before a stale transport expires.
+            connection.wsClose(if (err == error.ClientLimitReached) @enumFromInt(1013) else .internal_error, "");
+            return;
+        };
+        app.authenticatedUpgrade(connection.io, @intFromPtr(connection));
         if (new_client) |client| {
             app.ever_connected.store(true, .release);
-            const previous = app.unauthenticated_connections.fetchSub(
-                1,
-                .acq_rel,
-            );
-            std.debug.assert(previous > 0);
+            std.debug.assert(authenticated == null);
             window.applyGeometry(connection) catch |err|
                 window.log(.warn, "Browser geometry update failed: {}", .{err});
             window.dispatchEvent(connection.io, .{
@@ -3036,11 +3365,11 @@ fn onMessage(
         }
         return;
     }
+    const window = authenticated orelse {
+        connection.wsClose(.policy_violation, "");
+        return;
+    };
     if (packet.header.command == .multi) {
-        const window = authenticated orelse {
-            connection.wsClose(.policy_violation, "");
-            return;
-        };
         const expected = protocol.decodeMultiLength(
             packet.payload,
             app.options.limits.max_ws_message_size,
@@ -3059,10 +3388,6 @@ fn onMessage(
         };
         return;
     }
-    const window = authenticated orelse {
-        connection.wsClose(.policy_violation, "");
-        return;
-    };
     if (packet.header.token != window.token) {
         connection.wsClose(.policy_violation, "");
         return;
@@ -3099,7 +3424,7 @@ fn onMessage(
                 send(connection, app.gpa, packet.header, "") catch {};
                 return;
             };
-            const binding = window.binding(decoded.name) orelse {
+            const binding = window.binding(connection.io, decoded.name) orelse {
                 send(connection, app.gpa, packet.header, "") catch {};
                 return;
             };
@@ -3150,20 +3475,13 @@ fn onMessage(
 
 fn onClose(connection: *Linsang.Connection, user_data: ?*anyopaque) void {
     const app = appFrom(user_data);
-    var authenticated = false;
-    for (app.windows.items) |window| {
-        if (window.disconnected(connection)) |client| {
-            window.dispatchEvent(connection.io, .{
-                .kind = .disconnected,
-                .client = client,
-            }) catch |err|
-                window.log(.err, "WebUI event dispatch failed: {}", .{err});
-            authenticated = true;
-        }
-    }
-    if (!authenticated) {
-        const previous = app.unauthenticated_connections.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
+    const window = app.removeUpgrade(connection.io, @intFromPtr(connection)) orelse return;
+    if (window.disconnected(connection)) |client| {
+        window.dispatchEvent(connection.io, .{
+            .kind = .disconnected,
+            .client = client,
+        }) catch |err|
+            window.log(.err, "WebUI event dispatch failed: {}", .{err});
     }
 }
 
@@ -3204,29 +3522,6 @@ fn failingEventHandler(_: *const Event, _: ?*anyopaque) !void {
 
 fn noopCallHandler(_: *Call, _: ?*anyopaque) !void {}
 
-test "bindings and event handlers are rejected while running" {
-    const gpa = std.testing.allocator;
-    var app = App.init(gpa, .{});
-    defer app.deinit();
-    const window = try app.createWindow(.{
-        .content = .{ .html = "running page" },
-    });
-    try window.bind("before", noopCallHandler, null);
-    try window.onEvent(failingEventHandler, null);
-
-    window.state.running.store(true, .release);
-    try std.testing.expectError(
-        error.AlreadyStarted,
-        window.bind("during", noopCallHandler, null),
-    );
-    try std.testing.expectError(
-        error.AlreadyStarted,
-        window.onEvent(failingEventHandler, null),
-    );
-    window.state.running.store(false, .release);
-    try window.bind("after", noopCallHandler, null);
-}
-
 test "application logger receives level, message, and user data" {
     const gpa = std.testing.allocator;
     var capture: LoggerCapture = .{};
@@ -3247,8 +3542,8 @@ test "application logger receives level, message, and user data" {
         capture.message[0..capture.message_len],
     );
 
-    try window.onEvent(failingEventHandler, null);
-    window.state.invokeEvent(.{
+    try window.onEvent(std.testing.io, failingEventHandler, null);
+    window.state.invokeEvent(std.testing.io, .{
         .kind = .connected,
         .client = .{ .state = window.state, .client_id = 1 },
     }, null, window.state.event_binding);
@@ -3356,7 +3651,7 @@ test "network options, origins, and protocol limits" {
     });
     try std.testing.expectError(
         error.BindingNameTooLarge,
-        window.bind("long", integrationHandler, null),
+        window.bind(std.testing.io, "long", integrationHandler, null),
     );
     try std.testing.expectError(error.ScriptTooLarge, validateRunScript("1234", 3));
 
@@ -3667,27 +3962,34 @@ test "event modes serialize, copy, bound, and cancel handlers" {
         .max_pending_events = 2,
     });
     var capture: EventSchedulingCapture = .{ .io = io };
-    try window.onEvent(schedulingEventHandler, &capture);
+    defer window.state.cancelEvents(io);
+    try window.onEvent(io, schedulingEventHandler, &capture);
     const target: Client = .{ .state = window.state, .client_id = 1 };
 
     try std.testing.expectEqual(EventMode.serial, window.eventMode());
-    var first = io.async(WindowState.dispatchEvent, .{
-        window.state,
-        io,
-        Event{ .kind = .click, .client = target, .data = "1" },
+    try window.state.dispatchEvent(io, .{
+        .kind = .click,
+        .client = target,
+        .data = "1",
     });
     try waitForCount(io, &capture.entered, 1);
-    var second = io.async(WindowState.dispatchEvent, .{
-        window.state,
-        io,
-        Event{ .kind = .click, .client = target, .data = "2" },
+    var serial_data = [_]u8{'2'};
+    try window.state.dispatchEvent(io, .{
+        .kind = .click,
+        .client = target,
+        .data = &serial_data,
     });
+    serial_data[0] = 'x';
+    try std.testing.expectError(error.TooManyPendingEvents, window.state.dispatchEvent(io, .{
+        .kind = .click,
+        .client = target,
+        .data = "3",
+    }));
     try std.Io.sleep(io, .fromMilliseconds(10), .awake);
     try std.testing.expectEqual(@as(usize, 1), capture.entered.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), capture.peak.load(.acquire));
     capture.gate.set(io);
-    try first.await(io);
-    try second.await(io);
+    try window.state.event_tasks.await(io);
     try std.testing.expectEqualStrings("12", &capture.order);
 
     capture.reset(true);
@@ -4023,12 +4325,31 @@ fn authenticateTestClient(
         .command = .check_token,
     }, capability);
     try sendClientFrame(stream, io, packet.items);
-    const response = try protocol.decode(try readServerFrame(
-        stream,
-        io,
-        response_buffer,
-    ));
-    return std.mem.eql(u8, response.payload, &.{1});
+    while (true) {
+        const response = try protocol.decode(try readServerFrame(
+            stream,
+            io,
+            response_buffer,
+        ));
+        if (response.header.command == .add_id) continue;
+        try std.testing.expectEqual(protocol.Command.check_token, response.header.command);
+        return std.mem.eql(u8, response.payload, &.{1});
+    }
+}
+
+fn expectCapacityClose(stream: std.Io.net.Stream, io: std.Io, gpa: std.mem.Allocator, window: *WindowState) !void {
+    var packet: std.ArrayList(u8) = .empty;
+    defer packet.deinit(gpa);
+    try protocol.append(&packet, gpa, .{
+        .token = window.token,
+        .command = .check_token,
+    }, &window.capability);
+    try sendClientFrame(stream, io, packet.items);
+    var buffer: [125]u8 = undefined;
+    // The first response must be retryable close, not a terminal failed ACK.
+    const close = try readServerFrameOpcode(stream, io, .close, &buffer);
+    try std.testing.expect(close.len >= 2);
+    try std.testing.expectEqual(@as(u16, 1013), std.mem.readInt(u16, close[0..2], .big));
 }
 
 fn expectQuickScript(
@@ -4052,7 +4373,8 @@ fn readTestFileEventually(
     gpa: std.mem.Allocator,
     path: []const u8,
 ) ![]u8 {
-    for (0..100) |_| {
+    const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(5) });
+    while (deadline.compare(.gt, .now(io, .awake))) {
         const data = dir.readFileAlloc(
             io,
             path,
@@ -4060,7 +4382,7 @@ fn readTestFileEventually(
             .limited(4096),
         ) catch |err| {
             if (err != error.FileNotFound) return err;
-            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+            try std.Io.sleep(io, .fromMilliseconds(5), .awake);
             continue;
         };
         return data;
@@ -4083,7 +4405,7 @@ fn exerciseHeartbeat(io: std.Io, scenario: HeartbeatTest) anyerror!void {
         .content = .{ .html = "heartbeat test" },
     });
     var called_client_id: std.atomic.Value(u64) = .init(0);
-    try window.bind("greet", integrationHandler, &called_client_id);
+    try window.bind(io, "greet", integrationHandler, &called_client_id);
     var running = try app.start(io);
     defer running.stop() catch {};
 
@@ -4390,17 +4712,19 @@ test "runtime geometry persists for current and future clients" {
 }
 
 test "managed profiles are deletable and caller directories are not" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos)
+        return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited, .environ = std.testing.environ });
     defer threaded.deinit();
     const io = threaded.io();
+    try requireTestRuntime(gpa, io, .node_js);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{
         .sub_path = "fake-browser",
-        .data = "#!/bin/sh\nexec sleep 30\n",
+        .data = "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n",
         .flags = .{ .permissions = .executable_file },
     });
     const executable = try std.fmt.allocPrint(
@@ -4417,14 +4741,6 @@ test "managed profiles are deletable and caller directories are not" {
     defer gpa.free(caller_profile);
     try tmp.dir.createDirPath(io, "caller-profile");
 
-    // Epic is not installed on test machines, so its managed profile can
-    // never be a real profile this test would destroy.
-    const managed = (try browser.managedProfileDirectory(gpa, .epic)).?;
-    defer gpa.free(managed);
-    try std.testing.expectEqualStrings(
-        "/tmp/.WebUI/WebUIEpicProfile",
-        managed,
-    );
     try std.testing.expectEqual(
         @as(?[]u8, null),
         try browser.managedProfileDirectory(gpa, .firefox),
@@ -4442,8 +4758,11 @@ test "managed profiles are deletable and caller directories are not" {
         .content = .{ .html = "caller profile" },
         .profile_directory = caller_profile,
     });
+    const sibling = try app.createWindow(.{ .content = .{ .html = "independent profile" } });
     var running = try app.start(io);
     defer running.stop() catch {};
+    const managed = (try browser.managedWindowProfileDirectory(gpa, .epic, &window.state.capability)).?;
+    defer gpa.free(managed);
 
     // Nothing launched yet, so no profile can be identified.
     try std.testing.expectError(
@@ -4465,12 +4784,20 @@ test "managed profiles are deletable and caller directories are not" {
         .sub_path = "Default/Cache/entry",
         .data = "cached",
     });
+    const sibling_id = try sibling.openWithBrowser(&running, .{ .browser = .epic, .executable = executable });
+    const sibling_profile = (try browser.managedWindowProfileDirectory(gpa, .epic, &sibling.state.capability)).?;
+    defer gpa.free(sibling_profile);
+    defer _ = sibling.deleteProfile(&running) catch false;
+    try std.Io.Dir.cwd().createDirPath(io, sibling_profile);
     try std.testing.expect(try window.deleteProfile(&running));
     try std.testing.expect(!try window.deleteProfile(&running));
     try std.testing.expectError(
         error.FileNotFound,
         std.Io.Dir.accessAbsolute(io, managed, .{}),
     );
+    try std.Io.Dir.accessAbsolute(io, sibling_profile, .{});
+    try std.testing.expectEqual(sibling_id, (try sibling.browserProcessId(&running)).?);
+    try std.testing.expect(try sibling.deleteProfile(&running));
 
     // A caller-managed directory is never removed.
     _ = try caller_window.openWithBrowser(&running, .{
@@ -4491,22 +4818,24 @@ test "managed profiles are deletable and caller directories are not" {
 }
 
 test "selected browser launch applies window controls and owns process" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos)
+        return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited, .environ = std.testing.environ });
     defer threaded.deinit();
     const io = threaded.io();
+    try requireTestRuntime(gpa, io, .node_js);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{
         .sub_path = "fake-browser",
         .data =
-        \\#!/bin/sh
-        \\output=$1
-        \\shift
-        \\printf '%s\n' "$@" > "$output"
-        \\exec sleep 30
+        \\#!/usr/bin/env node
+        \\const fs = require('fs'), output = process.argv[2];
+        \\fs.writeFileSync(output + '.tmp', process.argv.slice(3).join('\n') + '\n');
+        \\fs.renameSync(output + '.tmp', output);
+        \\setInterval(() => {}, 1000);
         ,
         .flags = .{ .permissions = .executable_file },
     });
@@ -4536,10 +4865,14 @@ test "selected browser launch applies window controls and owns process" {
     defer gpa.free(fourth_capture);
     // A launch without caller arguments has nowhere to carry the capture path,
     // so this launcher hardcodes it.
+    const capture_json = try std.json.Stringify.valueAlloc(gpa, fourth_capture, .{});
+    defer gpa.free(capture_json);
     const capturing_script = try std.fmt.allocPrint(
         gpa,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{s}\"\nexec sleep 30\n",
-        .{fourth_capture},
+        "#!/usr/bin/env node\nconst fs = require('fs'), output = {s};\n" ++
+            "fs.writeFileSync(output + '.tmp', process.argv.slice(2).join('\\n') + '\\n');\n" ++
+            "fs.renameSync(output + '.tmp', output);\nsetInterval(() => {{}}, 1000);\n",
+        .{capture_json},
     );
     defer gpa.free(capturing_script);
     try tmp.dir.writeFile(io, .{
@@ -4726,11 +5059,11 @@ test "selected browser launch applies window controls and owns process" {
     defer gpa.free(third_argv);
     const expected_third = try std.fmt.allocPrint(
         gpa,
-        "--user-data-dir=/tmp/.WebUI/WebUIChromiumProfile\n" ++
+        "--user-data-dir=/tmp/.WebUI/WebUIChromiumProfile/{s}\n" ++
             "--proxy-server=socks5://127.0.0.1:1080\n" ++
             "--disable-features=ForcedColors\n" ++
             "--window-position=-300,50\n--app={s}\n",
-        .{positioned_url},
+        .{ positioned_window.state.capability, positioned_url },
     );
     defer gpa.free(expected_third);
     try std.testing.expectEqualStrings(expected_third, third_argv);
@@ -4751,7 +5084,7 @@ test "selected browser launch applies window controls and owns process" {
     defer gpa.free(fourth_argv);
     const expected_fourth = try std.fmt.allocPrint(
         gpa,
-        "--user-data-dir=/tmp/.WebUI/WebUIChromeProfile\n" ++
+        "--user-data-dir=/tmp/.WebUI/WebUIChromeProfile/{s}\n" ++
             "--no-first-run\n--safe-mode\n--disable-extensions\n" ++
             "--disable-background-mode\n--disable-plugins\n" ++
             "--disable-plugins-discovery\n--disable-translate\n" ++
@@ -4760,7 +5093,7 @@ test "selected browser launch applies window controls and owns process" {
             "--auto-accept-camera-and-microphone-capture\n" ++
             "--no-proxy-server\n--disable-features=Translate\n" ++
             "--headless=new\n--app={s}\n",
-        .{hidden_url},
+        .{ hidden_window.state.capability, hidden_url },
     );
     defer gpa.free(expected_fourth);
     try std.testing.expectEqualStrings(expected_fourth, fourth_argv);
@@ -4828,7 +5161,7 @@ test "runtime script lookup resolves indexes and rejects escapes" {
     try std.testing.expect(!safeSubPath("/etc/passwd"));
     try std.testing.expect(!safeSubPath("nested\\page.js"));
     try std.testing.expect(!safeSubPath("page\x00.js"));
-    // Percent escapes stay literal, so they never become a traversal.
+    // This helper receives decoded paths: a remaining percent is literal.
     try std.testing.expect(safeSubPath("%2e%2e/page.js"));
     try std.testing.expect(safeSubPath("nested/page.js"));
     try std.testing.expect(safeSubPath("a..b.js"));
@@ -4939,7 +5272,7 @@ fn expectRuntimeResponse(
     const window = try app.createWindow(.{ .content = .{ .html = "" } });
     var response = Response.init(gpa);
     defer response.deinit();
-    try runScript(window.state, io, .node_js, "test.js", argv, timeout, &response);
+    try runScript(window.state, io, .node_js, "test.js", argv, .inherit, timeout, &response);
     var wire: std.ArrayList(u8) = .empty;
     defer wire.deinit(gpa);
     try response.serialize(&wire, gpa, false);
@@ -5037,6 +5370,8 @@ fn testRuntimeHttp(runtime: Runtime) !void {
         .{ .resource = "?name=zig", .status = .ok, .body = "interpreted:name=zig\n" },
         .{ .resource = "broken.js", .status = @enumFromInt(502), .body = "" },
         .{ .resource = "oversized.js", .status = @enumFromInt(502), .body = "" },
+        .{ .resource = "index.%6as?encoded=suffix", .status = .ok, .body = "interpreted:encoded=suffix\n" },
+        .{ .resource = "broken.%6as", .status = @enumFromInt(502), .body = "" },
     };
     for (cases) |case| {
         const target = try std.fmt.allocPrint(
@@ -5073,6 +5408,30 @@ test "runtime selection serves static HTTP requests without executing scripts" {
     var running = try app.start(io);
     defer running.stop() catch {};
     try expectRuntimeStaticResponse(io, &running, window);
+    const cases = [_]struct { name: []const u8, resource: []const u8 }{
+        .{ .name = "literal%.txt", .resource = "literal%25.txt" },
+        .{ .name = "%2e%2e.txt", .resource = "%252e%252e.txt" },
+        .{ .name = "secret.%6as", .resource = "secret.%256as" },
+    };
+    for (cases) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = case.name, .data = "literal resource" });
+        const target = try std.fmt.allocPrint(gpa, "/{s}/{s}", .{ window.state.capability, case.resource });
+        defer gpa.free(target);
+        var response: [1024]u8 = undefined;
+        const wire = try getTestPath(running.inner.address, io, target, "\x00", &response);
+        try std.testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 200 "));
+        const body_at = (std.mem.indexOf(u8, wire, "\r\n\r\n") orelse return error.MissingHttpHeaders) + 4;
+        try std.testing.expectEqualStrings("literal resource", wire[body_at..]);
+    }
+    if (@import("builtin").os.tag != .windows) {
+        try tmp.dir.symLink(io, "page.html", "blocked.js", .{});
+        const target = try std.fmt.allocPrint(gpa, "/{s}/blocked.%6as", .{window.state.capability});
+        defer gpa.free(target);
+        var response: [1024]u8 = undefined;
+        const wire = try getTestPath(running.inner.address, io, target, "\x00", &response);
+        try std.testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 404 "));
+        try std.testing.expect(std.mem.indexOf(u8, wire, "<p>static</p>") == null);
+    }
 }
 
 fn expectRuntimeStaticResponse(io: std.Io, running: *Running, window: Window) !void {
@@ -5353,7 +5712,7 @@ test "binding replies can be deferred, bounded, and disconnected" {
     });
     var capture: DeferredReplyCapture = .{};
     defer if (capture.reply) |*reply| reply.deinit();
-    try window.bind("later", deferredReplyHandler, &capture);
+    try window.bind(io, "later", deferredReplyHandler, &capture);
     var running = try app.start(io);
     defer running.stop() catch {};
 
@@ -5602,17 +5961,18 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
     var primary_events: IntegrationEventState = .{
         .expected_click = "primary",
     };
-    try window.onEvent(integrationEventHandler, &primary_events);
+    try window.onEvent(io, integrationEventHandler, &primary_events);
     var secondary_events: IntegrationEventState = .{
         .expected_click = "secondary",
     };
-    try second_window.onEvent(integrationEventHandler, &secondary_events);
+    try second_window.onEvent(io, integrationEventHandler, &secondary_events);
     var called_client_id: std.atomic.Value(u64) = .init(0);
-    try window.bind("greet", integrationHandler, &called_client_id);
+    try window.bind(io, "greet", integrationHandler, &called_client_id);
     var large_argument_received: std.atomic.Value(usize) = .init(0);
-    try window.bind("large", largeIntegrationHandler, &large_argument_received);
+    try window.bind(io, "large", largeIntegrationHandler, &large_argument_received);
     var dom_binding_called: std.atomic.Value(bool) = .init(false);
     try window.bind(
+        io,
         "primary",
         integrationDomBindingHandler,
         &dom_binding_called,
@@ -5693,23 +6053,6 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
             bytes,
             icon.other_data,
         ) == null);
-    }
-    {
-        var target: [capability_len + 10]u8 = undefined;
-        var response: [8192]u8 = undefined;
-        const enabled = "globalThis.__zigWebuiEvents=true;";
-        const dom_bindings = "globalThis.__zigWebuiDomBindings=true;";
-        const bytes = try getTestPath(
-            running.inner.address,
-            io,
-            try std.fmt.bufPrint(&target, "/{s}/webui.js", .{
-                window.state.capability,
-            }),
-            dom_bindings,
-            &response,
-        );
-        try std.testing.expect(std.mem.indexOf(u8, bytes, enabled) != null);
-        try std.testing.expect(std.mem.indexOf(u8, bytes, dom_bindings) != null);
     }
     {
         var target: [capability_len + 2]u8 = undefined;
@@ -5804,23 +6147,6 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         external_bridge_url,
         &external_window.state.capability,
     ) != null);
-    {
-        var target: [capability_len + 10]u8 = undefined;
-        var response: [8192]u8 = undefined;
-        const disabled = "globalThis.__zigWebuiEvents=false;";
-        const dom_bindings = "globalThis.__zigWebuiDomBindings=false;";
-        const bytes = try getTestPath(
-            running.inner.address,
-            io,
-            try std.fmt.bufPrint(&target, "/{s}/webui.js", .{
-                external_window.state.capability,
-            }),
-            dom_bindings,
-            &response,
-        );
-        try std.testing.expect(std.mem.indexOf(u8, bytes, disabled) != null);
-        try std.testing.expect(std.mem.indexOf(u8, bytes, dom_bindings) != null);
-    }
 
     try std.testing.expectError(
         error.WebSocketUpgradeFailed,
@@ -5886,15 +6212,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
             &window.state.capability,
         );
         defer rejected.close(io);
-        var rejected_payload: [125]u8 = undefined;
-        try std.testing.expect(!try authenticateTestClient(
-            rejected,
-            io,
-            gpa,
-            window.state.token,
-            &window.state.capability,
-            &rejected_payload,
-        ));
+        try expectCapacityClose(rejected, io, gpa, window.state);
     }
 
     var packet: std.ArrayList(u8) = .empty;
@@ -6282,7 +6600,7 @@ test "multi-client limits, targeting, and disconnect lifecycle" {
         .max_pending_evals = 2,
     });
     var called_client_id: std.atomic.Value(u64) = .init(0);
-    try window.bind("greet", integrationHandler, &called_client_id);
+    try window.bind(io, "greet", integrationHandler, &called_client_id);
     var running = try app.start(io);
     defer running.stop() catch {};
     try std.testing.expect(!window.isShown(io));
@@ -6365,15 +6683,7 @@ test "multi-client limits, targeting, and disconnect lifecycle" {
             &window.state.capability,
         );
         defer rejected.close(io);
-        var rejected_response: [125]u8 = undefined;
-        try std.testing.expect(!try authenticateTestClient(
-            rejected,
-            io,
-            gpa,
-            window.state.token,
-            &window.state.capability,
-            &rejected_response,
-        ));
+        try expectCapacityClose(rejected, io, gpa, window.state);
     }
 
     var eval_buffer: [16]u8 = undefined;
@@ -6751,4 +7061,442 @@ test "multi-client limits, targeting, and disconnect lifecycle" {
     try second_stream.shutdown(io, .both);
     try running.wait();
     try std.testing.expect(!window.isShown(io));
+}
+
+const RuntimeBindingCapture = struct {
+    io: std.Io,
+    entered: std.atomic.Value(bool) = .init(false),
+    gate: std.Io.Event = .unset,
+};
+
+fn heldRuntimeBinding(call: *Call, user_data: ?*anyopaque) !void {
+    const capture: *RuntimeBindingCapture = @ptrCast(@alignCast(user_data.?));
+    capture.entered.store(true, .release);
+    try capture.gate.wait(capture.io);
+    try call.reply("old");
+}
+
+fn replacementRuntimeBinding(call: *Call, _: ?*anyopaque) !void {
+    try call.reply("new");
+}
+
+fn expectRegistration(
+    stream: std.Io.net.Stream,
+    io: std.Io,
+    buffer: []u8,
+    name: []const u8,
+) !void {
+    const packet = try protocol.decode(try readServerFrame(stream, io, buffer));
+    try std.testing.expectEqual(protocol.Command.add_id, packet.header.command);
+    try std.testing.expectEqualStrings(name, packet.payload);
+}
+
+test "runtime registrations replace in-flight handlers and replay racing updates" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{
+        .content = .{ .html = "runtime registration" },
+        .event_mode = .concurrent,
+        .max_clients = 2,
+    });
+    var capture: RuntimeBindingCapture = .{ .io = io };
+    var first_events: IntegrationEventState = .{ .expected_click = "unbound" };
+    var replacement_events: IntegrationEventState = .{ .expected_click = "unbound" };
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    const client = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    defer client.close(io);
+    var response: [512]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(
+        client,
+        io,
+        gpa,
+        window.state.token,
+        &window.state.capability,
+        &response,
+    ));
+    const oversized_name: [257]u8 = @splat('x');
+    try std.testing.expectError(error.BindingNameTooLarge, window.bind(io, &oversized_name, noopCallHandler, null));
+    try window.bind(io, "work", heldRuntimeBinding, &capture);
+    try expectRegistration(client, io, &response, "work");
+    var packet: std.ArrayList(u8) = .empty;
+    defer packet.deinit(gpa);
+    try protocol.append(&packet, gpa, .{
+        .token = window.state.token,
+        .id = 1,
+        .command = .call,
+    }, "work\x00\x00");
+    try sendClientFrame(client, io, packet.items);
+    try waitForFlag(io, &capture.entered);
+    defer capture.gate.set(io);
+    try window.bind(io, "work", replacementRuntimeBinding, null);
+    try expectRegistration(client, io, &response, "work");
+    packet.clearRetainingCapacity();
+    try protocol.append(&packet, gpa, .{
+        .token = window.state.token,
+        .id = 2,
+        .command = .call,
+    }, "work\x00\x00");
+    try sendClientFrame(client, io, packet.items);
+    const replaced = try protocol.decode(try readServerFrame(client, io, &response));
+    try std.testing.expectEqual(@as(u16, 2), replaced.header.id);
+    try std.testing.expectEqualStrings("new", replaced.payload);
+    capture.gate.set(io);
+    const held = try protocol.decode(try readServerFrame(client, io, &response));
+    try std.testing.expectEqual(@as(u16, 1), held.header.id);
+    try std.testing.expectEqualStrings("old", held.payload);
+
+    try window.onEvent(io, integrationEventHandler, &first_events);
+    try expectRegistration(client, io, &response, "");
+    packet.clearRetainingCapacity();
+    try protocol.append(&packet, gpa, .{
+        .token = window.state.token,
+        .command = .click,
+    }, "unbound");
+    try sendClientFrame(client, io, packet.items);
+    try waitForFlag(io, &first_events.clicked);
+    try window.onEvent(io, integrationEventHandler, &replacement_events);
+    try expectRegistration(client, io, &response, "");
+    try sendClientFrame(client, io, packet.items);
+    try waitForFlag(io, &replacement_events.clicked);
+    packet.clearRetainingCapacity();
+    try protocol.append(&packet, gpa, .{
+        .token = window.state.token,
+        .command = .navigation,
+    }, "http://localhost/next");
+    try sendClientFrame(client, io, packet.items);
+    try waitForFlag(io, &replacement_events.navigated);
+
+    // A real reconnect replays registrations, including one whose installation
+    // races authentication: it must appear in replay or in the subsequent push.
+    try client.shutdown(io, .both);
+    try waitForFlag(io, &replacement_events.disconnected);
+    const reconnect = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    defer reconnect.close(io);
+    packet.clearRetainingCapacity();
+    try protocol.append(&packet, gpa, .{
+        .token = window.state.token,
+        .command = .check_token,
+    }, &window.state.capability);
+    try sendClientFrame(reconnect, io, packet.items);
+    var registration = io.async(Window.bind, .{ window, io, "raced", replacementRuntimeBinding, null });
+    defer registration.cancel(io) catch {};
+    var saw_work = false;
+    var saw_events = false;
+    var saw_raced = false;
+    var acknowledged = false;
+    while (!acknowledged or !saw_raced) {
+        const received = try protocol.decode(try readServerFrame(reconnect, io, &response));
+        try std.testing.expectEqual(window.state.token, received.header.token);
+        switch (received.header.command) {
+            .add_id => {
+                if (std.mem.eql(u8, received.payload, "work")) saw_work = true else if (received.payload.len == 0) saw_events = true else if (std.mem.eql(u8, received.payload, "raced")) saw_raced = true else return error.UnexpectedRegistration;
+            },
+            .check_token => {
+                try std.testing.expect(saw_work and saw_events);
+                try std.testing.expectEqualSlices(u8, &.{1}, received.payload);
+                acknowledged = true;
+            },
+            else => return error.UnexpectedCommand,
+        }
+    }
+    try registration.await(io);
+    packet.clearRetainingCapacity();
+    try protocol.append(&packet, gpa, .{
+        .token = window.state.token,
+        .id = 3,
+        .command = .call,
+    }, "raced\x00\x00");
+    try sendClientFrame(reconnect, io, packet.items);
+    const raced = try protocol.decode(try readServerFrame(reconnect, io, &response));
+    try std.testing.expectEqual(@as(u16, 3), raced.header.id);
+    try std.testing.expectEqualStrings("new", raced.payload);
+}
+
+fn registrationAllocationFailures(gpa: std.mem.Allocator) !void {
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "allocation failure" } });
+    try window.bind(std.testing.io, "owned", noopCallHandler, null);
+    try window.bind(std.testing.io, "owned", replacementRuntimeBinding, null);
+    try window.onEvent(std.testing.io, failingEventHandler, null);
+}
+
+test "registration allocation failures release names and leave invalid names uninstalled" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, registrationAllocationFailures, .{});
+    var app = App.init(std.testing.allocator, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "invalid registration" } });
+    try std.testing.expectError(error.InvalidBindingName, window.bind(std.testing.io, "", noopCallHandler, null));
+    try std.testing.expectError(error.InvalidBindingName, window.bind(std.testing.io, "a\x00b", noopCallHandler, null));
+    try std.testing.expectError(error.InvalidUtf8, window.bind(std.testing.io, "\xff", noopCallHandler, null));
+    const name: [257]u8 = @splat('a');
+    try std.testing.expectError(error.BindingNameTooLarge, window.bind(std.testing.io, &name, noopCallHandler, null));
+    // Subsequent valid installation still dispatches normally after failures.
+    var called: std.atomic.Value(bool) = .init(false);
+    try window.bind(std.testing.io, "valid", integrationDomBindingHandler, &called);
+    try window.state.dispatchEvent(std.testing.io, .{
+        .kind = .click,
+        .client = .{ .state = window.state, .client_id = 1 },
+        .data = "valid",
+    });
+    try window.state.event_tasks.await(std.testing.io);
+    try std.testing.expect(called.load(.acquire));
+}
+
+test "canonical resources decode suffixes once and reject ambiguous paths" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("secret.js", canonicalResource(&buffer, "secret.%6as").?);
+    try std.testing.expectEqualStrings("percent%.txt", canonicalResource(&buffer, "percent%25.txt").?);
+    try std.testing.expectEqualStrings("%2e%2e/file.js", canonicalResource(&buffer, "%252e%252e/file.js").?);
+    try std.testing.expectEqualStrings("nested/", canonicalResource(&buffer, "nested/").?);
+    for ([_][]const u8{
+        "%",             "%0",       "%zz",      "%00.js",  "%ff.js", "%2e%2e/file.js",
+        "a/%2e/file.js", "a%2fb.js", "a%5cb.js", "a//b.js", "/a.js",  "a:b.js",
+        "a\\b.js",       "\xff.js",  "%+a",      "%a_",     "%_a",
+    }) |path| try std.testing.expect(canonicalResource(&buffer, path) == null);
+}
+
+test "runtime rejects final and intermediate symlinks and nonregular scripts" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "public/not-file.js");
+    try tmp.dir.createDirPath(io, "private");
+    try tmp.dir.writeFile(io, .{ .sub_path = "private/secret.js", .data = "secret source" });
+    try tmp.dir.symLink(io, "../private/secret.js", "public/link.js", .{});
+    try tmp.dir.symLink(io, "../private", "public/linked", .{ .is_directory = true });
+    const root = try tmp.dir.openDir(io, "public", .{});
+    defer root.close(io);
+    try std.testing.expect(!readableScript(root, io, "link.js"));
+    try std.testing.expect(!readableScript(root, io, "linked/secret.js"));
+    try std.testing.expect(!readableScript(root, io, "not-file.js"));
+}
+
+test "upgrade admission owns only accepted connections and removes every state" {
+    const io = std.testing.io;
+    var app = App.init(std.testing.allocator, .{
+        .limits = .{ .max_connections = 2, .max_unauthenticated_connections = 1 },
+    });
+    defer app.deinit();
+    const first = try app.createWindow(.{ .content = .{ .html = "first" } });
+    const second = try app.createWindow(.{ .content = .{ .html = "second" } });
+    try app.admitUpgrade(io, 1, first.state);
+    try std.testing.expectError(error.ClientLimitReached, app.admitUpgrade(io, 2, second.state));
+    try std.testing.expect(app.removeUpgrade(io, 2) == null);
+    try std.testing.expect(app.authorizedWindow(io, 1) == first.state);
+    app.authenticatedUpgrade(io, 1);
+    app.authenticatedUpgrade(io, 1);
+    try app.admitUpgrade(io, 2, second.state);
+    try std.testing.expect(app.removeUpgrade(io, 1) == first.state);
+    try std.testing.expect(app.removeUpgrade(io, 2) == second.state);
+    try app.admitUpgrade(io, 3, first.state);
+    _ = app.removeUpgrade(io, 3);
+    try std.testing.expectEqual(@as(usize, 0), app.unauthenticated_connections.load(.acquire));
+}
+
+test "external pages cannot silently disable Strict cookie authorization" {
+    var app = App.init(std.testing.allocator, .{ .use_cookies = true });
+    defer app.deinit();
+    try std.testing.expectError(error.ExternalUrlCookiesUnsupported, app.createWindow(.{
+        .content = .{ .external_url = "https://example.com/" },
+    }));
+}
+
+test "CHECK_TOKEN cannot change the cookie authorized upgrade window" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var app = App.init(gpa, .{ .use_cookies = true });
+    defer app.deinit();
+    const first = try app.createWindow(.{ .content = .{ .html = "first" } });
+    const second = try app.createWindow(.{ .content = .{ .html = "second" } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    try std.testing.expectError(error.WebSocketUpgradeFailed, connectTestWebSocket(running.inner.address, io, &second.state.capability));
+    const stream = try connectTestWebSocketCookie(running.inner.address, io, &first.state.capability, &first.state.cookie);
+    defer stream.close(io);
+    var response: [125]u8 = undefined;
+    try std.testing.expect(!try authenticateTestClient(stream, io, gpa, second.state.token, &second.state.capability, &response));
+    const close = try readServerFrameOpcode(stream, io, .close, &response);
+    try std.testing.expectEqual(@as(u16, 1008), std.mem.readInt(u16, close[0..2], .big));
+    try std.testing.expect(!second.isShown(io));
+}
+
+fn serialEvalHandler(call: *Call, _: ?*anyopaque) !void {
+    var result: [16]u8 = undefined;
+    const evaluated = try call.client.eval(call.io.?, "return 42", &result, .fromSeconds(1));
+    try call.reply(evaluated.value);
+}
+
+test "serial handler eval receives its own client reply without blocking the receiver" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "serial eval" } });
+    try window.bind(io, "evaluate", serialEvalHandler, null);
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    const stream = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    defer stream.close(io);
+    var response: [125]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &response));
+    var packet: std.ArrayList(u8) = .empty;
+    defer packet.deinit(gpa);
+    try protocol.append(&packet, gpa, .{ .token = window.state.token, .id = 7, .command = .call }, "evaluate\x00\x00");
+    try sendClientFrame(stream, io, packet.items);
+    const eval_request = try protocol.decode(try readServerFrame(stream, io, &response));
+    try std.testing.expectEqual(protocol.Command.js, eval_request.header.command);
+    packet.clearRetainingCapacity();
+    try protocol.append(&packet, gpa, eval_request.header, "\x0042");
+    try sendClientFrame(stream, io, packet.items);
+    const reply = try protocol.decode(try readServerFrame(stream, io, &response));
+    try std.testing.expectEqual(protocol.Command.call, reply.header.command);
+    try std.testing.expectEqual(@as(u16, 7), reply.header.id);
+    try std.testing.expectEqualStrings("42", reply.payload);
+}
+
+test "eval total deadline cancels a blocked send and releases caller buffers" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "blocked eval" } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    const stream = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    defer stream.close(io);
+    var response: [125]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &response));
+    const client = try window.waitForConnection(io, .fromSeconds(1));
+    var peer = try client.retainPeer(io);
+    defer peer.deinit();
+    // Deterministic transport backpressure: a prior writer owns the send lock.
+    try peer.state.mutex.lock(io);
+    defer peer.state.mutex.unlock(io);
+    var output: [16]u8 = undefined;
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.Timeout, client.eval(io, "return 1", &output, .fromMilliseconds(20)));
+    try std.testing.expect(start.untilNow(io).raw.nanoseconds < std.Io.Duration.fromMilliseconds(500).nanoseconds);
+}
+
+test "silent and control-pinging upgrades expire and restore admission capacity" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var app = App.init(gpa, .{ .limits = .{ .max_unauthenticated_connections = 2 } });
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "hard authentication deadline" } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    const silent = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    defer silent.close(io);
+    const pinging = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    defer pinging.close(io);
+    try waitForCount(io, &app.unauthenticated_connections, 2);
+    // Control traffic must not refresh the absolute authentication deadline.
+    for (0..30) |_| {
+        try sendClientFrameOpcode(pinging, io, .ping, "");
+        try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+    }
+    try std.Io.sleep(io, .fromMilliseconds(2500), .awake);
+    try waitForCount(io, &app.unauthenticated_connections, 0);
+    const replacement = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    defer replacement.close(io);
+    var response: [125]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(replacement, io, gpa, window.state.token, &window.state.capability, &response));
+}
+
+fn upgradeAllocationFailures(gpa: std.mem.Allocator) !void {
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "admission allocation" } });
+    try app.admitUpgrade(std.testing.io, 1, window.state);
+    defer _ = app.removeUpgrade(std.testing.io, 1);
+}
+
+test "upgrade allocation failures do not retain admission ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, upgradeAllocationFailures, .{});
+}
+
+test "managed browser replacement reaps its previous child before relaunch" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos)
+        return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{
+        .async_limit = .unlimited,
+        .environ = std.testing.environ,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+    try requireTestRuntime(gpa, io, .node_js);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "owned-browser",
+        .flags = .{ .permissions = .executable_file },
+        .data =
+        \\#!/usr/bin/env node
+        \\const fs = require('fs'), state = process.argv[2];
+        \\if (fs.existsSync(state)) {
+        \\  const old = Number(fs.readFileSync(state, 'utf8'));
+        \\  try { process.kill(old, 0); process.exit(71); }
+        \\  catch (error) { if (error.code !== 'ESRCH') throw error; }
+        \\}
+        \\fs.writeFileSync(state + '.tmp', String(process.pid));
+        \\fs.renameSync(state + '.tmp', state);
+        \\setInterval(() => {}, 1000);
+        ,
+    });
+    const executable = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/owned-browser", .{tmp.sub_path});
+    defer gpa.free(executable);
+    const state_file = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/pid", .{tmp.sub_path});
+    defer gpa.free(state_file);
+    const missing_executable = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/missing-browser", .{tmp.sub_path});
+    defer gpa.free(missing_executable);
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "replace child" } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    const options: BrowserLaunchOptions = .{
+        .browser = .chromium,
+        .executable = executable,
+        .arguments = &.{state_file},
+    };
+    for (0..2) |_| {
+        const id = try window.openWithBrowser(&running, options);
+        var observed = false;
+        for (0..1000) |_| {
+            const bytes = tmp.dir.readFileAlloc(io, "pid", gpa, .limited(32)) catch |err| {
+                if (err != error.FileNotFound) return err;
+                try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+                continue;
+            };
+            defer gpa.free(bytes);
+            if ((std.fmt.parseInt(i32, std.mem.trim(u8, bytes, "\r\n"), 10) catch -1) == id) {
+                observed = true;
+                break;
+            }
+            try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+        }
+        try std.testing.expect(observed);
+    }
+    try std.testing.expectError(error.FileNotFound, window.openWithBrowser(&running, .{
+        .browser = .chromium,
+        .executable = missing_executable,
+    }));
+    try std.testing.expectEqual(@as(?BrowserProcessId, null), try window.browserProcessId(&running));
 }

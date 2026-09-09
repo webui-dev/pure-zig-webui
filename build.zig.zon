@@ -5,14 +5,14 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .linsang = .{
-            .hash = "Linsang-0.0.0-SZhixF2vBgDJnOE8rrcEh9Tz-016h12Yc4KntI9aghj4",
-            .url = "https://github.com/jinzhongjia/Linsang/archive/d625dcb8ddad13bd26d4b8621f15fcaad4305eef.tar.gz",
+            .hash = "Linsang-0.0.0-SZhixNTPBgAFNzofDbxNvJ-mV6zSGNm7brP3jHExQfcC",
+            .url = "https://github.com/jinzhongjia/Linsang/archive/db11eb05e897e4dccdab701e110dc8a6948cb690.tar.gz",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "examples/minimal",
+        "examples",
         "src",
     },
 }

@@ -12,6 +12,7 @@ pub const Command = enum(u8) {
     close = 0xfa,
     call = 0xf9,
     raw = 0xf8,
+    add_id = 0xf7,
     multi = 0xf6,
     check_token = 0xf5,
     _,
@@ -41,6 +42,7 @@ pub fn decode(bytes: []const u8) DecodeError!Packet {
         .close,
         .call,
         .raw,
+        .add_id,
         .multi,
         .check_token,
         => {},
@@ -232,4 +234,48 @@ test "untrusted packets are rejected" {
         error.InvalidPacket,
         decodeEventText(&.{0xff}),
     );
+}
+
+fn exerciseParsers(input: []const u8) void {
+    _ = decodeCall(input) catch {};
+    _ = decodeEventText(input) catch {};
+    _ = decodeMultiLength(input, 1 << 20) catch {};
+    if (decode(input)) |packet| {
+        switch (packet.header.command) {
+            .call => _ = decodeCall(packet.payload) catch {},
+            .click, .navigation, .add_id => _ = decodeEventText(packet.payload) catch {},
+            .multi => _ = decodeMultiLength(packet.payload, 1 << 20) catch {},
+            else => {},
+        }
+    } else |_| {}
+}
+
+fn fuzzParsers(_: void, smith: *std.testing.Smith) !void {
+    var bytes: [1024]u8 = undefined;
+    const len: usize = smith.slice(&bytes);
+    exerciseParsers(bytes[0..len]);
+}
+
+fn fuzzSeed(comptime input: []const u8) [4 + input.len]u8 {
+    var bytes: [4 + input.len]u8 = undefined;
+    std.mem.writeInt(u32, bytes[0..4], input.len, .little);
+    @memcpy(bytes[4..], input);
+    return bytes;
+}
+
+test "protocol parsers tolerate arbitrary input" {
+    const call = fuzzSeed("\xdd\x07\x00\x00\x00\x01\x00\xf9greet\x003\x00Zig\x00");
+    const length = fuzzSeed("65500\x00");
+    const event = fuzzSeed("button\x00");
+    try std.testing.fuzz({}, fuzzParsers, .{ .corpus = &.{ &call, &length, &event } });
+}
+
+test "protocol parsers tolerate deterministic malformed input" {
+    var random = std.Random.DefaultPrng.init(0x7765627569);
+    var bytes: [1024]u8 = undefined;
+    for (0..10_000) |_| {
+        const len = random.random().intRangeAtMost(usize, 0, bytes.len);
+        random.random().bytes(bytes[0..len]);
+        exerciseParsers(bytes[0..len]);
+    }
 }
