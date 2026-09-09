@@ -28,14 +28,13 @@ deleted.
 | Area | Status |
 |---|---|
 | Server and security | HTTP, WebSocket, TLS, loopback/public policy, capabilities, Origin checks, cookies, and protocol limits are implemented. |
-| Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, browser-native high-contrast detection, bounded `MULTI` packet fragmentation, and multiple clients are implemented. |
+| Browser bridge | Bindings, typed arguments and replies, events, deferred replies, JavaScript evaluation, raw data, navigation, high-contrast detection, bounded `MULTI` fragmentation, multiple clients, authenticated keepalive, reconnect, and connection-loss UI are implemented. |
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, Deno/Node.js/Bun script interpretation, logging, and deterministic shutdown are implemented. |
 | Browser integration | Centring, app-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed and deletable managed profile directories, Chromium-family proxy rules, Windows external-browser focus, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
-| Current validation | 2026-09-09 local validation: `zig build test` passes (25 Zig tests passed, 8 platform-gated tests skipped; all 3 bridge tests passed), and `zig build` passes. The focused runtime run passes all 10 tests, including installed Deno, Node.js, and Bun. Real Chromium completed 65,536 calls across ID wrap without losing a deferred reply; live HTTP checks covered `200`, `502`, `503`, and `504`. Cross-target release gates were not rerun in this change. |
+| Current validation | 2026-09-09 local validation: `zig build test` passes (29 Zig tests passed, 8 platform-gated tests skipped; all 11 bridge tests passed), and `zig build` passes. Four focused heartbeat integration scenarios pass without skips. Real Chromium verified scheduled `ping`/`pong`, disconnect rejection without replay, authenticated reconnect, recovery/terminal UI, reload, and clean backend-requested shutdown. Cross-target release gates were not rerun in this change. |
 
-Remaining work includes bridge keepalive and reconnect recovery, runtime
-binding updates, native browser-window controls and geometry, optional native
-WebViews and handles, and the final parity validation gates.
+Remaining work includes runtime binding updates, native browser-window controls
+and geometry, optional native WebViews and handles, and final parity validation.
 The coverage ledger below is the authoritative method-level list.
 
 ## Original Baseline
@@ -343,7 +342,16 @@ implementation detail.
 Call correlation reserves IDs 1–65,535 until completion, send failure, or
 disconnect. Allocation skips outstanding IDs on wrap and rejects only the new
 call when exhausted, instead of overwriting an earlier promise as upstream can.
-Automatic reconnect, keepalive, and connection-loss UI are not yet implemented.
+The bridge retries transport loss after 500ms and reauthenticates each socket,
+with a five-second connection/authentication deadline. Authenticated text
+`ping`/`pong` exchanges run every 20 seconds with a ten-second reply deadline.
+All other client text is rejected, and heartbeat traffic does not disturb
+binary `MULTI` reassembly. Pending calls reject without replay on loss; old
+socket messages and asynchronous evaluation results cannot cross sessions.
+Authentication denial, protocol/policy failures, backend close, and page unload
+stop retries. A nonblocking loss banner is suppressed when the application
+installs its own event callback. Reconnect does not extend `Running.wait()`'s
+1.5-second grace period or survive a changed backend capability.
 
 ### Intentional Zig Replacements
 
@@ -417,14 +425,14 @@ This completes the behavior represented by `webui_set_public()`,
 
 ### Calls, bindings, and browser bridge (partial)
 
-- Implements the public bridge methods listed above; automatic connection
-  recovery and runtime binding updates remain incomplete.
+- Implements the public bridge methods listed above, authenticated keepalive,
+  reconnection, and connection-loss UI. Runtime binding updates remain incomplete.
 - Preserves string, number, boolean, and `Uint8Array` call arguments.
 - Implements bounded `MULTI` fragmentation for large browser-to-Zig calls and
   JavaScript results, including strict length parsing and per-client cleanup.
 
 Typed argument and return methods are implemented. Runtime `webui_bind()`
-updates and `CMD_ADD_ID`, keepalive, reconnect, and connection-loss UI remain.
+updates and `CMD_ADD_ID` remain.
 
 ### Handler and event lifecycle (complete)
 
@@ -550,8 +558,6 @@ zig build -Dtarget=aarch64-macos
 
 Continue capability parity:
 
-1. Add authenticated bridge keepalive, reconnect, and connection-loss UI with
-   deterministic token, event, and pending-call lifecycle handling.
-2. Add synchronized runtime bindings and `CMD_ADD_ID` updates.
-3. Design the optional native WebView boundary required by minimize, maximize,
+1. Add synchronized runtime bindings and `CMD_ADD_ID` updates.
+2. Design the optional native WebView boundary required by minimize, maximize,
    resizable, and minimum-size behavior.

@@ -3,428 +3,146 @@ const test = require("node:test");
 const { readFileSync } = require("node:fs");
 const { runInNewContext } = require("node:vm");
 
-test("bridge handles commands and external script origins", async () => {
-    class WebSocketMock {
-        static instance;
+const source = readFileSync(require.resolve("./bridge.js"), "utf8");
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
+function frame(command, payload = new Uint8Array(), id = 0, token = 7) {
+    const bytes = new Uint8Array(8 + payload.length);
+    const view = new DataView(bytes.buffer);
+    bytes[0] = 0xdd;
+    view.setUint32(1, token, true);
+    view.setUint16(5, id, true);
+    bytes[7] = command;
+    bytes.set(payload, 8);
+    return bytes;
+}
+
+function isolatedCallBridge(options = {}) {
+    let now = 0;
+    let nextTimer = 0;
+    const timers = new Map();
+    const sockets = [];
+    const listeners = new Map();
+    const domListeners = new Map();
+    const navigationListeners = new Map();
+    const banners = [];
+    const outcomes = [];
+    const events = [];
+    const addListener = (target, type, listener) => {
+        if (!target.has(type)) target.set(type, []);
+        target.get(type).push(listener);
+    };
+    class WebSocketMock {
+        static OPEN = 1;
         constructor(url) {
             this.url = url;
-            this.closed = false;
-            this.sent = undefined;
+            this.readyState = 0;
             this.sentPackets = [];
-            this.sendCount = 0;
-            WebSocketMock.instance = this;
-        }
-
-        close() {
-            this.closed = true;
-        }
-
-        send(data) {
-            this.sent = data;
-            this.sentPackets.push(data);
-            this.sendCount += 1;
-        }
-    }
-
-    const encoder = new TextEncoder();
-    const frame = (command, payload = new Uint8Array(), id = 0) => {
-        const bytes = new Uint8Array(8 + payload.length);
-        const view = new DataView(bytes.buffer);
-        bytes[0] = 0xdd;
-        view.setUint16(5, id, true);
-        bytes[7] = command;
-        bytes.set(payload, 8);
-        return bytes;
-    };
-
-    let windowClosed = false;
-    let received;
-    let clickListener;
-    const bridgeEvents = [];
-    const logs = [];
-    const originalLog = console.log;
-    console.log = (...args) => logs.push(args.join(" "));
-    globalThis.WebSocket = WebSocketMock;
-    globalThis.__zigWebuiCapability = "0123456789abcdef0123456789abcdef";
-    globalThis.__zigWebuiEvents = true;
-    globalThis.__zigWebuiDomBindings = false;
-    globalThis.__zigWebuiToken = 7;
-    globalThis.document = {
-        addEventListener(type, listener) {
-            if (type === "click") clickListener = listener;
-        },
-    };
-    globalThis.location = {
-        protocol: "http:",
-        host: "localhost",
-        href: "/",
-    };
-    globalThis.close = () => {
-        windowClosed = true;
-    };
-    globalThis.matchMedia = (query) => ({
-        matches: query === "(forced-colors: active)",
-    });
-    globalThis.receiveRaw = (data) => {
-        received = [...data];
-    };
-
-    try {
-        require("./bridge.js");
-        assert.deepEqual(globalThis.webui.event, {
-            CONNECTED: 0,
-            DISCONNECTED: 1,
-        });
-        globalThis.webui.setEventCallback((event) => bridgeEvents.push(event));
-        assert.throws(
-            () => globalThis.webui.setEventCallback(null),
-            /must be a function/,
-        );
-        assert.equal(globalThis.webui.encode("Zig WebUI"), "WmlnIFdlYlVJ");
-        assert.equal(globalThis.webui.decode("WmlnIFdlYlVJ"), "Zig WebUI");
-        assert.equal(await globalThis.webui.isHighContrast(), true);
-        globalThis.matchMedia = (query) => ({
-            matches: query === "(prefers-contrast: more)",
-        });
-        assert.equal(await globalThis.webui.isHighContrast(), true);
-        globalThis.matchMedia = () => ({ matches: false });
-        assert.equal(await globalThis.webui.isHighContrast(), false);
-        delete globalThis.matchMedia;
-        assert.equal(await globalThis.webui.isHighContrast(), false);
-        globalThis.webui.setLogging(true);
-        const socket = WebSocketMock.instance;
-        assert.equal(
-            socket.url,
-            "ws://localhost/0123456789abcdef0123456789abcdef/_webui_ws_connect",
-        );
-        socket.onopen();
-        assert.equal(
-            new TextDecoder().decode(new Uint8Array(socket.sent).subarray(8)),
-            globalThis.__zigWebuiCapability,
-        );
-        await socket.onmessage({
-            data: frame(0xf5, Uint8Array.of(1)),
-        });
-        await socket.onmessage({
-            data: frame(0xf5, Uint8Array.of(1)),
-        });
-        assert.deepEqual(bridgeEvents, [globalThis.webui.event.CONNECTED]);
-        assert(logs.includes("WebUI -> Log Enabled."));
-        assert(logs.includes("WebUI -> Connected"));
-        const largeArgument = new Uint8Array(65_500).fill(0x61);
-        const sendsBeforeMulti = socket.sentPackets.length;
-        const largeCall = globalThis.webui.call("large", largeArgument);
-        const multiPackets = socket.sentPackets.slice(sendsBeforeMulti);
-        assert.equal(multiPackets.length, 3);
-        const prePacket = new Uint8Array(multiPackets[0]);
-        assert.equal(prePacket[7], 0xf6);
-        assert.equal(prePacket.at(-1), 0);
-        const announcedLength = Number(
-            new TextDecoder().decode(prePacket.subarray(8, prePacket.length - 1)),
-        );
-        const chunks = multiPackets.slice(1).map((data) => new Uint8Array(data));
-        assert.equal(chunks[0].length, 65_500);
-        const rebuilt = new Uint8Array(
-            chunks.reduce((total, chunk) => total + chunk.length, 0),
-        );
-        let rebuiltAt = 0;
-        for (const chunk of chunks) {
-            rebuilt.set(chunk, rebuiltAt);
-            rebuiltAt += chunk.length;
-        }
-        assert.equal(rebuilt.length, announcedLength);
-        assert.equal(rebuilt[7], 0xf9);
-        assert.deepEqual(
-            rebuilt.subarray(
-                rebuilt.length - largeArgument.length - 1,
-                rebuilt.length - 1,
-            ),
-            largeArgument,
-        );
-        const largeCallId = new DataView(rebuilt.buffer).getUint16(5, true);
-        await socket.onmessage({
-            data: frame(0xf9, encoder.encode("large-ok"), largeCallId),
-        });
-        assert.equal(await largeCall, "large-ok");
-
-        const sendsBeforeQuick = socket.sendCount;
-        await socket.onmessage({
-            data: frame(
-                0xfd,
-                encoder.encode("globalThis.quickResult = 42"),
-            ),
-        });
-        assert.equal(globalThis.quickResult, 42);
-        assert.equal(socket.sendCount, sendsBeforeQuick);
-
-        const button = { id: "run" };
-        clickListener({
-            target: {
-                closest(selector) {
-                    return selector === "[id]" ? button : null;
-                },
-            },
-        });
-        let eventPacket = new Uint8Array(socket.sent);
-        assert.equal(eventPacket[7], 0xfc);
-        assert.equal(
-            new TextDecoder().decode(eventPacket.subarray(8)),
-            "run",
-        );
-
-        const anonymous = { id: "" };
-        const sendsBeforeEmptyClick = socket.sendCount;
-        clickListener({
-            target: {
-                closest(selector) {
-                    return selector === "[id]" ? anonymous : null;
-                },
-            },
-        });
-        assert.equal(socket.sendCount, sendsBeforeEmptyClick);
-
-        let prevented = false;
-        const link = { href: "http://localhost/next" };
-        clickListener({
-            target: {
-                closest(selector) {
-                    return selector === "a[href]" ? link : null;
-                },
-            },
-            preventDefault() {
-                prevented = true;
-            },
-        });
-        eventPacket = new Uint8Array(socket.sent);
-        assert.equal(prevented, true);
-        assert.equal(eventPacket[7], 0xfb);
-        assert.equal(
-            new TextDecoder().decode(eventPacket.subarray(8)),
-            link.href,
-        );
-        globalThis.webui.allowNavigation(true);
-        prevented = false;
-        const sendsBeforeAllowedLink = socket.sendCount;
-        clickListener({
-            target: {
-                closest(selector) {
-                    return selector === "a[href]" ? link : null;
-                },
-            },
-            preventDefault() {
-                prevented = true;
-            },
-        });
-        assert.equal(prevented, false);
-        assert.equal(socket.sendCount, sendsBeforeAllowedLink);
-        globalThis.webui.allowNavigation(false);
-
-        await socket.onmessage({
-            data: frame(0xfb, encoder.encode("/next")),
-        });
-        assert.equal(globalThis.location.href, "/next");
-
-        const name = encoder.encode("receiveRaw");
-        const raw = new Uint8Array(name.length + 4);
-        raw.set(name);
-        raw.set([0, 0, 1, 255], name.length);
-        await socket.onmessage({ data: frame(0xf8, raw) });
-        assert.deepEqual(received, [0, 1, 255]);
-
-        await socket.onmessage({ data: frame(0xfa) });
-        assert.equal(socket.closed, true);
-        assert.equal(windowClosed, true);
-        socket.onclose();
-        socket.onclose();
-        assert.deepEqual(bridgeEvents, [
-            globalThis.webui.event.CONNECTED,
-            globalThis.webui.event.DISCONNECTED,
-        ]);
-        assert(logs.includes("WebUI -> Disconnected"));
-        globalThis.webui.setLogging(false);
-        assert(logs.includes("WebUI -> Log Disabled."));
-
-        let navigationListener;
-        globalThis.navigation = {
-            addEventListener(type, listener) {
-                if (type === "navigate") navigationListener = listener;
-            },
-        };
-        globalThis.document.currentScript = {
-            src: "https://bridge.example:9443/capability/webui.js",
-        };
-        delete globalThis.webui;
-        delete require.cache[require.resolve("./bridge.js")];
-        require("./bridge.js");
-        const navigationSocket = WebSocketMock.instance;
-        assert.equal(
-            navigationSocket.url,
-            "wss://bridge.example:9443/0123456789abcdef0123456789abcdef/_webui_ws_connect",
-        );
-        navigationSocket.onopen();
-        await navigationSocket.onmessage({
-            data: frame(0xf5, Uint8Array.of(1)),
-        });
-        prevented = false;
-        navigationListener({
-            cancelable: true,
-            destination: { url: "http://localhost/history" },
-            preventDefault() {
-                prevented = true;
-            },
-        });
-        eventPacket = new Uint8Array(navigationSocket.sent);
-        assert.equal(prevented, true);
-        assert.equal(eventPacket[7], 0xfb);
-        assert.equal(
-            new TextDecoder().decode(eventPacket.subarray(8)),
-            "http://localhost/history",
-        );
-
-        // Backend-initiated navigation must bypass the navigate listener
-        // instead of bouncing back to Zig as a navigation event.
-        await navigationSocket.onmessage({
-            data: frame(0xfb, encoder.encode("http://localhost/backend")),
-        });
-        assert.equal(globalThis.location.href, "http://localhost/backend");
-        prevented = false;
-        const sendsAfterBackendNavigation = navigationSocket.sendCount;
-        navigationListener({
-            cancelable: true,
-            destination: { url: "http://localhost/backend" },
-            preventDefault() {
-                prevented = true;
-            },
-        });
-        assert.equal(prevented, false);
-        assert.equal(
-            navigationSocket.sendCount,
-            sendsAfterBackendNavigation,
-        );
-        globalThis.webui.allowNavigation(false);
-        globalThis.webui.allowNavigation(true);
-        prevented = false;
-        const sendsBeforeAllowedNavigation = navigationSocket.sendCount;
-        navigationListener({
-            cancelable: true,
-            destination: { url: "http://localhost/allowed" },
-            preventDefault() {
-                prevented = true;
-            },
-        });
-        assert.equal(prevented, false);
-        assert.equal(
-            navigationSocket.sendCount,
-            sendsBeforeAllowedNavigation,
-        );
-
-        delete globalThis.navigation;
-        globalThis.__zigWebuiEvents = false;
-        globalThis.__zigWebuiDomBindings = true;
-        clickListener = undefined;
-        delete globalThis.webui;
-        delete require.cache[require.resolve("./bridge.js")];
-        require("./bridge.js");
-        const bindingSocket = WebSocketMock.instance;
-        bindingSocket.onopen();
-        await bindingSocket.onmessage({
-            data: frame(0xf5, Uint8Array.of(1)),
-        });
-        assert.equal(typeof clickListener, "function");
-
-        const dynamicButton = { id: "dynamic-binding" };
-        clickListener({
-            target: {
-                closest(selector) {
-                    return selector === "[id]" ? dynamicButton : null;
-                },
-            },
-        });
-        eventPacket = new Uint8Array(bindingSocket.sent);
-        assert.equal(eventPacket[7], 0xfc);
-        assert.equal(
-            new TextDecoder().decode(eventPacket.subarray(8)),
-            dynamicButton.id,
-        );
-
-        prevented = false;
-        const sendsBeforeLink = bindingSocket.sendCount;
-        clickListener({
-            target: {
-                closest() {
-                    return null;
-                },
-            },
-            preventDefault() {
-                prevented = true;
-            },
-        });
-        assert.equal(prevented, false);
-        assert.equal(bindingSocket.sendCount, sendsBeforeLink);
-    } finally {
-        console.log = originalLog;
-        delete globalThis.WebSocket;
-        delete globalThis.document;
-        delete globalThis.location;
-        delete globalThis.matchMedia;
-        delete globalThis.navigation;
-        delete globalThis.close;
-        delete globalThis.receiveRaw;
-        delete globalThis.quickResult;
-        delete globalThis.webui;
-        delete globalThis.__zigWebuiCapability;
-        delete globalThis.__zigWebuiDomBindings;
-        delete globalThis.__zigWebuiEvents;
-        delete globalThis.__zigWebuiToken;
-    }
-});
-
-function isolatedCallBridge() {
-    let socket;
-    class WebSocketMock {
-        constructor() {
             this.sentIds = [];
             this.sendError = null;
-            socket = this;
+            this.failAt = Infinity;
+            sockets.push(this);
         }
-
+        open() {
+            this.readyState = 1;
+            this.onopen();
+        }
         send(bytes) {
-            if (this.sendError) throw this.sendError;
-            assert.equal(bytes[7], 0xf9);
-            this.sentIds.push(
-                new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-                    .getUint16(5, true),
-            );
+            assert.equal(this.readyState, 1);
+            if (this.sendError || this.sentPackets.length === this.failAt)
+                throw this.sendError || new Error("simulated partial send failure");
+            this.sentPackets.push(bytes);
+            if (typeof bytes !== "string" && bytes[7] === 0xf9)
+                this.sentIds.push(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(5, true));
+        }
+        close() {
+            this.readyState = 3;
+        }
+        lose(code = 1006) {
+            this.readyState = 3;
+            this.onclose({ code });
         }
     }
-
+    const root = {
+        appendChild(element) { banners.push(element); },
+    };
     const context = {
         WebSocket: WebSocketMock,
         TextEncoder,
         TextDecoder,
+        Uint8Array,
         URL,
-        document: {},
+        console: { log() {} },
+        btoa,
+        atob,
+        setTimeout(callback, delay) {
+            const id = ++nextTimer;
+            timers.set(id, { at: now + delay, callback });
+            return id;
+        },
+        clearTimeout(id) { timers.delete(id); },
+        addEventListener(type, listener) { addListener(listeners, type, listener); },
+        document: {
+            currentScript: options.script ? { src: options.script } : null,
+            body: root,
+            documentElement: root,
+            addEventListener(type, listener) { addListener(domListeners, type, listener); },
+            createElement(tag) {
+                assert.equal(tag, "div");
+                return {
+                    style: {},
+                    attributes: {},
+                    setAttribute(name, value) { this.attributes[name] = value; },
+                    set innerHTML(value) { assert.fail("warning must not parse HTML"); },
+                    remove() { banners.splice(banners.indexOf(this), 1); },
+                };
+            },
+        },
         location: { protocol: "http:", host: "localhost", href: "/" },
+        close() { context.windowClosed = true; },
         __zigWebuiCapability: "test-capability",
         __zigWebuiToken: 7,
+        __zigWebuiEvents: options.events ?? false,
+        __zigWebuiDomBindings: options.bindings ?? false,
     };
-    runInNewContext(readFileSync(require.resolve("./bridge.js"), "utf8"), context);
-
-    const outcomes = [];
-    const receive = (command, payload, id = 0) => {
-        const bytes = new Uint8Array(8 + payload.length);
-        bytes[0] = 0xdd;
-        new DataView(bytes.buffer).setUint16(5, id, true);
-        bytes[7] = command;
-        bytes.set(payload, 8);
-        return socket.onmessage({ data: bytes });
+    if (options.navigation) context.navigation = {
+        addEventListener(type, listener) { addListener(navigationListeners, type, listener); },
     };
-    return {
-        socket,
-        outcomes,
-        connect: () => receive(0xf5, Uint8Array.of(1)),
-        reply: (id, value) => receive(0xf9, new TextEncoder().encode(value), id),
+    runInNewContext(source, context);
+    if (options.callback) context.webui.setEventCallback(options.callback);
+    const bridge = {
+        context, sockets, timers, banners, listeners, domListeners, navigationListeners, outcomes, events,
+        get socket() { return sockets.at(-1); },
+        get webui() { return context.webui; },
+        async tick(milliseconds) {
+            const target = now + milliseconds;
+            while (true) {
+                const next = [...timers].filter(([, timer]) => timer.at <= target)
+                    .sort((a, b) => a[1].at - b[1].at || a[0] - b[0])[0];
+                if (!next) break;
+                now = next[1].at;
+                timers.delete(next[0]);
+                next[1].callback();
+                await Promise.resolve();
+            }
+            now = target;
+            await Promise.resolve();
+        },
+        dispatch(type, value = {}) {
+            for (const listener of listeners.get(type) || []) listener(value);
+        },
+        receive(command, payload, id = 0, socket = bridge.socket, token = 7) {
+            return socket.onmessage({ data: frame(command, payload, id, token) });
+        },
+        async connect() {
+            if (bridge.socket.readyState === 3) await bridge.tick(500);
+            bridge.socket.open();
+            await bridge.receive(0xf5, Uint8Array.of(1));
+        },
+        reply(id, value, socket = bridge.socket) {
+            return bridge.receive(0xf9, encoder.encode(value), id, socket);
+        },
         call(...args) {
             const outcome = { status: "pending" };
             outcomes.push(outcome);
@@ -435,20 +153,311 @@ function isolatedCallBridge() {
             return outcome;
         },
         async close() {
-            socket.onclose();
+            bridge.socket.lose();
             await Promise.resolve();
-            assert.equal(
-                outcomes.filter((outcome) => outcome.status === "pending").length,
-                0,
-                "every call must settle after disconnect",
-            );
+            assert.equal(outcomes.filter((outcome) => outcome.status === "pending").length, 0);
         },
     };
+    return bridge;
 }
+
+test("bridge authenticates each replacement and isolates pending calls and stale async results", async () => {
+    const bridge = isolatedCallBridge();
+    bridge.webui.setEventCallback((value) => bridge.events.push(value));
+    const old = bridge.socket;
+    old.open();
+    assert.equal(bridge.webui.isConnected(), false);
+    await assert.rejects(bridge.webui.call("early"));
+    await bridge.receive(0xfd, encoder.encode("globalThis.early = true"));
+    assert.equal(bridge.context.early, undefined);
+    await bridge.receive(0xf5, Uint8Array.of(1));
+    await bridge.receive(0xf5, Uint8Array.of(1));
+    assert.deepEqual(bridge.events, [0]);
+    const pending = bridge.call("pending");
+    let release;
+    bridge.context.delayed = new Promise((resolve) => { release = resolve; });
+    const evaluation = bridge.receive(0xfe, encoder.encode("return await globalThis.delayed"), 91);
+    old.lose();
+    old.onclose({ code: 1006 });
+    await Promise.resolve();
+    assert.equal(pending.status, "rejected");
+    assert.deepEqual(bridge.events, [0, 1]);
+    await bridge.tick(499);
+    assert.equal(bridge.sockets.length, 1);
+    bridge.context.__zigWebuiCapability = "changed";
+    bridge.context.__zigWebuiToken = 99;
+    await bridge.tick(1);
+    const replacement = bridge.socket;
+    replacement.open();
+    assert.equal(replacement.url, old.url);
+    const auth = replacement.sentPackets[0];
+    assert.equal(auth[7], 0xf5);
+    assert.equal(new DataView(auth.buffer).getUint32(1, true), 7);
+    assert.equal(decoder.decode(auth.subarray(8)), "test-capability");
+    await bridge.receive(0xfd, encoder.encode("globalThis.early = true"));
+    assert.equal(bridge.context.early, undefined);
+    await bridge.receive(0xf5, Uint8Array.of(1));
+    assert.deepEqual(bridge.events, [0, 1, 0]);
+    const current = bridge.call("new");
+    const id = replacement.sentIds.at(-1);
+    await bridge.reply(id, "stale", old);
+    assert.equal(current.status, "pending");
+    const sends = replacement.sentPackets.length;
+    release("old result");
+    await evaluation;
+    old.onopen();
+    await bridge.receive(0xfa, undefined, 0, old);
+    assert.equal(replacement.sentPackets.length, sends);
+    assert.equal(bridge.webui.isConnected(), true);
+    await bridge.reply(id, "current");
+    assert.deepEqual(current, { status: "fulfilled", value: "current" });
+    assert.equal(replacement.sentIds.length, 1, "lost calls are never replayed");
+});
+
+test("authentication denial, invalid tokens, protocol policy and backend close stop recovery", async () => {
+    for (const reason of ["denied", "token", "close", 1002, 1003, 1007, 1008, 1009]) {
+        const bridge = isolatedCallBridge();
+        bridge.socket.open();
+        if (reason === "denied") await bridge.receive(0xf5, Uint8Array.of(0));
+        else if (reason === "token") await bridge.receive(0xf5, Uint8Array.of(1), 0, bridge.socket, 99);
+        else {
+            await bridge.receive(0xf5, Uint8Array.of(1));
+            if (reason === "close") await bridge.receive(0xfa);
+            else bridge.socket.lose(reason);
+        }
+        assert.equal(bridge.webui.isConnected(), false);
+        assert.equal(bridge.socket.readyState, 3);
+        assert.equal(bridge.timers.size, 0);
+        assert.equal(bridge.banners.length, reason === "close" ? 0 : 1);
+        if (reason !== "close") assert.equal(bridge.banners[0].attributes.role, "alert");
+        bridge.dispatch("pagehide", { persisted: true });
+        bridge.dispatch("pageshow", { persisted: true });
+        await bridge.tick(60_000);
+        assert.equal(bridge.sockets.length, 1);
+        if (reason === "close") assert.equal(bridge.context.windowClosed, true);
+    }
+});
+
+test("terminal rejection replaces recovery UI and notifies initially disconnected callbacks", async () => {
+    const bridge = isolatedCallBridge();
+    await bridge.connect();
+    bridge.socket.lose();
+    await bridge.tick(1000);
+    assert.equal(bridge.banners[0].attributes.role, "status");
+    bridge.socket.open();
+    await bridge.receive(0xf5, Uint8Array.of(0));
+    assert.equal(bridge.banners.length, 1);
+    assert.equal(bridge.banners[0].attributes.role, "alert");
+    assert.equal(bridge.timers.size, 0);
+
+    const events = [];
+    const custom = isolatedCallBridge({ callback: (event) => events.push(event) });
+    custom.socket.open();
+    await custom.receive(0xf5, Uint8Array.of(0));
+    custom.socket.lose();
+    assert.deepEqual(events, [1]);
+    assert.equal(custom.banners.length, 0);
+});
+
+test("establishment and authentication share a five second deadline and warning", async () => {
+    for (const open of [false, true]) {
+        const bridge = isolatedCallBridge();
+        if (open) bridge.socket.open();
+        await bridge.tick(4999);
+        assert.equal(bridge.banners.length, 0);
+        assert.equal(bridge.socket.readyState, open ? 1 : 0);
+        await bridge.tick(1);
+        assert.equal(bridge.socket.readyState, 3);
+        assert.equal(bridge.banners.length, 1);
+        assert.equal(bridge.banners[0].attributes.role, "status");
+        assert.equal(typeof bridge.banners[0].textContent, "string");
+        await bridge.tick(500);
+        bridge.socket.open();
+        assert.equal(bridge.banners.length, 1);
+        await bridge.receive(0xf5, Uint8Array.of(1));
+        assert.equal(bridge.banners.length, 0);
+        assert.equal(bridge.webui.isConnected(), true);
+    }
+});
+
+test("heartbeat requires pong within ten seconds and cleans old session deadlines", async () => {
+    const bridge = isolatedCallBridge();
+    await bridge.connect();
+    await bridge.tick(19_999);
+    assert.equal(bridge.socket.sentPackets.includes("ping"), false);
+    await bridge.tick(1);
+    assert.equal(bridge.socket.sentPackets.at(-1), "ping");
+    await bridge.tick(9999);
+    await bridge.socket.onmessage({ data: "pong" });
+    await bridge.tick(10_001);
+    assert.equal(bridge.socket.sentPackets.filter((value) => value === "ping").length, 2);
+    const old = bridge.socket;
+    await bridge.tick(10_000);
+    assert.equal(bridge.webui.isConnected(), false);
+    assert.equal(old.readyState, 3);
+    await bridge.tick(500);
+    await bridge.connect();
+    await old.onmessage({ data: "pong" });
+    await bridge.tick(20_000);
+    await bridge.tick(10_000);
+    assert.equal(bridge.webui.isConnected(), false, "old pong cannot satisfy the new session");
+    bridge.dispatch("pagehide");
+    assert.equal(bridge.timers.size, 0);
+});
+
+test("recoverable loss warning waits one second and custom callbacks own connection UI", async () => {
+    const bridge = isolatedCallBridge();
+    await bridge.connect();
+    bridge.socket.lose();
+    await bridge.tick(999);
+    assert.equal(bridge.banners.length, 0);
+    await bridge.tick(1);
+    assert.equal(bridge.banners.length, 1);
+    bridge.socket.open();
+    assert.equal(bridge.banners.length, 1);
+    await bridge.receive(0xf5, Uint8Array.of(1));
+    assert.equal(bridge.banners.length, 0);
+    bridge.socket.lose();
+    await bridge.tick(1000);
+    assert.equal(bridge.banners.length, 1);
+    bridge.webui.setEventCallback((value) => {
+        bridge.events.push(value);
+        throw new Error("callback failure");
+    });
+    assert.equal(bridge.banners.length, 0);
+    bridge.socket.open();
+    await bridge.receive(0xf5, Uint8Array.of(1));
+    await bridge.receive(0xf5, Uint8Array.of(1));
+    bridge.socket.lose();
+    await bridge.tick(1000);
+    assert.equal(bridge.banners.length, 0);
+    assert.deepEqual(bridge.events, [0, 1]);
+    bridge.socket.open();
+    await bridge.receive(0xf5, Uint8Array.of(1));
+    assert.equal(bridge.webui.isConnected(), true);
+    assert.deepEqual(bridge.events, [0, 1, 0]);
+});
+
+test("pagehide stops all work, BFCache resumes once, and same-document navigation remains live", async () => {
+    const bridge = isolatedCallBridge({ events: true, navigation: true });
+    await bridge.connect();
+    await bridge.receive(0xfb, encoder.encode("/#section"));
+    assert.equal(bridge.context.location.href, "/#section");
+    const nav = bridge.navigationListeners.get("navigate")[0];
+    nav({ cancelable: true, destination: { url: "/#section" }, preventDefault() { assert.fail("backend navigation intercepted"); } });
+    assert.equal(bridge.webui.isConnected(), true);
+    await bridge.tick(20_000);
+    assert.equal(bridge.socket.sentPackets.at(-1), "ping");
+    const pending = bridge.call("unloading");
+    const old = bridge.socket;
+    bridge.dispatch("pagehide", { persisted: true });
+    await Promise.resolve();
+    assert.equal(pending.status, "rejected");
+    assert.equal(bridge.timers.size, 0);
+    await bridge.tick(60_000);
+    assert.equal(bridge.sockets.length, 1);
+    bridge.dispatch("pageshow", { persisted: false });
+    assert.equal(bridge.sockets.length, 1);
+    bridge.dispatch("pageshow", { persisted: true });
+    bridge.dispatch("pageshow", { persisted: true });
+    assert.equal(bridge.sockets.length, 2);
+    old.onopen();
+    await bridge.receive(0xf5, Uint8Array.of(1), 0, old);
+    assert.equal(bridge.webui.isConnected(), false);
+    await bridge.connect();
+    assert.equal(bridge.webui.isConnected(), true);
+    assert.equal(bridge.listeners.get("pagehide").length, 1);
+    assert.equal(bridge.listeners.get("pageshow").length, 1);
+    assert.equal(bridge.domListeners.get("click").length, 1);
+    assert.equal(bridge.navigationListeners.get("navigate").length, 1);
+    bridge.dispatch("pagehide");
+    assert.equal(bridge.timers.size, 0);
+});
+
+test("commands, public helpers, external origins and large packets preserve behavior", async () => {
+    const bridge = isolatedCallBridge({ events: true, script: "https://bridge.example:9443/capability/webui.js" });
+    assert.equal(bridge.socket.url, "wss://bridge.example:9443/test-capability/_webui_ws_connect");
+    assert.equal(bridge.webui.encode("Zig WebUI"), "WmlnIFdlYlVJ");
+    assert.equal(bridge.webui.decode("WmlnIFdlYlVJ"), "Zig WebUI");
+    assert.throws(() => bridge.webui.setEventCallback(null));
+    for (const active of ["(forced-colors: active)", "(prefers-contrast: more)"]) {
+        bridge.context.matchMedia = (query) => ({ matches: query === active });
+        assert.equal(await bridge.webui.isHighContrast(), true);
+    }
+    delete bridge.context.matchMedia;
+    assert.equal(await bridge.webui.isHighContrast(), false);
+    bridge.webui.setLogging(true);
+    bridge.webui.setLogging(false);
+    await bridge.connect();
+    const largeArgument = new Uint8Array(65_500).fill(0x61);
+    const before = bridge.socket.sentPackets.length;
+    const large = bridge.webui.call("large", largeArgument);
+    const [pre, ...chunks] = bridge.socket.sentPackets.slice(before);
+    assert.equal(pre[7], 0xf6);
+    assert.equal(chunks[0].length, 65_500);
+    const rebuilt = Buffer.concat(chunks);
+    assert.equal(rebuilt.length, Number(decoder.decode(pre.subarray(8, pre.length - 1))));
+    assert.equal(rebuilt[7], 0xf9);
+    assert.deepEqual(new Uint8Array(rebuilt.subarray(-largeArgument.length - 1, -1)), largeArgument);
+    await bridge.reply(rebuilt.readUInt16LE(5), "large-ok");
+    assert.equal(await large, "large-ok");
+    const sends = bridge.socket.sentPackets.length;
+    await bridge.receive(0xfd, encoder.encode("globalThis.quickResult = 42"));
+    assert.equal(bridge.context.quickResult, 42);
+    assert.equal(bridge.socket.sentPackets.length, sends);
+    await bridge.receive(0xfe, encoder.encode("return 'result'"), 42);
+    let response = bridge.socket.sentPackets.at(-1);
+    assert.equal(response[8], 0);
+    assert.equal(decoder.decode(response.subarray(9, -1)), "result");
+    await bridge.receive(0xfe, encoder.encode("throw new Error('failure')"), 43);
+    response = bridge.socket.sentPackets.at(-1);
+    assert.equal(response[8], 1);
+    let raw;
+    bridge.context.receiveRaw = (data) => { raw = [...data]; };
+    await bridge.receive(0xf8, new Uint8Array([...encoder.encode("receiveRaw"), 0, 0, 1, 255]));
+    assert.deepEqual(raw, [0, 1, 255]);
+    const click = bridge.domListeners.get("click")[0];
+    click({ target: { closest: (selector) => selector === "[id]" ? { id: "run" } : null } });
+    assert.equal(bridge.socket.sentPackets.at(-1)[7], 0xfc);
+    assert.equal(decoder.decode(bridge.socket.sentPackets.at(-1).subarray(8)), "run");
+    let prevented = false;
+    const link = { target: { closest: (selector) => selector === "a[href]" ? { href: "/next" } : null }, preventDefault() { prevented = true; } };
+    click(link);
+    assert.equal(prevented, true);
+    assert.equal(bridge.socket.sentPackets.at(-1)[7], 0xfb);
+    bridge.webui.allowNavigation(true);
+    prevented = false;
+    const allowedSends = bridge.socket.sentPackets.length;
+    click(link);
+    assert.equal(prevented, false);
+    assert.equal(bridge.socket.sentPackets.length, allowedSends);
+    const binding = isolatedCallBridge({ bindings: true });
+    await binding.connect();
+    binding.domListeners.get("click")[0]({ target: { closest: () => ({ id: "dynamic-binding" }) } });
+    assert.equal(decoder.decode(binding.socket.sentPackets.at(-1).subarray(8)), "dynamic-binding");
+});
+
+test("partial MULTI send failure retires transport and rejects every pending call", async () => {
+    const bridge = isolatedCallBridge();
+    await bridge.connect();
+    const old = bridge.socket;
+    const pending = bridge.call("pending");
+    old.failAt = old.sentPackets.length + 2;
+    const failed = bridge.call("large", new Uint8Array(140_000));
+    await Promise.resolve();
+    assert.equal(pending.status, "rejected");
+    assert.equal(failed.status, "rejected");
+    assert.equal(old.readyState, 3);
+    await bridge.connect();
+    assert.equal(bridge.socket.sentPackets.length, 1, "partial packet must never continue on replacement");
+    const recovered = bridge.call("recovered");
+    await bridge.reply(bridge.socket.sentIds.at(-1), "ok");
+    assert.deepEqual(recovered, { status: "fulfilled", value: "ok" });
+});
 
 test("pending call IDs survive wrap, exhaustion, reuse, send failure and disconnect", async () => {
     const bridge = isolatedCallBridge();
-    const { socket } = bridge;
+    let socket = bridge.socket;
     await bridge.connect();
     try {
         const oldest = bridge.call("oldest");
@@ -458,11 +467,7 @@ test("pending call IDs survive wrap, exhaustion, reuse, send failure and disconn
         const wrapped = bridge.call("wrapped");
         assert.equal(socket.sentIds.at(-1), 2);
         assert.equal(oldest.status, "pending");
-        assert.deepEqual(
-            new Set(socket.sentIds.slice(0, 0xffff)),
-            new Set(Array.from({ length: 0xffff }, (_, index) => index + 1)),
-        );
-
+        assert.deepEqual(new Set(socket.sentIds.slice(0, 0xffff)), new Set(Array.from({ length: 0xffff }, (_, index) => index + 1)));
         const sendsAtCapacity = socket.sentIds.length;
         const overflow = bridge.call("overflow");
         await Promise.resolve();
@@ -470,7 +475,6 @@ test("pending call IDs survive wrap, exhaustion, reuse, send failure and disconn
         assert.equal(socket.sentIds.length, sendsAtCapacity);
         assert.equal(oldest.status, "pending");
         assert.equal(wrapped.status, "pending");
-
         await bridge.reply(1, "oldest-response");
         assert.deepEqual(oldest, { status: "fulfilled", value: "oldest-response" });
         const reused = bridge.call("reuse-oldest-slot");
@@ -478,7 +482,6 @@ test("pending call IDs survive wrap, exhaustion, reuse, send failure and disconn
         await bridge.reply(2, "wrapped-response");
         assert.deepEqual(wrapped, { status: "fulfilled", value: "wrapped-response" });
         bridge.call("refill-wrapped-slot");
-
         await bridge.reply(32768, "release-for-send-failure");
         const sendError = new Error("simulated send failure");
         socket.sendError = sendError;
@@ -486,25 +489,21 @@ test("pending call IDs survive wrap, exhaustion, reuse, send failure and disconn
         await Promise.resolve();
         assert.equal(failedSend.status, "rejected");
         assert.equal(failedSend.error, sendError);
-        socket.sendError = null;
-        const afterFailure = bridge.call("after-send-failure");
-        assert.equal(socket.sentIds.at(-1), 32768);
-        await bridge.reply(32768, "send-recovered");
-        assert.deepEqual(afterFailure, { status: "fulfilled", value: "send-recovered" });
-
-        await bridge.close();
         assert.equal(reused.status, "rejected");
-        const sendsBeforeReconnect = socket.sentIds.length;
+        const offline = bridge.call("offline");
+        await Promise.resolve();
+        assert.equal(offline.status, "rejected");
         await bridge.connect();
+        socket = bridge.socket;
         const reconnected = bridge.call("reconnected");
         for (let count = 1; count < 0xffff; count++) bridge.call("refill");
-        assert.equal(socket.sentIds.length - sendsBeforeReconnect, 0xffff);
-        assert.equal(new Set(socket.sentIds.slice(sendsBeforeReconnect)).size, 0xffff);
+        assert.equal(socket.sentIds.length, 0xffff);
+        assert.equal(new Set(socket.sentIds).size, 0xffff);
         const reconnectedOverflow = bridge.call("reconnected-overflow");
         await Promise.resolve();
         assert.equal(reconnectedOverflow.status, "rejected");
-        assert.equal(socket.sentIds.length - sendsBeforeReconnect, 0xffff);
-        await bridge.reply(socket.sentIds[sendsBeforeReconnect], "reconnected-response");
+        assert.equal(socket.sentIds.length, 0xffff);
+        await bridge.reply(socket.sentIds[0], "reconnected-response");
         assert.deepEqual(reconnected, { status: "fulfilled", value: "reconnected-response" });
     } finally {
         await bridge.close();
@@ -513,7 +512,7 @@ test("pending call IDs survive wrap, exhaustion, reuse, send failure and disconn
 
 test("argument conversion can reenter calls at capacity or disconnect without leaking slots", async () => {
     const bridge = isolatedCallBridge();
-    const { socket } = bridge;
+    let socket = bridge.socket;
     await bridge.connect();
     try {
         const oldest = bridge.call("oldest");
@@ -534,13 +533,13 @@ test("argument conversion can reenter calls at capacity or disconnect without le
         assert.deepEqual(nested, { status: "fulfilled", value: "nested-response" });
         await bridge.reply(1, "oldest-response");
         assert.deepEqual(oldest, { status: "fulfilled", value: "oldest-response" });
-
         await bridge.close();
         await bridge.connect();
+        socket = bridge.socket;
         const sendsBeforeDisconnect = socket.sentIds.length;
         const disconnected = bridge.call("disconnect-during-conversion", {
             toString() {
-                socket.onclose();
+                socket.lose();
                 return "argument";
             },
         });

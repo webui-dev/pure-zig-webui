@@ -24,55 +24,166 @@
     let allowNavigation = !globalThis.__zigWebuiEvents;
     let eventCallback = null;
     let lastEvent = -1;
+    let socket = null;
+    let stopped = false;
+    let suspended = false;
+    let retryTimer;
+    let handshakeTimer;
+    let heartbeatTimer;
+    let pongTimer;
+    let warningTimer;
+    let warning = null;
+    const token = globalThis.__zigWebuiToken;
+    const capability = globalThis.__zigWebuiCapability;
 
     const bridgeSource = document.currentScript?.src
         ? new URL(document.currentScript.src)
         : new URL(location.href, `${location.protocol}//${location.host}`);
-    const socket = new WebSocket(
-        `${bridgeSource.protocol === "https:" ? "wss" : "ws"}://${bridgeSource.host}/${globalThis.__zigWebuiCapability}/_webui_ws_connect`,
-    );
-    socket.binaryType = "arraybuffer";
+    const socketUrl = `${bridgeSource.protocol === "https:" ? "wss" : "ws"}://${bridgeSource.host}/${capability}/_webui_ws_connect`;
 
     function packet(command, id, payload = new Uint8Array()) {
         const bytes = new Uint8Array(8 + payload.length);
         const view = new DataView(bytes.buffer);
         bytes[0] = signature;
-        view.setUint32(1, globalThis.__zigWebuiToken, true);
+        view.setUint32(1, token, true);
         view.setUint16(5, id, true);
         bytes[7] = command;
         bytes.set(payload, 8);
         return bytes;
     }
 
-    function sendData(bytes) {
-        if (bytes.length < multiChunkSize) {
-            socket.send(bytes);
-            return;
+    function sendData(connection, bytes) {
+        try {
+            if (connection !== socket || connection.readyState !== WebSocket.OPEN)
+                throw new Error("WebUI is not connected");
+            if (bytes.length < multiChunkSize) {
+                connection.send(bytes);
+                return;
+            }
+            const length = encoder.encode(`${bytes.length}\0`);
+            const prePacket = new Uint8Array(8 + length.length);
+            prePacket[0] = signature;
+            prePacket[7] = commandMulti;
+            prePacket.set(length, 8);
+            connection.send(prePacket);
+            for (let offset = 0; offset < bytes.length; offset += multiChunkSize) {
+                if (connection !== socket || connection.readyState !== WebSocket.OPEN)
+                    throw new Error("WebUI connection closed");
+                connection.send(bytes.subarray(offset, offset + multiChunkSize));
+            }
+        } catch (error) {
+            retire(connection, error);
+            throw error;
         }
-        const length = encoder.encode(`${bytes.length}\0`);
-        const prePacket = new Uint8Array(8 + length.length);
-        prePacket[0] = signature;
-        prePacket[7] = commandMulti;
-        prePacket.set(length, 8);
-        socket.send(prePacket);
-        for (let offset = 0; offset < bytes.length; offset += multiChunkSize)
-            socket.send(bytes.subarray(offset, offset + multiChunkSize));
     }
 
     function sendEvent(command, value) {
-        if (connected)
-            sendData(packet(command, 0, encoder.encode(value)));
+        if (!connected) return;
+        const connection = socket;
+        try {
+            sendData(connection, packet(command, 0, encoder.encode(value)));
+        } catch {}
     }
 
     function log(message) {
         if (logging) console.log(`WebUI -> ${message}`);
     }
 
-    function emitEvent(value) {
-        if (eventCallback && value !== lastEvent) {
-            lastEvent = value;
-            eventCallback(value);
+    function setConnected(value) {
+        const changed = connected !== value;
+        connected = value;
+        if (changed) log(value ? "Connected" : "Disconnected");
+        const kind = value ? event.CONNECTED : event.DISCONNECTED;
+        if (!eventCallback || lastEvent === kind) return;
+        lastEvent = kind;
+        try {
+            eventCallback(kind);
+        } catch {
+            log("Event callback failed");
         }
+    }
+
+    function removeWarning() {
+        clearTimeout(warningTimer);
+        warningTimer = undefined;
+        warning?.remove();
+        warning = null;
+    }
+
+    function showWarning() {
+        if (connected || suspended || eventCallback) return;
+        if (!warning) {
+            warning = document.createElement("div");
+            warning.style.cssText = "position:fixed;bottom:0;left:0;right:0;z-index:2147483647;padding:10px 16px;background:#252525;color:#fff;font:14px system-ui,sans-serif;pointer-events:none";
+            (document.body || document.documentElement).appendChild(warning);
+        }
+        warning.setAttribute("role", stopped ? "alert" : "status");
+        warning.setAttribute("aria-live", stopped ? "assertive" : "polite");
+        warning.textContent = stopped
+            ? "Connection to the application was rejected. Reload the page to reconnect."
+            : "Connection to the application was lost. Reconnecting…";
+    }
+
+    function scheduleWarning(delay) {
+        if (warningTimer !== undefined || warning || eventCallback) return;
+        warningTimer = setTimeout(() => {
+            warningTimer = undefined;
+            showWarning();
+        }, delay);
+    }
+
+    function clearSessionTimers() {
+        clearTimeout(handshakeTimer);
+        clearTimeout(heartbeatTimer);
+        clearTimeout(pongTimer);
+        handshakeTimer = heartbeatTimer = pongTimer = undefined;
+    }
+
+    function retire(connection, error = new Error("WebUI connection closed")) {
+        if (!connection || connection !== socket) return;
+        socket = null;
+        clearSessionTimers();
+        for (const promise of pending.values()) promise.reject(error);
+        pending.clear();
+        if (!stopped && !suspended) {
+            scheduleWarning(connected ? 1000 : 5000);
+            retryTimer = setTimeout(() => {
+                retryTimer = undefined;
+                connect();
+            }, 500);
+        }
+        try { connection.close(); } catch {}
+        setConnected(false);
+    }
+
+    function stop(permanent) {
+        if (permanent) stopped = true;
+        else suspended = true;
+        clearTimeout(retryTimer);
+        retryTimer = undefined;
+        removeWarning();
+        retire(socket);
+    }
+
+    function rejectConnection() {
+        stop(true);
+        showWarning();
+    }
+
+    function heartbeat(connection) {
+        heartbeatTimer = setTimeout(() => {
+            if (connection !== socket || !connected) return;
+            try {
+                if (connection.readyState !== WebSocket.OPEN)
+                    throw new Error("WebUI connection closed");
+                connection.send("ping");
+            } catch (error) {
+                retire(connection, error);
+                return;
+            }
+            pongTimer = setTimeout(() => retire(connection), 10_000);
+            heartbeat(connection);
+        }, 20_000);
     }
 
     // ponytail: Zig filters IDs to avoid injecting names; send a filtered
@@ -102,30 +213,69 @@
         });
     }
 
-    socket.onopen = () => {
-        log("Connected");
-        sendData(
-            packet(commandCheckToken, 0, encoder.encode(globalThis.__zigWebuiCapability)),
-        );
-    };
-    socket.onclose = () => {
-        connected = false;
-        log("Disconnected");
-        for (const promise of pending.values())
-            promise.reject(new Error("WebUI connection closed"));
-        pending.clear();
-        emitEvent(event.DISCONNECTED);
-    };
-    socket.onmessage = async ({ data }) => {
+    function connect() {
+        if (stopped || suspended || socket) return;
+        let connection;
+        try {
+            connection = new WebSocket(socketUrl);
+        } catch {
+            retryTimer = setTimeout(() => {
+                retryTimer = undefined;
+                connect();
+            }, 500);
+            return;
+        }
+        socket = connection;
+        connection.binaryType = "arraybuffer";
+        handshakeTimer = setTimeout(() => retire(connection), 5000);
+        connection.onopen = () => {
+            if (connection !== socket) return;
+            try {
+                sendData(connection, packet(commandCheckToken, 0, encoder.encode(capability)));
+            } catch {}
+        };
+        // WebSocket errors are followed by close; only close carries the
+        // policy/protocol code that decides whether reconnecting is allowed.
+        connection.onclose = ({ code } = {}) => {
+            if (connection !== socket) return;
+            if ([1002, 1003, 1007, 1008, 1009].includes(code)) rejectConnection();
+            else retire(connection);
+        };
+        connection.onmessage = ({ data }) => receive(connection, data);
+    }
+
+    async function receive(connection, data) {
+        if (connection !== socket || connection.readyState !== WebSocket.OPEN) return;
+        if (typeof data === "string") {
+            if (connected && data === "pong") {
+                clearTimeout(pongTimer);
+                pongTimer = undefined;
+            }
+            return;
+        }
         const bytes = new Uint8Array(data);
         if (bytes.length < 8 || bytes[0] !== signature) return;
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-        const id = view.getUint16(5, true);
-        if (bytes[7] === commandCheckToken) {
-            connected = bytes.length > 8 && bytes[8] === 1;
-            if (connected) emitEvent(event.CONNECTED);
+        if (view.getUint32(1, true) !== token) {
+            rejectConnection();
             return;
         }
+        const id = view.getUint16(5, true);
+        if (bytes[7] === commandCheckToken) {
+            if (bytes.length <= 8 || bytes[8] !== 1) {
+                rejectConnection();
+                return;
+            }
+            if (!connected) {
+                clearTimeout(handshakeTimer);
+                handshakeTimer = undefined;
+                removeWarning();
+                heartbeat(connection);
+                setConnected(true);
+            }
+            return;
+        }
+        if (!connected) return;
         if (bytes[7] === commandJs || bytes[7] === commandJsQuick) {
             let failed = 0;
             let value;
@@ -141,11 +291,13 @@
                     error instanceof Error ? error.message : String(error),
                 );
             }
-            if (bytes[7] === commandJsQuick) return;
+            if (bytes[7] === commandJsQuick || connection !== socket || !connected) return;
             const response = new Uint8Array(value.length + 2);
             response[0] = failed;
             response.set(value, 1);
-            sendData(packet(commandJs, id, response));
+            try {
+                sendData(connection, packet(commandJs, id, response));
+            } catch {}
             return;
         }
         if (bytes[7] === commandNavigation) {
@@ -157,7 +309,7 @@
             return;
         }
         if (bytes[7] === commandClose) {
-            socket.close();
+            stop(true);
             globalThis.close();
             return;
         }
@@ -177,13 +329,22 @@
                 promise.resolve(decoder.decode(bytes.subarray(8)));
             }
         }
-    };
+    }
+
+    globalThis.addEventListener("pagehide", () => stop(false));
+    globalThis.addEventListener("pageshow", ({ persisted }) => {
+        if (!persisted || stopped || !suspended) return;
+        suspended = false;
+        scheduleWarning(5000);
+        connect();
+    });
 
     globalThis.webui = {
         event,
         isConnected: () => connected,
         call(name, ...args) {
             if (!connected) return Promise.reject(new Error("WebUI is not connected"));
+            const connection = socket;
             log(`Calling [${name}(...)]`);
             const values = args.map((arg) =>
                 arg instanceof Uint8Array ? arg : encoder.encode(String(arg)),
@@ -207,7 +368,8 @@
 
             // Serialization can invoke user code, so check capacity and choose
             // an ID only after any reentrant calls have reserved their slots.
-            if (!connected) return Promise.reject(new Error("WebUI is not connected"));
+            if (!connected || connection !== socket)
+                return Promise.reject(new Error("WebUI is not connected"));
             if (pending.size === 0xffff)
                 return Promise.reject(new Error("WebUI has too many pending calls"));
             while (pending.has(nextId))
@@ -217,7 +379,7 @@
             return new Promise((resolve, reject) => {
                 pending.set(id, { resolve, reject });
                 try {
-                    sendData(packet(commandCall, id, payload));
+                    sendData(connection, packet(commandCall, id, payload));
                 } catch (error) {
                     pending.delete(id);
                     reject(error);
@@ -238,6 +400,7 @@
             if (typeof callback !== "function")
                 throw new TypeError("Event callback must be a function");
             eventCallback = callback;
+            removeWarning();
         },
         async isHighContrast() {
             if (globalThis.matchMedia?.("(forced-colors: active)").matches)
@@ -248,4 +411,7 @@
             allowNavigation = Boolean(status);
         },
     };
+
+    scheduleWarning(5000);
+    connect();
 })();

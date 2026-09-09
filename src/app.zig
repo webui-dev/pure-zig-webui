@@ -2965,12 +2965,20 @@ fn onMessage(
     message: Linsang.websocket.Message,
     user_data: ?*anyopaque,
 ) void {
+    const app = appFrom(user_data);
+    const authenticated = app.windowForConnection(connection);
+    if (message.opcode == .text and std.mem.eql(u8, message.data, "ping")) {
+        if (authenticated == null) {
+            connection.wsClose(.policy_violation, "");
+            return;
+        }
+        connection.sendText("pong") catch {};
+        return;
+    }
     if (message.opcode != .binary) {
         connection.wsClose(.unsupported_data, "");
         return;
     }
-    const app = appFrom(user_data);
-    const authenticated = app.windowForConnection(connection);
     var owned_message: ?[]u8 = null;
     defer if (owned_message) |bytes| app.gpa.free(bytes);
     const incoming_data: []const u8 = if (authenticated) |window|
@@ -3865,10 +3873,19 @@ fn sendClientFrame(
     io: std.Io,
     payload: []const u8,
 ) !void {
+    return sendClientFrameOpcode(stream, io, .binary, payload);
+}
+
+fn sendClientFrameOpcode(
+    stream: std.Io.net.Stream,
+    io: std.Io,
+    opcode: Linsang.websocket.Opcode,
+    payload: []const u8,
+) !void {
     if (payload.len > std.math.maxInt(u16)) return error.TestPayloadTooLarge;
     var frame: [std.math.maxInt(u16) + 8]u8 = undefined;
     const mask = [4]u8{ 1, 2, 3, 4 };
-    frame[0] = 0x82;
+    frame[0] = 0x80 | @as(u8, @intFromEnum(opcode));
     const payload_at: usize = if (payload.len <= 125) blk: {
         frame[1] = 0x80 | @as(u8, @intCast(payload.len));
         @memcpy(frame[2..6], &mask);
@@ -3889,9 +3906,19 @@ fn readServerFrame(
     io: std.Io,
     buffer: []u8,
 ) ![]u8 {
+    return readServerFrameOpcode(stream, io, .binary, buffer);
+}
+
+fn readServerFrameOpcode(
+    stream: std.Io.net.Stream,
+    io: std.Io,
+    opcode: Linsang.websocket.Opcode,
+    buffer: []u8,
+) ![]u8 {
     var header: [2]u8 = undefined;
     try readExact(stream, io, &header);
-    if (header[0] != 0x82 or header[1] >= 126 or header[1] > buffer.len)
+    if (header[0] != (0x80 | @as(u8, @intFromEnum(opcode))) or
+        header[1] >= 126 or header[1] > buffer.len)
         return error.InvalidServerFrame;
     try readExact(stream, io, buffer[0..header[1]]);
     return buffer[0..header[1]];
@@ -4039,6 +4066,151 @@ fn readTestFileEventually(
         return data;
     }
     return error.Timeout;
+}
+
+const HeartbeatTest = enum {
+    authenticated,
+    unauthenticated,
+    unsupported,
+    multi,
+};
+
+fn exerciseHeartbeat(io: std.Io, scenario: HeartbeatTest) anyerror!void {
+    const gpa = std.testing.allocator;
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{
+        .content = .{ .html = "heartbeat test" },
+    });
+    var called_client_id: std.atomic.Value(u64) = .init(0);
+    try window.bind("greet", integrationHandler, &called_client_id);
+    var running = try app.start(io);
+    defer running.stop() catch {};
+
+    const texts: []const []const u8 = if (scenario == .unsupported)
+        &.{ "", "Ping", "ping\x00", "ping ", "pong" }
+    else
+        &.{"ping"};
+    for (texts) |text| {
+        const client = try connectTestWebSocket(
+            running.inner.address,
+            io,
+            &window.state.capability,
+        );
+        defer client.close(io);
+        var response: [125]u8 = undefined;
+        if (scenario != .unauthenticated) {
+            try std.testing.expect(try authenticateTestClient(
+                client,
+                io,
+                gpa,
+                window.state.token,
+                &window.state.capability,
+                &response,
+            ));
+        }
+
+        var packet: std.ArrayList(u8) = .empty;
+        defer packet.deinit(gpa);
+        if (scenario == .authenticated or scenario == .multi) {
+            try protocol.append(&packet, gpa, .{
+                .token = window.state.token,
+                .id = 9,
+                .command = .call,
+            }, "greet\x003\x00Zig\x00");
+        }
+        const split = protocol.header_len + 2;
+        if (scenario == .multi) {
+            var pre_packet: std.ArrayList(u8) = .empty;
+            defer pre_packet.deinit(gpa);
+            var length_buffer: [32]u8 = undefined;
+            try protocol.append(&pre_packet, gpa, .{
+                .token = 0,
+                .command = .multi,
+            }, try std.fmt.bufPrint(
+                &length_buffer,
+                "{d}\x00",
+                .{packet.items.len},
+            ));
+            try sendClientFrame(client, io, pre_packet.items);
+            try sendClientFrame(client, io, packet.items[0..split]);
+        }
+
+        try sendClientFrameOpcode(client, io, .text, text);
+        if (scenario == .unauthenticated or scenario == .unsupported) {
+            const closed = try readServerFrameOpcode(client, io, .close, &response);
+            try std.testing.expect(closed.len >= 2);
+            try std.testing.expectEqual(
+                @as(u16, if (scenario == .unauthenticated) 1008 else 1003),
+                std.mem.readInt(u16, closed[0..2], .big),
+            );
+            // The server drops the client before closing its TCP stream.
+            var end: [1]u8 = undefined;
+            try std.testing.expectError(error.EndOfStream, readExact(client, io, &end));
+            continue;
+        }
+        try std.testing.expectEqualStrings(
+            "pong",
+            try readServerFrameOpcode(client, io, .text, &response),
+        );
+        try sendClientFrame(
+            client,
+            io,
+            if (scenario == .multi) packet.items[split..] else packet.items,
+        );
+        const reply = try protocol.decode(try readServerFrame(client, io, &response));
+        try std.testing.expectEqual(protocol.Command.call, reply.header.command);
+        try std.testing.expectEqual(@as(u16, 9), reply.header.id);
+        try std.testing.expectEqualStrings("Hello from Zig", reply.payload);
+        try client.shutdown(io, .both);
+    }
+    try running.stop();
+}
+
+fn runHeartbeatTest(scenario: HeartbeatTest) !void {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos)
+        return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{
+        .async_limit = .unlimited,
+        .environ = std.testing.environ,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Result = union(enum) {
+        completed: anyerror!void,
+        timeout: std.Io.Cancelable!void,
+    };
+    var results: [2]Result = undefined;
+    var select = std.Io.Select(Result).init(io, &results);
+    defer select.cancelDiscard();
+    try select.concurrent(.timeout, std.Io.sleep, .{
+        io, std.Io.Duration.fromSeconds(5), .awake,
+    });
+    try select.concurrent(.completed, exerciseHeartbeat, .{ io, scenario });
+    switch (try select.await()) {
+        .completed => |result| try result,
+        .timeout => |result| {
+            try result;
+            return error.Timeout;
+        },
+    }
+}
+
+test "authenticated text heartbeat preserves binding calls" {
+    try runHeartbeatTest(.authenticated);
+}
+
+test "unauthenticated text heartbeat closes with policy violation" {
+    try runHeartbeatTest(.unauthenticated);
+}
+
+test "non-heartbeat text closes with unsupported data" {
+    try runHeartbeatTest(.unsupported);
+}
+
+test "text heartbeat preserves incomplete binary MULTI calls" {
+    try runHeartbeatTest(.multi);
 }
 
 test "runtime geometry persists for current and future clients" {

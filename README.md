@@ -133,6 +133,8 @@ or `Client.close()` ends it as soon as the last client disconnects, while any
 other disconnect — a page reload, a navigation, a closed browser window —
 gets a 1.5-second reconnect grace period first, so reloads and
 `Window.setContent()` do not stop the application.
+Bridge retries do not extend this grace period or restart a stopped backend.
+Longer outages can recover only while the application keeps its server running.
 
 `Window.open()` discovers the best installed browser and launches it as a
 standalone app window, exactly like `Window.openWithBrowser()` with that
@@ -308,6 +310,30 @@ before `App.deinit()`.
 The browser-side `webui` object also provides connection events, runtime
 logging, Base64 helpers, navigation control, and native high-contrast media
 query detection.
+
+The bridge retries lost transports after 500ms and authenticates every new
+connection before enabling calls. Connection establishment and authentication
+have a five-second deadline. Authenticated connections send text `ping` every
+20 seconds and require `pong` within 10 seconds; missing replies trigger
+reconnection. The server accepts only this exact authenticated text heartbeat,
+not arbitrary text messages.
+
+Disconnects reject outstanding `webui.call()` promises; they are never replayed,
+because a binding may already have produced side effects. Results from
+JavaScript evaluations started on an old connection cannot reach a replacement
+connection. Authentication rejection and protocol/policy failures stop retries,
+as do backend close commands and page unloads. Returning from the browser's
+back-forward cache reconnects unless the bridge was permanently stopped.
+
+A nonblocking status banner appears after a connection loss persists for one
+second, or an initial connection fails to authenticate within five seconds.
+Opening a replacement socket does not remove it; successful authentication does.
+Authentication or protocol/policy rejection displays a terminal error instead
+of claiming to retry. Backend close and page unload remove bridge-owned UI.
+Installing `webui.setEventCallback()` suppresses the default banner so the
+application can own its connection UI. The callback receives the initial failed
+attempt and subsequent connected/disconnected transitions without duplicate
+notifications; callback exceptions do not interrupt recovery.
 
 `webui.call()` reserves a nonzero 16-bit request ID until its response arrives,
 the send fails, or the connection closes. Allocation skips pending IDs when
