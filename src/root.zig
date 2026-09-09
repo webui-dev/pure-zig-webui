@@ -37,9 +37,12 @@ pub const managedProfileDirectory = @import("browser.zig").managedProfileDirecto
 pub const deleteManagedProfile = @import("browser.zig").deleteManagedProfile;
 pub const deleteAllManagedProfiles = @import("browser.zig").deleteAllManagedProfiles;
 pub const protocol = @import("protocol.zig");
+/// Optional platform WebViews; using them requires the platform GUI libraries.
+pub const native = @import("native.zig");
 
 test {
     _ = @import("app.zig");
     _ = @import("browser.zig");
     _ = protocol;
+    _ = native;
 }
