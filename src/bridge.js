@@ -205,7 +205,15 @@
                 at += value.length + 1;
             }
 
-            const id = nextId++ & 0xffff || nextId++ & 0xffff;
+            // Serialization can invoke user code, so check capacity and choose
+            // an ID only after any reentrant calls have reserved their slots.
+            if (!connected) return Promise.reject(new Error("WebUI is not connected"));
+            if (pending.size === 0xffff)
+                return Promise.reject(new Error("WebUI has too many pending calls"));
+            while (pending.has(nextId))
+                nextId = nextId === 0xffff ? 1 : nextId + 1;
+            const id = nextId;
+            nextId = nextId === 0xffff ? 1 : nextId + 1;
             return new Promise((resolve, reject) => {
                 pending.set(id, { resolve, reject });
                 try {

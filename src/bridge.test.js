@@ -1,5 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
+const { readFileSync } = require("node:fs");
+const { runInNewContext } = require("node:vm");
 
 test("bridge handles commands and external script origins", async () => {
     class WebSocketMock {
@@ -375,5 +377,177 @@ test("bridge handles commands and external script origins", async () => {
         delete globalThis.__zigWebuiDomBindings;
         delete globalThis.__zigWebuiEvents;
         delete globalThis.__zigWebuiToken;
+    }
+});
+
+function isolatedCallBridge() {
+    let socket;
+    class WebSocketMock {
+        constructor() {
+            this.sentIds = [];
+            this.sendError = null;
+            socket = this;
+        }
+
+        send(bytes) {
+            if (this.sendError) throw this.sendError;
+            assert.equal(bytes[7], 0xf9);
+            this.sentIds.push(
+                new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+                    .getUint16(5, true),
+            );
+        }
+    }
+
+    const context = {
+        WebSocket: WebSocketMock,
+        TextEncoder,
+        TextDecoder,
+        URL,
+        document: {},
+        location: { protocol: "http:", host: "localhost", href: "/" },
+        __zigWebuiCapability: "test-capability",
+        __zigWebuiToken: 7,
+    };
+    runInNewContext(readFileSync(require.resolve("./bridge.js"), "utf8"), context);
+
+    const outcomes = [];
+    const receive = (command, payload, id = 0) => {
+        const bytes = new Uint8Array(8 + payload.length);
+        bytes[0] = 0xdd;
+        new DataView(bytes.buffer).setUint16(5, id, true);
+        bytes[7] = command;
+        bytes.set(payload, 8);
+        return socket.onmessage({ data: bytes });
+    };
+    return {
+        socket,
+        outcomes,
+        connect: () => receive(0xf5, Uint8Array.of(1)),
+        reply: (id, value) => receive(0xf9, new TextEncoder().encode(value), id),
+        call(...args) {
+            const outcome = { status: "pending" };
+            outcomes.push(outcome);
+            context.webui.call(...args).then(
+                (value) => Object.assign(outcome, { status: "fulfilled", value }),
+                (error) => Object.assign(outcome, { status: "rejected", error }),
+            );
+            return outcome;
+        },
+        async close() {
+            socket.onclose();
+            await Promise.resolve();
+            assert.equal(
+                outcomes.filter((outcome) => outcome.status === "pending").length,
+                0,
+                "every call must settle after disconnect",
+            );
+        },
+    };
+}
+
+test("pending call IDs survive wrap, exhaustion, reuse, send failure and disconnect", async () => {
+    const bridge = isolatedCallBridge();
+    const { socket } = bridge;
+    await bridge.connect();
+    try {
+        const oldest = bridge.call("oldest");
+        for (let id = 2; id < 0xffff; id++) bridge.call("pending");
+        await bridge.reply(2, "released-before-wrap");
+        bridge.call("last-before-wrap");
+        const wrapped = bridge.call("wrapped");
+        assert.equal(socket.sentIds.at(-1), 2);
+        assert.equal(oldest.status, "pending");
+        assert.deepEqual(
+            new Set(socket.sentIds.slice(0, 0xffff)),
+            new Set(Array.from({ length: 0xffff }, (_, index) => index + 1)),
+        );
+
+        const sendsAtCapacity = socket.sentIds.length;
+        const overflow = bridge.call("overflow");
+        await Promise.resolve();
+        assert.equal(overflow.status, "rejected");
+        assert.equal(socket.sentIds.length, sendsAtCapacity);
+        assert.equal(oldest.status, "pending");
+        assert.equal(wrapped.status, "pending");
+
+        await bridge.reply(1, "oldest-response");
+        assert.deepEqual(oldest, { status: "fulfilled", value: "oldest-response" });
+        const reused = bridge.call("reuse-oldest-slot");
+        assert.equal(socket.sentIds.at(-1), 1);
+        await bridge.reply(2, "wrapped-response");
+        assert.deepEqual(wrapped, { status: "fulfilled", value: "wrapped-response" });
+        bridge.call("refill-wrapped-slot");
+
+        await bridge.reply(32768, "release-for-send-failure");
+        const sendError = new Error("simulated send failure");
+        socket.sendError = sendError;
+        const failedSend = bridge.call("failed-send");
+        await Promise.resolve();
+        assert.equal(failedSend.status, "rejected");
+        assert.equal(failedSend.error, sendError);
+        socket.sendError = null;
+        const afterFailure = bridge.call("after-send-failure");
+        assert.equal(socket.sentIds.at(-1), 32768);
+        await bridge.reply(32768, "send-recovered");
+        assert.deepEqual(afterFailure, { status: "fulfilled", value: "send-recovered" });
+
+        await bridge.close();
+        assert.equal(reused.status, "rejected");
+        const sendsBeforeReconnect = socket.sentIds.length;
+        await bridge.connect();
+        const reconnected = bridge.call("reconnected");
+        for (let count = 1; count < 0xffff; count++) bridge.call("refill");
+        assert.equal(socket.sentIds.length - sendsBeforeReconnect, 0xffff);
+        assert.equal(new Set(socket.sentIds.slice(sendsBeforeReconnect)).size, 0xffff);
+        const reconnectedOverflow = bridge.call("reconnected-overflow");
+        await Promise.resolve();
+        assert.equal(reconnectedOverflow.status, "rejected");
+        assert.equal(socket.sentIds.length - sendsBeforeReconnect, 0xffff);
+        await bridge.reply(socket.sentIds[sendsBeforeReconnect], "reconnected-response");
+        assert.deepEqual(reconnected, { status: "fulfilled", value: "reconnected-response" });
+    } finally {
+        await bridge.close();
+    }
+});
+
+test("argument conversion can reenter calls at capacity or disconnect without leaking slots", async () => {
+    const bridge = isolatedCallBridge();
+    const { socket } = bridge;
+    await bridge.connect();
+    try {
+        const oldest = bridge.call("oldest");
+        for (let count = 1; count < 0xfffe; count++) bridge.call("pending");
+        let nested;
+        const outer = bridge.call("outer", {
+            toString() {
+                nested = bridge.call("nested");
+                return "argument";
+            },
+        });
+        await Promise.resolve();
+        assert.equal(outer.status, "rejected");
+        assert.equal(nested.status, "pending");
+        assert.equal(socket.sentIds.length, 0xffff);
+        assert.equal(new Set(socket.sentIds).size, 0xffff);
+        await bridge.reply(socket.sentIds.at(-1), "nested-response");
+        assert.deepEqual(nested, { status: "fulfilled", value: "nested-response" });
+        await bridge.reply(1, "oldest-response");
+        assert.deepEqual(oldest, { status: "fulfilled", value: "oldest-response" });
+
+        await bridge.close();
+        await bridge.connect();
+        const sendsBeforeDisconnect = socket.sentIds.length;
+        const disconnected = bridge.call("disconnect-during-conversion", {
+            toString() {
+                socket.onclose();
+                return "argument";
+            },
+        });
+        await Promise.resolve();
+        assert.equal(disconnected.status, "rejected");
+        assert.equal(socket.sentIds.length, sendsBeforeDisconnect);
+    } finally {
+        await bridge.close();
     }
 });
