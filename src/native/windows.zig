@@ -244,6 +244,7 @@ pub const Backend = struct {
     com_initialized: bool = false,
     instance: ?*anyopaque = null,
     class_atom: u16 = 0,
+    class_name: ?[:0]u16 = null,
     hwnd: ?HWND = null,
     controller: ?*Com = null,
     webview: ?*Com = null,
@@ -299,7 +300,7 @@ pub const Backend = struct {
         var class_buffer: [64]u8 = undefined;
         const class_name = try std.fmt.bufPrint(&class_buffer, "PureZigWebUI-{x}", .{@intFromPtr(self)});
         const class_wide = try std.unicode.utf8ToUtf16LeAllocZ(gpa, class_name);
-        defer gpa.free(class_wide);
+        self.class_name = class_wide;
         const wc: WNDCLASSEXW = .{
             .wnd_proc = windowProc,
             .instance = self.instance,
@@ -313,7 +314,7 @@ pub const Backend = struct {
         defer gpa.free(title);
         const outer = try self.outerSize(options.size);
         const initial = options.position orelse types.Position{ .x = std.math.minInt(i32), .y = std.math.minInt(i32) };
-        self.hwnd = CreateWindowExW(if (options.transparent) 0x00200000 else 0, @ptrFromInt(self.class_atom), title.ptr, self.style(), initial.x, initial.y, outer.x, outer.y, null, null, self.instance, self) orelse return error.NativeWindowCreationFailed;
+        self.hwnd = CreateWindowExW(if (options.transparent) 0x00200000 else 0, class_wide.ptr, title.ptr, self.style(), initial.x, initial.y, outer.x, outer.y, null, null, self.instance, self) orelse return error.NativeWindowCreationFailed;
         const profile = if (options.profile_directory) |path| try std.unicode.utf8ToUtf16LeAllocZ(gpa, path) else null;
         defer if (profile) |path| gpa.free(path);
         const start = std.Io.Clock.awake.now(io);
@@ -391,7 +392,8 @@ pub const Backend = struct {
             _ = DestroyWindow(hwnd);
             self.hwnd = null;
         }
-        if (self.class_atom != 0) _ = UnregisterClassW(@ptrFromInt(self.class_atom), self.instance);
+        if (self.class_atom != 0) _ = UnregisterClassW(self.class_name.?.ptr, self.instance);
+        if (self.class_name) |name| self.gpa.free(name);
         // Apartment teardown may synchronously release/invoke abandoned creation
         // callbacks. They own their own allocation and loader reference.
         if (self.com_initialized) CoUninitialize();
