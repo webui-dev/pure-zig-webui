@@ -664,7 +664,8 @@ fn windowProc(hwnd: HWND, message: u32, wparam: usize, lparam: isize) callconv(.
         owner.hwnd = hwnd;
         SetLastError(0);
         if (setWindowLongPtr(hwnd, -21, @bitCast(@intFromPtr(owner))) == 0 and GetLastError() != 0) return 0;
-        return 1;
+        // Preserve User32's normal caption/non-client initialization.
+        return DefWindowProcW(hwnd, message, wparam, lparam);
     }
     const address = getWindowLongPtr(hwnd, -21);
     if (address != 0) {

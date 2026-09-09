@@ -101,8 +101,17 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class NativeWindowBounds {
+            [StructLayout(LayoutKind.Sequential)]
+            public struct Rect { public int Left, Top, Right, Bottom; }
+            [DllImport("user32.dll")]
+            public static extern bool GetWindowRect(IntPtr window, out Rect rectangle);
+          }
+          '@
           $process = Start-Process "$PWD/zig-out/bin/native.exe" -ArgumentList @('--loader', ('"' + $env:WEBUI_WEBVIEW2_LOADER + '"')) -PassThru -NoNewWindow
           try {
             $deadline = [DateTime]::UtcNow.AddSeconds(20)
@@ -112,11 +121,16 @@ jobs:
             }
             if ($process.HasExited -or $process.MainWindowHandle -eq [IntPtr]::Zero) { throw 'Native window did not appear' }
             Start-Sleep -Seconds 3
-            $screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
-            $bitmap = [System.Drawing.Bitmap]::new($screen.Width, $screen.Height)
+            $process.Refresh()
+            if ($process.MainWindowTitle -ne 'Pure Zig native WebView') { throw "Incorrect native caption: $($process.MainWindowTitle)" }
+            $rectangle = [NativeWindowBounds+Rect]::new()
+            if (![NativeWindowBounds]::GetWindowRect($process.MainWindowHandle, [ref]$rectangle)) { throw 'Native window bounds unavailable' }
+            $size = [System.Drawing.Size]::new($rectangle.Right - $rectangle.Left, $rectangle.Bottom - $rectangle.Top)
+            $origin = [System.Drawing.Point]::new($rectangle.Left, $rectangle.Top)
+            $bitmap = [System.Drawing.Bitmap]::new($size.Width, $size.Height)
             $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
             try {
-              $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
+              $graphics.CopyFromScreen($origin, [System.Drawing.Point]::Empty, $size)
               $bitmap.Save("$env:RUNNER_TEMP/native-visual.png", [System.Drawing.Imaging.ImageFormat]::Png)
             } finally {
               $graphics.Dispose()
