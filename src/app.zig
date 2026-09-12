@@ -1170,6 +1170,14 @@ const WindowState = struct {
         click_binding: ?Binding,
         registered: ?EventBinding,
     ) void {
+        if (registered) |event_binding_value|
+            event_binding_value.handler(
+                &event,
+                event_binding_value.user_data,
+            ) catch |err| {
+                if (err != error.Canceled)
+                    self.log(.err, "WebUI event handler failed: {}", .{err});
+            };
         if (click_binding) |binding_value| {
             var call: Call = .{
                 .gpa = self.gpa,
@@ -1180,14 +1188,6 @@ const WindowState = struct {
             defer call.deinit();
             binding_value.handler(&call, binding_value.user_data) catch {};
         }
-        if (registered) |event_binding_value|
-            event_binding_value.handler(
-                &event,
-                event_binding_value.user_data,
-            ) catch |err| {
-                if (err != error.Canceled)
-                    self.log(.err, "WebUI event handler failed: {}", .{err});
-            };
     }
 
     fn dispatchEvent(self: *WindowState, io: std.Io, event: Event) !void {
@@ -3965,6 +3965,47 @@ fn waitForCount(
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
     }
     return error.Timeout;
+}
+
+test "general click handler precedes named binding in both event modes" {
+    const Capture = struct {
+        order: [2]u8 = undefined,
+        count: usize = 0,
+
+        fn observe(_: *const Event, data: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            self.order[self.count] = 'G';
+            self.count += 1;
+        }
+
+        fn click(_: *Call, data: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            self.order[self.count] = 'B';
+            self.count += 1;
+        }
+    };
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "click order" } });
+    var capture: Capture = .{};
+    defer window.state.cancelEvents(io);
+    try window.onEvent(io, Capture.observe, &capture);
+    try window.bind(io, "button", Capture.click, &capture);
+    for ([_]EventMode{ .serial, .concurrent }) |mode| {
+        window.setEventMode(mode);
+        capture.count = 0;
+        try window.state.dispatchEvent(io, .{
+            .kind = .click,
+            .client = .{ .state = window.state, .client_id = 1 },
+            .data = "button",
+        });
+        try window.state.event_tasks.await(io);
+        try std.testing.expectEqualStrings("GB", &capture.order);
+    }
 }
 
 test "event modes serialize, copy, bound, and cancel handlers" {

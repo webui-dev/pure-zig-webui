@@ -15,6 +15,7 @@
     const decoder = new TextDecoder();
     const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
     const pending = new Map();
+    const awaitingAuthentication = new Set();
     const bindings = new Set();
     let allEvents = false;
     const event = Object.freeze({
@@ -149,6 +150,8 @@
         clearSessionTimers();
         for (const promise of pending.values()) promise.reject(error);
         pending.clear();
+        for (const waiter of awaitingAuthentication) waiter.reject(error);
+        awaitingAuthentication.clear();
         if (!stopped && !suspended) {
             scheduleWarning(connected ? 1000 : 5000);
             retryTimer = setTimeout(() => {
@@ -209,9 +212,13 @@
     // Delegation is installed even on pages with no initial registrations.
     // State changes on ADD_ID; no repeated listeners or DOM scans are needed.
     document.addEventListener("click", (event) => {
-        const element = event.target?.closest?.("[id]");
-        if (element?.id && (allEvents || bindings.has(element.id)))
-            sendEvent(commandClick, element.id);
+        // Every bound ancestor receives a bubbling click upstream. An unbound
+        // inner ID must not hide a binding on its parent.
+        for (let element = event.target?.closest?.("[id]"); element;
+            element = element.parentElement?.closest?.("[id]")) {
+            if (element.id && (allEvents || bindings.has(element.id)))
+                sendEvent(commandClick, element.id);
+        }
         if (allEvents && !allowNavigation && !("navigation" in globalThis)) {
             const link = event.target?.closest?.("a[href]");
             if (link && connected) {
@@ -287,6 +294,8 @@
                 removeWarning();
                 heartbeat(connection);
                 setConnected(true);
+                for (const waiter of awaitingAuthentication) waiter.resolve();
+                awaitingAuthentication.clear();
             }
             return;
         }
@@ -375,8 +384,22 @@
         event,
         isConnected: () => connected,
         call(name, ...args) {
-            if (!connected) return Promise.reject(new Error("WebUI is not connected"));
             const connection = socket;
+            if (!connected) {
+                if (!connection || connection.readyState !== WebSocket.OPEN)
+                    return Promise.reject(new Error("WebUI is not connected"));
+                if (awaitingAuthentication.size >= 0xffff)
+                    return Promise.reject(new Error("WebUI has too many pending calls"));
+                // Share the socket's existing authentication deadline. Loss,
+                // rejection and unload reject these calls without replay.
+                return new Promise((resolve, reject) => {
+                    awaitingAuthentication.add({ resolve, reject });
+                }).then(() => {
+                    if (connection !== socket || !connected)
+                        throw new Error("WebUI connection closed");
+                    return globalThis.webui.call(name, ...args);
+                });
+            }
             log(`Calling [${name}(...)]`);
             const values = args.map((arg) =>
                 arg instanceof Uint8Array ? arg : encoder.encode(String(arg)),

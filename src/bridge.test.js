@@ -160,13 +160,87 @@ function isolatedCallBridge(options = {}) {
     return bridge;
 }
 
+test("calls on an open socket wait for authentication and never cross sessions", async () => {
+    const bridge = isolatedCallBridge();
+    await assert.rejects(bridge.webui.call("before-open"));
+    bridge.socket.open();
+    const call = bridge.call("during-auth", "argument");
+    assert.equal(call.status, "pending");
+    assert.equal(bridge.socket.sentIds.length, 0);
+    await bridge.receive(0xf7, encoder.encode("during-auth"));
+    assert.equal(bridge.socket.sentIds.length, 0);
+    await bridge.receive(0xf5, Uint8Array.of(1));
+    await bridge.reply(bridge.socket.sentIds.at(-1), "authenticated");
+    await Promise.resolve();
+    assert.deepEqual(call, { status: "fulfilled", value: "authenticated" });
+
+    for (const failure of ["timeout", "denied", "disconnect", "pagehide"]) {
+        const other = isolatedCallBridge();
+        other.socket.open();
+        const waiting = other.call("must-not-replay");
+        if (failure === "timeout") await other.tick(5000);
+        else if (failure === "denied") await other.receive(0xf5, Uint8Array.of(0));
+        else if (failure === "disconnect") other.socket.lose();
+        else other.dispatch("pagehide");
+        await Promise.resolve();
+        await Promise.resolve();
+        assert.equal(waiting.status, "rejected", failure);
+        if (failure === "pagehide") other.dispatch("pageshow", { persisted: true });
+        if (failure !== "denied") {
+            await other.connect();
+            assert.equal(other.socket.sentIds.length, 0, "authentication waiters are not replayed");
+        }
+    }
+});
+
+test("authentication waiting is bounded and reentrant close rejects released waiters", async () => {
+    const bridge = isolatedCallBridge();
+    bridge.socket.open();
+    for (let count = 0; count < 0xffff; count++) bridge.call("waiting");
+    const overflow = bridge.call("overflow");
+    await Promise.resolve();
+    assert.equal(overflow.status, "rejected");
+    assert.equal(bridge.outcomes.slice(0, -1).every((outcome) => outcome.status === "pending"), true);
+    assert.equal(bridge.socket.sentIds.length, 0);
+    bridge.webui.setEventCallback((event) => {
+        if (event === bridge.webui.event.CONNECTED) bridge.dispatch("pagehide");
+    });
+    await bridge.receive(0xf5, Uint8Array.of(1));
+    await Promise.resolve();
+    assert.equal(bridge.outcomes.every((outcome) => outcome.status === "rejected"), true);
+    assert.equal(bridge.socket.sentIds.length, 0);
+});
+
+test("click delegation preserves nested bound ancestors and skips empty or unbound IDs", async () => {
+    const bridge = isolatedCallBridge({ bindings: ["outer", "inner"] });
+    await bridge.connect();
+    const element = (id, parentElement = null) => ({
+        id, parentElement,
+        closest(selector) { return selector === "[id]" ? this : null; },
+    });
+    const outer = element("outer");
+    const empty = element("", outer);
+    const unbound = element("decoration", empty);
+    const inner = element("inner", unbound);
+    const click = bridge.domListeners.get("click")[0];
+    const received = () => bridge.socket.sentPackets
+        .filter((packet) => packet[7] === 0xfc)
+        .map((packet) => decoder.decode(packet.subarray(8)));
+    click({ target: unbound });
+    assert.deepEqual(received(), ["outer"]);
+    click({ target: inner });
+    assert.deepEqual(received(), ["outer", "inner", "outer"]);
+    await bridge.receive(0xf7, new Uint8Array());
+    click({ target: inner });
+    assert.deepEqual(received(), ["outer", "inner", "outer", "inner", "decoration", "outer"]);
+});
+
 test("bridge authenticates each replacement and isolates pending calls and stale async results", async () => {
     const bridge = isolatedCallBridge();
     bridge.webui.setEventCallback((value) => bridge.events.push(value));
     const old = bridge.socket;
     old.open();
     assert.equal(bridge.webui.isConnected(), false);
-    await assert.rejects(bridge.webui.call("early"));
     await bridge.receive(0xfd, encoder.encode("globalThis.early = true"));
     assert.equal(bridge.context.early, undefined);
     await bridge.receive(0xf5, Uint8Array.of(1));
