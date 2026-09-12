@@ -9,6 +9,13 @@ compile or link the upstream WebUI C library or CivetWeb.
 [Linsang](https://github.com/jinzhongjia/Linsang) provides HTTP and WebSocket
 support.
 
+The core rewrite is substantial, but full upstream behavioral parity is not
+complete. A fresh source audit found gaps in content composition, live window
+creation/destruction, Firefox app profiles, and native drag/resize, title and
+navigation integration. See the
+[open semantic gaps](docs/PURE_ZIG_REFACTOR.md#open-semantic-gaps)
+and the [source comparison](docs/UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
+
 The current phase provides:
 
 - Zig 0.16;
@@ -131,11 +138,13 @@ should run `zig build test-bridge`, which fails when Node is unavailable.
 `Window.evalAll` returns owned results; call `deinit` on them after consuming
 every per-client outcome.
 
-`Running.wait()` returns once every client is gone: a backend `Window.close()`
-or `Client.close()` ends it as soon as the last client disconnects, while any
-other disconnect — a page reload, a navigation, a closed browser window —
-gets a 1.5-second reconnect grace period first, so reloads and
-`Window.setContent()` do not stop the application.
+`Running.wait()` normally returns once every client is gone. Backend close
+requests bypass its 1.5-second reconnect grace period; other disconnects should
+receive that grace so reloads and `Window.setContent()` can reconnect.
+Known limitation: close intent is currently sticky across windows, so closing
+one window can bypass a later unrelated window's reload grace. An initial wait
+with no clients also lacks a startup/stop completion condition; explicitly use
+`Window.waitForConnection()` with a timeout before waiting for client shutdown.
 Bridge retries do not extend this grace period or restart a stopped backend.
 Longer outages can recover only while the application keeps its server running.
 
@@ -236,16 +245,25 @@ in `App.WindowOptions` returns `error.ConflictingWindowPlacement`.
 
 Serve a directory by setting
 `.content = .{ .directory = "path/to/public" }`. The path is opened when the
-app starts and closed when it stops. Custom resources receive `webui.Request`
-and `webui.Response` directly.
+app starts and closed when it stops. Physical directory requests, with or
+without a trailing slash, redirect with HTTP 302 to the first readable regular
+file in this order: `index.html`, `index.htm`, `index.ts`, `index.js`.
+The redirect preserves the encoded path and query string, so relative assets
+resolve under the selected directory. Index lookup does not follow symlinks.
+Custom resources receive borrowed `webui.Request` and `webui.Response` values;
+complete the response before the handler returns. Custom handlers do not have
+built-in directory-index probing or fallthrough to a disk directory.
 
 Set `.runtime = .deno`, `.node_js`, or `.bun` in `App.WindowOptions` to run
 served `.js` and `.ts` files through an external interpreter instead of
-sending them to the browser. A request for a directory resolves `index.ts`
-and then `index.js`. The interpreter is spawned as argv, never through a
-shell, and receives the script path followed by the raw query string, so a
-query can never become a command. Successful standard output is answered as
-`200 text/plain` and bounded by `Limits.max_runtime_output`; a run is abandoned
+sending them to the browser. Directory index selection happens first, so an
+HTML/HTM entry takes precedence over TS/JS regardless of runtime selection.
+Following a script-index redirect executes that script only when a runtime is
+enabled; without one it is served as a static resource. The interpreter is
+spawned as argv, never through a shell, and receives the script path followed by
+the raw query string, so a query can never become a command. Successful standard
+output is answered as `200 text/plain` and bounded by `Limits.max_runtime_output`;
+a run is abandoned
 after 30 seconds. Unlike upstream's empty-success fallback, unavailable
 interpreters (missing, inaccessible, or invalid executables) answer `503`,
 timeouts answer `504`, and output-limit violations or unsuccessful exits answer
@@ -297,6 +315,9 @@ Non-conflicting binding names also expose `webui.<name>(...)`; core and inherite
 properties are never overwritten, and `webui.call(name, ...)` always remains
 available.
 
+For a click, the general event handler runs before the named binding, using the
+same registration snapshot and scheduled task in both event modes.
+
 Handlers use a bounded FIFO worker queue in `.serial` mode, leaving the network
 receiver free to process replies and heartbeats. A handler can safely evaluate
 JavaScript on its own client. `Window.setEventMode(.concurrent)` starts newly
@@ -315,9 +336,11 @@ during the callback. The callback must be thread-safe when concurrent event
 handling is enabled. Without a callback, messages use `std.log`.
 
 `Window.bind(io, "button", ...)` also dispatches clicks from elements with
-`id="button"`, including elements added after the bridge loads. DOM click
-handlers receive no arguments and their replies are ignored; explicit
-`webui.call("button", ...)` remains available.
+`id="button"`, including elements added after the bridge loads. Every matching
+ancestor receives the bubbling click from inner to outer; an unbound or empty
+inner ID does not hide a bound parent. DOM click handlers receive no arguments
+and their replies are ignored; explicit `webui.call("button", ...)` remains
+available.
 
 Binding handlers can transfer an explicit `webui.call()` response beyond the
 handler lifetime with `Call.deferReply()`. Complete the owned `PendingReply`
@@ -362,6 +385,13 @@ notifications; callback exceptions do not interrupt recovery.
 the send fails, or the connection closes. Allocation skips pending IDs when
 wrapping; with all 65,535 IDs occupied, only the new call is rejected and no
 packet is sent. A slow deferred reply cannot be overwritten by later calls.
+
+When a WebSocket is already open but authentication is pending, `webui.call()`
+waits for that same socket's authentication before sending. Waiting calls are
+bounded to 65,535 and share the existing five-second handshake deadline.
+Transport loss, rejection, and unload reject them without replay on a new
+socket. Calls made before the socket opens or during an offline retry still
+reject immediately.
 
 Browser-to-Zig protocol packets of at least 65,500 bytes are sent as ordered
 `MULTI` chunks and reassembled per client. The announced total size is strictly
@@ -480,9 +510,10 @@ External-browser examples warn and shut down when no browser connects.
 Node, Deno, and Bun, runs the core and bridge suites, executes native smoke gates
 on Linux/macOS/Windows, and cross-builds all five ledger targets.
 
-The [capability ledger](docs/PURE_ZIG_REFACTOR.md#completion-evidence) records the
-completed rewrite and exact cross-platform validation evidence. The experimental
-warning still applies; no stable release or production-readiness claim is implied.
+The [capability ledger](docs/PURE_ZIG_REFACTOR.md) records implemented behavior,
+open semantic gaps, and dated cross-platform validation evidence. The earlier
+rewrite-closure claim was withdrawn after the source rescan; existing passing
+gates do not prove untested upstream behavior. The experimental warning applies.
 
 ## License
 

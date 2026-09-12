@@ -19,7 +19,7 @@ the Zig standard library and launching an installed browser remain in scope.
 
 ## Current Rewrite Status
 
-Status snapshot: 2026-09-09.
+Status snapshot: 2026-09-12 (source rescan; parity reopened).
 
 The external-browser core is now implemented in Zig on top of pinned Linsang.
 The legacy wrapper, C API, compatibility files, and examples have been
@@ -32,13 +32,39 @@ deleted.
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, Deno/Node.js/Bun script interpretation, logging, and deterministic shutdown are implemented. |
 | Browser integration | Centring, app-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed and deletable managed profile directories, Chromium-family proxy rules, Windows external-browser focus, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
 | Native integration | Optional Zig-only WKWebView, GTK3/WebKitGTK 4.1 and Win32/WebView2 backends implement native controls, UI-thread dispatch, close veto/history-safe JavaScript close, multiwindow pumping, and borrowed handles. Actual runtime gates pass on all three platforms. |
-| Current validation | Linux CI: 54/54 core tests and 15/15 bridge tests. Native smoke passes on Linux/macOS/Windows; Linux missing-display and Windows missing-loader checks pass. All five cross-target builds pass. Protocol fuzzing completed 101,191 executions without failure; hardened Linsang passes all 107 Linux tests. |
+| Current validation | 2026-09-12 local: 50/56 core tests pass, six existing platform-gated tests skip, bridge 18/18, and the package build passes. Real Chromium exercises authentication waiting, nested click ordering, directory redirects and relative assets. Earlier cross-platform CI evidence is retained below as a dated snapshot, not fresh parity proof. |
 
-The pure Zig rewrite is complete against this ledger: every capability has a
-concrete implementation or an intentional Zig-native replacement, and the
-required runtime/build gates have passed. The package remains experimental;
-capability completion is not a production-readiness or bug-free guarantee.
-The coverage ledger below is the authoritative method-level list.
+The earlier claim that every upstream capability was complete was too broad:
+API-name mappings did not cover all implementation semantics. Full behavioral
+parity remains open. The method-level ledger and the explicit gaps below are the
+completion contract; passing the existing gates alone cannot close those gaps.
+The package remains experimental.
+
+## Open Semantic Gaps
+
+Fresh comparison: upstream HEAD
+[`52f9e75b92faf9a23fd150b3c60051c4ec85fc69`](https://github.com/webui-dev/webui/tree/52f9e75b92faf9a23fd150b3c60051c4ec85fc69),
+also compared with the original pinned baseline. Detailed function/line evidence
+is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
+
+| Area | Remaining behavior, not covered by existing API mappings |
+|---|---|
+| Content composition | Embedded HTML plus disk assets and a custom override/fallthrough handler cannot be composed; resource-only replacement currently replaces page content and navigates. |
+| Entry and custom routing | No configured local entry file; custom handlers lack virtual-directory index probing. Physical directory index precedence and 302 redirects are fixed in this rescan. |
+| Live window lifecycle | `createWindow` rejects after start; no independent destroy/unregister/reclaim while other windows run. `close` is not a replacement for `destroy`. |
+| Wait lifecycle | Sticky cross-window close intent can bypass an unrelated reconnect grace; initial no-client `wait` lacks startup/stop completion. These are source findings, not newly reproduced regressions. |
+| Callback metadata | Named `Call` does not expose its binding name or click-vs-explicit-call origin; callbacks cannot access a bounded snapshot of the connection's cookies. |
+| Firefox app mode | No generated Firefox app profile/userChrome.css or managed preference setup. Existing caller-profile support and explicit high-contrast error do not implement those capabilities. |
+| Browser discovery | Registered Windows Chromium using `chrome.exe` and macOS bundles outside the fixed application directories lack upstream discovery paths. |
+| Native interaction | Missing GTK custom drag/edge resize, Windows draggable-region setup and resizable frameless host behavior, and Cocoa frameless background movement. |
+| Native page integration | No upstream page-title-to-host synchronization; no GTK engine-level navigation-policy interception independent of a live bridge. |
+| Default presentation | No upstream default fallback favicon. F5/context-menu/DevTools policy differences are intentional UI-policy candidates, not proof of missing protocol support. |
+
+Borrowed custom HTTP handlers can await work before returning through `std.Io`;
+there is no owned post-return HTTP reply handle. This is an explicit Zig task
+composition alternative, not the same ownership contract as `webui_return_http`.
+Permanent C ABI/old-Zig/self-signed-certificate exclusions and the documented
+macOS transparency/profile and Wayland absolute-coordinate limits are unchanged.
 
 ## Original Baseline
 
@@ -352,6 +378,11 @@ implementation detail.
 `Window.bind(io, ...)` and `Window.onEvent(io, ...)` support synchronized
 runtime replacement. Registration replay precedes `CONNECTED`; safe names also
 expose `webui.<binding>()`, without overwriting core or prototype properties.
+Calls on an already-open socket wait for that socket's authentication within
+the existing five-second handshake deadline, with at most 65,535 waiters.
+Loss/rejection/unload reject waiters without replay; offline calls still reject.
+Nested DOM clicks reach every registered ancestor in bubbling order, and the
+general backend click observer runs before the named binding.
 
 Call correlation reserves IDs 1–65,535 until completion, send failure, or
 disconnect. Allocation skips outstanding IDs on wrap and rejects only the new
@@ -372,12 +403,12 @@ installs its own event callback. Reconnect does not extend `Running.wait()`'s
 
 ### Intentional Zig Replacements
 
-The following upstream methods are covered by the current Zig design and are
-not implementation gaps:
+The following table maps upstream methods to the current Zig design.
+Mappings with an explicit remaining gap are partial, not parity-complete:
 
 | Upstream API | Zig replacement |
 |---|---|
-| `webui_new_window()`, `webui_new_window_id()`, `webui_get_new_window_id()` | `App.createWindow()` and application-owned IDs. |
+| `webui_new_window()`, `webui_new_window_id()`, `webui_get_new_window_id()` | `App.createWindow()` and application-owned IDs. Partial: runtime creation remains unsupported. |
 | `webui_show()`, `webui_start_server()`, `webui_get_url()` | Initial `Content`, runtime `Window.setContent()`, `App.start()`, `Window.open()`, and `Window.url()`. `Window.open()` launches the best installed browser in app mode and falls back to the OS URL handler, matching upstream `webui_show()` with `AnyBrowser`. |
 | `webui_show_client()` | `Client.show()` replaces the window content and navigates only the selected client. |
 | `webui_is_shown()` | `Window.isShown()` reports whether the window has at least one connected browser client. |
@@ -392,13 +423,13 @@ not implementation gaps:
 | `webui_get_child_process_id()` | `Window.openWithBrowser()` returns the retained direct child's `BrowserProcessId`; `Window.browserProcessId()` retrieves it later. |
 | `webui_get_parent_process_id()` | Root-level `parentProcessId()` returns the current Zig backend's numeric process ID without a redundant window argument. Unsupported process targets return an explicit error. |
 | `webui_set_default_root_folder()` | `App.Options.default_directory` supplies directory content to windows created without explicit content. |
-| `webui_set_runtime()` | `App.WindowOptions.runtime` selects Deno, Node.js, or Bun for served `.js` and `.ts` files, including `index.ts`/`index.js` directory resolution. The interpreter is spawned as argv rather than through a shell. Unlike upstream's empty `200`, unavailable executables answer `503`, timeouts `504`, and output-limit violations or unsuccessful exits `502`; failed stdout and diagnostics are never served. |
+| `webui_set_runtime()` | `App.WindowOptions.runtime` selects Deno, Node.js, or Bun for `.js`/`.ts`. Physical directories first redirect to the first `index.html`, `index.htm`, `index.ts`, or `index.js`; only a selected script is interpreted. Executables receive argv without a shell. Failures deliberately answer `503`/`504`/`502`, never partial stdout or diagnostics. |
 | `webui_set_config(folder_monitor)` | `App.Options.folder_monitor_interval` enables portable recursive directory polling and reloads the affected window's connected clients. |
 | `webui_set_icon()`, `webui_set_icon_file()` | `Window.setIcon()` copies inline data and MIME type; `Window.setIconFile()` loads a supported image file as the window favicon. |
-| `webui_set_profile()` | Caller-managed browser profiles remain supported. Default Chromium processes use distinct per-window capability leaves under managed family roots, preventing cross-window process handoff. Replacement stops/reaps the previous child before launch; explicit deletion never removes a caller profile. |
+| `webui_set_profile()` | Caller-managed profiles and isolated owned Chromium profile leaves are supported. Partial: Firefox managed app profiles, chrome suppression and preference setup remain absent. |
 | `webui_set_proxy()` | `App.WindowOptions.proxy_server` is copied and passed as one Chromium-family `--proxy-server` argument. Unsupported browsers return an explicit error. |
-| `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. Matching upstream `WEBUI_RELOAD_TIMEOUT`, a disconnect that was not requested by a backend `close` gets a 1.5-second reconnect grace period before the wait ends, so reloads and navigations survive. |
-| `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `Running.stop()`, and `App.deinit()`. |
+| `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. A 1.5-second reconnect grace is implemented, but sticky cross-window close intent and initial no-client wait completion remain known lifecycle gaps. |
+| `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `Running.stop()`, and `App.deinit()`. Partial: there is no independent running-window destroy/reclaim. |
 | `webui_set_context()`, `webui_get_context()` | Binding and event-handler `user_data`. |
 | `webui_bind()` | `Window.bind(io, name, handler, user_data)` supports explicit calls, DOM clicks, and runtime replacement. `Window.onEvent(io, handler, user_data)` updates event handling. `CMD_ADD_ID` pushes new registrations and authentication replays current state; in-flight work keeps its handler snapshot. |
 | `webui_get_count()`, `webui_get_size()`, `webui_get_size_at()` | `Call.arguments.len` and `Call.bytes(index).len`. |
@@ -417,7 +448,7 @@ not implementation gaps:
 | `webui_set_public()` | `App.Options.public` permits non-loopback listening only with TLS; Origin and explicit connection and protocol limits are enforced. |
 | `webui_set_tls_certificate()` | `App.Options.tls` accepts caller-provided PEM certificate and private-key bytes. |
 | `webui_set_port()`, `webui_get_port()`, `webui_get_free_port()` | `App.Options.port`, including `0` for automatic selection, and the running window URL. |
-| `webui_set_root_folder()`, `webui_set_file_handler()`, `webui_set_file_handler_window()`, `webui_return_http()` | Initial or runtime `.directory` and `.custom` content through `Content`, `Window.setContent()`, and `Response`. |
+| `webui_set_root_folder()`, `webui_set_file_handler()`, `webui_set_file_handler_window()`, `webui_return_http()` | Initial/runtime `.directory` or `.custom` content and borrowed `Response`. Partial: modes are exclusive; no HTML-plus-assets/custom fallthrough or resource-only replacement. HTTP work may await before callback return, but there is no owned delayed HTTP reply. |
 | `webui_get_mime_type()` | Linsang resource handling. |
 | `webui_encode()`, `webui_decode()`, `webui_malloc()`, `webui_free()`, `webui_memcpy()` | Zig standard library and allocators. |
 | `webui_get_last_error_number()`, `webui_get_last_error_message()` | Zig error unions. |
@@ -440,7 +471,7 @@ the coverage ledger in the same commit.
 This completes the behavior represented by `webui_set_public()`,
 `webui_set_tls_certificate()`, and `webui_set_config(use_cookies)`.
 
-### Calls, bindings, and browser bridge (complete)
+### Calls, bindings, and browser bridge
 
 - Implements the public bridge methods listed above, authenticated keepalive,
   reconnection, connection-loss UI, synchronized runtime bindings and replay.
@@ -451,26 +482,26 @@ This completes the behavior represented by `webui_set_public()`,
 Typed argument/return methods, runtime `webui_bind()` updates, and `CMD_ADD_ID`
 are implemented and covered by integration and bridge regressions.
 
-### Handler and event lifecycle (complete)
+### Handler and event lifecycle
 
 Implements asynchronous replies, bounded FIFO serial or independent concurrent
 handlers, connection waiting, and logging. The receiver never executes user
 handlers inline, so a serial handler may evaluate JavaScript on its own client.
 
-### Dynamic content and client state (complete)
+### Dynamic content and client state
 
-This completes `webui_show()`, `webui_show_client()`, `webui_is_shown()`,
-the dynamic root and file-handler methods, `webui_set_default_root_folder()`,
-`webui_set_icon()`, and `webui_set_icon_file()`.
+Content replacement, default directories, custom icons and shown state exist.
+Composition, resource-only replacement, configured entry files and custom index
+resolution remain open; see the semantic gap table.
 
-### Managed browser launch (complete)
+### Managed browser launch
 
 Browser discovery, default URL opening, explicit browser selection, custom
 executable paths and argv, the process-wide backend identifier, per-window
 direct child identifiers, replacement, and shutdown cleanup are implemented.
 
-This completes the browser discovery, selection, custom-parameter, and direct
-child tracking methods in the ledger.
+Discovery, profile and app-presentation behavior still has the Firefox,
+Windows Chromium and macOS resolver gaps listed above.
 
 ### Browser window controls
 
@@ -521,10 +552,13 @@ This completes `webui_set_runtime()`.
 This implements `webui_show_wv()`, `webui_set_close_handler_wv()`, and native
 handles. A separate ABI/ownership review was performed for every platform;
 the public API stays Zig-native, and runtime verification remains mandatory.
+This does not yet cover upstream native drag/edge resize, page-title tracking
+or GTK navigation-policy integration; see the reopened semantic gaps.
 
-### Parity closure
+### Parity closure (reopened)
 
-- All ledger rows now have a concrete implementation or intentional replacement.
+- Close every semantic gap above with implementation and focused runtime proof;
+  method-name coverage is not sufficient.
 - Retained examples cover bindings, dynamic content, public TLS, managed
   browsers, runtimes, and native WebViews.
 - `zig build fuzz --fuzz=100K`, real browser/native scenarios, leak checks, and
@@ -580,6 +614,10 @@ zig build -Dtarget=aarch64-macos
 ## Completion Evidence
 
 Completion snapshot: 2026-09-09.
+
+This historical snapshot covered the tests available then. The 2026-09-12
+source rescan withdrew the broader parity-closure conclusion; it does not
+invalidate these recorded test results or claim that new gaps were exercised.
 
 [The final platform gate](https://github.com/webui-dev/pure-zig-webui/actions/runs/34342120131)
 passed every job: Ubuntu 24.04, macOS 15, Windows Server 2022, and the

@@ -1,5 +1,10 @@
 # 上游实现逻辑比对审计
 
+**最新结论（2026-09-12）：行为 parity 重新打开。** 下文 2026-09-09 的
+“完整重写闭环”是当时验收结论；本次重新扫描源码发现它覆盖了 API 名称，
+却没有覆盖若干上游实现语义。最新修复、剩余缺口及证据见
+[本轮扫描](#2026-09-12-source-rescan)，历史记录保留供追溯。
+
 日期：2026-08-22。
 比对基准：上游 WebUI `2.5.0-beta.4`（commit `337a183cea0a9c5daee16acb77eed2d5443bbbb0`，
 即 coverage ledger 钉住的版本），同时参考上游 HEAD `52f9e75` 中已合入的修复。
@@ -279,3 +284,102 @@ JavaScript 关闭请求由 document-start 原生消息桥接处理；否决时�
 协议 fuzz 实际执行 101,191 次无失败。Windows 已校验真实页面渲染、初始标题和
 OS 关闭路径；本机 macOS 屏幕捕获受限，但其原生窗口与 JavaScript/控制门禁通过。
 覆盖账本已关闭实现和验收缺口，实验性/非生产就绪声明仍保留。
+
+## 2026-09-12 Source Rescan
+
+### 基准与方法
+
+重新获取上游源码，HEAD 仍为
+[`52f9e75b92faf9a23fd150b3c60051c4ec85fc69`](https://github.com/webui-dev/webui/tree/52f9e75b92faf9a23fd150b3c60051c4ec85fc69)，
+并与账本基准 `337a183cea0a9c5daee16acb77eed2d5443bbbb0` 做源码差异比较。
+读取 `include/webui.h`、`src/webui.c`、`bridge/webui.ts`、Cocoa/WebView2
+适配器，再分别对照本仓库 `app.zig`、`bridge.js`、`browser.zig` 和原生模块。
+未编译或链接上游 C。以下上游行号均指上述 HEAD；本仓库以符号名定位。
+
+### 本轮已实现并复现验证
+
+1. **认证中的显式调用等待。** 上游 `bridge/webui.ts:609–619,919–924`
+   在 WebSocket OPEN、token 尚未接受时等待绑定列表；这是基准之后新增的
+   实现。原桥接直接拒绝。现在 `awaitingAuthentication` 将调用绑定到当前
+   socket，成功后才发送；最多 65,535 个等待者，共用既有 5s 认证期限。
+   拒绝、超时、断开、pagehide 都取消，不把调用移到替换连接。
+   `CONNECTED` 回调重入关闭也不会漏发旧调用。
+2. **嵌套点击及后端顺序。** 上游 `bridge/webui.ts:337–345` 给匹配元素
+   分别安装点击监听器，因此 DOM 冒泡会经过所有匹配祖先。旧实现只查
+   `closest("[id]")`，内层未绑定 ID 会遮住外层绑定。现在沿祖先逐个分发，
+   跳过空 ID；运行期绑定仍有效。上游 `webui.c:10456–10489` 先调用 general
+   observer 再调用 named binding；`WindowState.invokeEvent` 已改为相同顺序，
+   保留同一任务内的注册快照以及 serial/concurrent 调度。
+3. **物理目录 index 路由。** 上游 `webui.c:11278–11314,11396–11450`
+   按 HTML、HTM、TS、JS 顺序选入口并 302。旧实现只在静态路径补 `index.html`，
+   runtime 路径先找 TS/JS；`/docs` 和 HTM-only 目录失败，HTML/TS 并存时会
+   错选脚本。新增 `directoryIndex`，先逐组件 no-follow 打开目录，再检查
+   普通可读文件；`onRequest` 先重定向，`runtimeScript` 仅处理显式脚本。
+   Location 使用原始编码路径并保留 query，避免 `%`、空格、`#`、`?`
+   文件名被重新解释。解释器关闭时 TS/JS index 仍可静态服务。
+   此项不宣称实现 custom handler 的虚拟 index 或任意配置入口文件。
+
+前置失败证据：新桥接回归分别得到 `WebUI is not connected` 和空点击列表；
+后端顺序回归期望 `GB` 却得到 `BG`；目录集成回归未得到预期的 302。
+修复后这些场景全部通过。
+
+### 尚未实现或不等价的能力
+
+下表为源码确认的缺口，不宣称已经对每个缺口运行平台复现。
+优先级表示建议实现顺序，不是安全严重性。
+
+| 优先级 | 缺口 | 上游具体实现 | 本仓库边界 |
+|---|---|---|---|
+| P1 | HTML、磁盘资源、自定义覆盖/回退不能组合 | `webui.c:11249–11266,11343–11401` 先 custom，未处理再访问页面/磁盘；`6059–6063` 的 NULL 表示回退 | `Content` 是互斥 union；`onRequest` 的 `.html` 非根路径 404、`.custom` 总是结束请求。更换资源目录还会更换内容并导航。 |
+| P1 | 运行期创建、独立销毁窗口 | `webui.c:1270–1333,1583–1670` 允许其它窗口运行时创建/销毁并处理回调内延迟回收 | `App.createWindow` 在 started 时拒绝；`Window.close` 只发协议，`Running.stop`/`App.deinit` 是全局级别。需要稳定句柄和任务/Client/PendingReply 生命周期设计，不能直接 free。 |
+| P1 | Firefox 托管 app profile | `webui.c:7249–7321` 创建 profile，写 prefs/userChrome.css 隐藏浏览器 chrome，并设置 high-contrast preference | `browser.managedProfileDirectory` 不支持 Firefox；只转发 caller profile 和 `-new-window`。已声明的显式 high-contrast 错误不是该能力的实现。 |
+| P1 | 原生 frameless 的实际拖动与边缘缩放 | GTK `webui.c:12640–12658,14530–14612`；Win32 `14091–14098` 的 resizable 样式；`win32_wv2.cpp:488` draggable regions；`wkwebview.m:217–220` background movement | 本地无 GTK drag/resize 信号或协议实现、WebView2 draggable 配置、Cocoa background movement；Windows frameless style 丢掉 resizable。不是 Wayland absolute-position 限制所能解释。 |
+| P2 | 任意本地入口文件、custom index 探测 | `webui.c:10180–10198,11283–11285` 的 `user_index_file`；`5999–6055` 虚拟入口探测 | `.directory` 只能从标准 index 打开，`.custom` 不自动探测；物理目录标准 index 已在本轮修复。 |
+| P2 | callback 元信息 | `include/webui.h:205–214`、`webui.c:10447–10454,12913–12923` 带 event_type、element、cookies | `Call` 无公开 name/origin；零参数显式调用与 DOM click 对 named handler 不可区分。`Call`/`Event` 没有 connection cookie 快照。 |
+| P2 | 原生标题跟随页面 | GTK `webui.c:14278–14291`；Cocoa `wkwebview.m:114–125`；WebView2 `win32_wv2.cpp:75–89,164–166` | 三个适配器只设 options.title/显式 setTitle，无页面标题通知。需定义显式标题覆盖策略。 |
+| P2 | GTK 引擎级导航拦截 | `webui.c:14294–14352` 的 decide-policy 可在无 live bridge 时拦截并区分 backend navigation | 本地 Linux 适配器无 decide-policy 信号；仅靠 bridge 的 Navigation API/链接点击不能完整替代。 |
+| P2 | 平台浏览器发现范围 | `webui.c:8430–8480` 区分注册的 Chrome/Chromium；`7872–7877,8319–8322` 使用 macOS 应用解析 | 本地 Windows Chromium 只找 `chromium.exe`；macOS 只查固定 bundle 目录。[INFERENCE] 注册在其它位置的应用可被上游解析而被本地漏掉。显式 executable 只是绕过。 |
+| P3 | 默认 favicon | `webui.c:11317–11346` 依次找用户/磁盘/default SVG | 本地只有配置或内容提供的图标；无上游默认图标回退。 |
+
+### 生命周期源码风险，尚未运行复现
+
+- **旧 close intent 影响另一窗口的刷新。** `App.closeRequested` 对所有
+  window 的 `close_requested` 做 OR；标记只在启动时复位。
+  `Running.wait` 在任意窗口曾请求 close 后都会跳过最后断连的重连宽限期。
+  [INFERENCE] 关闭 A 后 B 再刷新可能触发全局停止。上游按窗口处理并在
+  重新连接时清 `is_closed`（`webui.c:11956–11960`）。
+- **初次无客户端 wait 的完成条件。** `Running.wait` 在 `ever_connected`
+  为 false 时始终 continue，也不检查 stopped。上游首连等待有期限
+  （`webui.c:11858–11949`）。不应给刻意无头的服务强加期限，但应补齐
+  显式停止条件，并把启动等待与服务寿命区分。
+
+### 不应误报为缺口
+
+- 上游 `CALL_FUNC` 实际仅调用 named handler（`webui.c:12923–12963`），
+  不会调用所谓 all-events handler。不能仅凭头文件“all events”描述，
+  给 `onEvent` 凭空添加 callback 事件。
+- C ABI、旧 Zig、自签证书、CivetWeb 和无约束全局数组仍属明确排除项。
+  capability 路由、argv 启动、有界任务、严格错误和 stale-client ID 是有意设计。
+- 自定义 HTTP handler 的 Request/Response 是借用，返回前可通过 `std.Io`
+  await 延迟工作；没有类似 `PendingReply` 的返回后持有型 HTTP reply。
+  账本已将该所有权差异写明，不能把 borrowed Response 说成原样替代
+  上游 `webui_return_http`。
+- F5、右键菜单、release DevTools 的开关是 UI policy 差异；
+  不影响协议能力，不在本轮悄悄改变。
+
+### 本轮验证
+
+- `zig build test --summary all`：4/4 步成功，Zig 50/56 通过，六项既有
+  Linux-only 平台门禁跳过；Node bridge **18/18**。Deno/Node/Bun 实际执行。
+- `zig build --summary all`：13/13 步成功。
+- `zig build test-native -Dnative=true --summary all`：macOS WKWebView 实际
+  双窗口 smoke 成功，覆盖 bridge、geometry、controls、dispatch、close veto、
+  history、多窗口关闭；不是新的 drag/title 缺口验收。
+- 真实 Chromium + 临时 Zig 服务：延迟 token ACK，确认 OPEN 未认证时调用
+  等待后成功；真实 DOM 嵌套点击依次得到 general→named、inner→outer；
+  root HTML 胜过并存 TS；`/docs?name=zig%20ui` 跳到
+  `/docs/index.htm?name=zig%20ui`，相对 CSS 被加载且计算颜色正确。
+  后端收到结束调用，打印 `SMOKE_PASS` 并以 0 退出。
+- 浏览器截图工具超时，因此不声称像素/截图验收；上述结论来自实际页面、
+  DOM、网络调用、计算样式和服务退出结果。未重跑 Linux/Windows 原生运行、
+  五目标交叉构建或 fuzz；历史门禁不作为本轮新验收。
