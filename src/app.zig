@@ -2913,10 +2913,6 @@ fn cookieAdmit(
     return true;
 }
 
-/// Longest directory-index path accepted for interpreter dispatch, bounded so
-/// the lookup needs no allocation.
-const max_script_sub_path = 512;
-
 /// Wall-clock budget for one interpreter run, so a hanging script releases its
 /// connection instead of holding it forever.
 const runtime_timeout: std.Io.Clock.Duration = .{
@@ -2924,38 +2920,48 @@ const runtime_timeout: std.Io.Clock.Duration = .{
     .clock = .awake,
 };
 
-/// Return the sub-path of the script this request should run through the
-/// interpreter, or null when the request is not a readable script. Directory
-/// requests fall back to `index.ts` and then `index.js`, matching upstream.
+/// Return a readable script sub-path. Directory entry selection happens before
+/// runtime dispatch so static HTML indexes take precedence over scripts.
 /// The caller supplies the same canonical resource used by static serving.
 fn runtimeScript(
     dir: std.Io.Dir,
     io: std.Io,
     resource: []const u8,
-    buffer: []u8,
 ) ?[]const u8 {
-    if (resource.len == 0 or resource[resource.len - 1] == '/') {
-        for ([_][]const u8{ "index.ts", "index.js" }) |name| {
-            const candidate = std.fmt.bufPrint(
-                buffer,
-                "{s}{s}",
-                .{ resource, name },
-            ) catch return null;
-            if (readableScript(dir, io, candidate)) return candidate;
-        }
-        return null;
-    }
     const extension = std.fs.path.extension(resource);
     if (!std.mem.eql(u8, extension, ".js") and
         !std.mem.eql(u8, extension, ".ts"))
     {
         return null;
     }
-    if (!readableScript(dir, io, resource)) return null;
+    if (!readableResource(dir, io, resource)) return null;
     return resource;
 }
 
-fn readableScript(root: std.Io.Dir, io: std.Io, sub_path: []const u8) bool {
+/// Resolve physical directory entries without following symlinks. The returned
+/// name is static; no request path allocation or fixed-size path buffer is needed.
+fn directoryIndex(root: std.Io.Dir, io: std.Io, resource: []const u8) ?[]const u8 {
+    const path = std.mem.trimEnd(u8, resource, "/");
+    if (path.len != 0 and !safeSubPath(path)) return null;
+    var dir = root;
+    var owns_dir = false;
+    defer if (owns_dir) dir.close(io);
+    if (path.len != 0) {
+        var components = std.mem.splitScalar(u8, path, '/');
+        while (components.next()) |component| {
+            const child = dir.openDir(io, component, .{ .follow_symlinks = false }) catch return null;
+            if (owns_dir) dir.close(io);
+            dir = child;
+            owns_dir = true;
+        }
+    }
+    for ([_][]const u8{ "index.html", "index.htm", "index.ts", "index.js" }) |name| {
+        if (readableResource(dir, io, name)) return name;
+    }
+    return null;
+}
+
+fn readableResource(root: std.Io.Dir, io: std.Io, sub_path: []const u8) bool {
     if (!safeSubPath(sub_path)) return false;
     // Match Linsang's component-by-component no-follow static resolver.
     var components = std.mem.splitScalar(u8, sub_path, '/');
@@ -3220,13 +3226,26 @@ fn onRequest(
         },
         .directory => |directory| blk: {
             const dir = directory.dir orelse break :blk failResponse(response);
+            if (directoryIndex(dir, io, resolved.resource)) |entry| {
+                // Keep the encoded request path: decoding it into Location
+                // would turn literal %, # or ? filenames into URL syntax.
+                const location = std.fmt.allocPrint(app.gpa, "{s}{s}{s}{s}{s}", .{
+                    request.path,
+                    if (std.mem.endsWith(u8, request.path, "/")) "" else "/",
+                    entry,
+                    if (request.query.len == 0) "" else "?",
+                    request.query,
+                }) catch break :blk failResponse(response);
+                defer app.gpa.free(location);
+                response.setHeader("Location", location) catch break :blk failResponse(response);
+                response.status = .found;
+                break :blk .respond;
+            }
             if (window.runtime) |runtime| {
-                var script_buffer: [max_script_sub_path]u8 = undefined;
                 if (runtimeScript(
                     dir,
                     io,
                     resolved.resource,
-                    &script_buffer,
                 )) |sub_path| {
                     interpretScript(
                         window,
@@ -5168,7 +5187,7 @@ test "selected browser launch applies window controls and owns process" {
     try std.testing.expectError(error.NotRunning, window.open(io, &running));
 }
 
-test "runtime script lookup resolves indexes and rejects escapes" {
+test "runtime script lookup requires readable scripts and rejects escapes" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
     defer threaded.deinit();
@@ -5176,45 +5195,29 @@ test "runtime script lookup resolves indexes and rejects escapes" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "nested");
-    for ([_][]const u8{
-        "index.ts",
-        "index.js",
-        "page.js",
-        "page.mjs",
-        "nested/index.js",
-    }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+    for ([_][]const u8{ "page.js", "page.mjs" }) |name|
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
 
-    var buffer: [max_script_sub_path]u8 = undefined;
-    // A directory request prefers index.ts, exactly like upstream.
-    try std.testing.expectEqualStrings(
-        "index.ts",
-        runtimeScript(tmp.dir, io, "", &buffer).?,
-    );
-    try std.testing.expectEqualStrings(
-        "nested/index.js",
-        runtimeScript(tmp.dir, io, "nested/", &buffer).?,
-    );
     try std.testing.expectEqualStrings(
         "page.js",
-        runtimeScript(tmp.dir, io, "page.js", &buffer).?,
+        runtimeScript(tmp.dir, io, "page.js").?,
     );
     // Not a script extension, missing, or outside the directory.
     try std.testing.expectEqual(
         @as(?[]const u8, null),
-        runtimeScript(tmp.dir, io, "page.mjs", &buffer),
+        runtimeScript(tmp.dir, io, "page.mjs"),
     );
     try std.testing.expectEqual(
         @as(?[]const u8, null),
-        runtimeScript(tmp.dir, io, "absent.js", &buffer),
+        runtimeScript(tmp.dir, io, "absent.js"),
     );
     try std.testing.expectEqual(
         @as(?[]const u8, null),
-        runtimeScript(tmp.dir, io, "../page.js", &buffer),
+        runtimeScript(tmp.dir, io, "../page.js"),
     );
     try std.testing.expectEqual(
         @as(?[]const u8, null),
-        runtimeScript(tmp.dir, io, "nested/../../page.js", &buffer),
+        runtimeScript(tmp.dir, io, "nested/../../page.js"),
     );
     try std.testing.expect(!safeSubPath(""));
     try std.testing.expect(!safeSubPath("/etc/passwd"));
@@ -5426,7 +5429,7 @@ fn testRuntimeHttp(runtime: Runtime) !void {
         status: Linsang.Status,
         body: []const u8,
     }{
-        .{ .resource = "?name=zig", .status = .ok, .body = "interpreted:name=zig\n" },
+        .{ .resource = "index.js?name=zig", .status = .ok, .body = "interpreted:name=zig\n" },
         .{ .resource = "broken.js", .status = @enumFromInt(502), .body = "" },
         .{ .resource = "oversized.js", .status = @enumFromInt(502), .body = "" },
         .{ .resource = "index.%6as?encoded=suffix", .status = .ok, .body = "interpreted:encoded=suffix\n" },
@@ -5446,6 +5449,77 @@ fn testRuntimeHttp(runtime: Runtime) !void {
     }
     // A failed script must not prevent a later static request.
     try expectRuntimeStaticResponse(io, &running, window);
+}
+
+test "directory HTTP indexes preserve precedence, escaped paths, queries and relative assets" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "docs", "scripts", "js-only", "sp ace%", "empty" }) |path|
+        try tmp.dir.createDirPath(io, path);
+    const files = [_][]const u8{
+        "index.html",       "index.htm",         "index.ts",         "index.js",
+        "docs/index.htm",   "docs/asset.txt",    "scripts/index.ts", "scripts/index.js",
+        "js-only/index.js", "sp ace%/index.htm",
+    };
+    for (files) |path| try tmp.dir.writeFile(io, .{ .sub_path = path, .data = path });
+    const directory = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(directory);
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const windows = [_]Window{
+        try app.createWindow(.{ .content = .{ .directory = directory } }),
+        try app.createWindow(.{ .content = .{ .directory = directory }, .runtime = .node_js }),
+    };
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    const cases = [_]struct { request: []const u8, entry: []const u8, body: []const u8, script: bool = false }{
+        .{ .request = "?name=zig%20ui", .entry = "index.html?name=zig%20ui", .body = "index.html" },
+        .{ .request = "docs", .entry = "docs/index.htm", .body = "docs/index.htm" },
+        .{ .request = "docs/", .entry = "docs/index.htm", .body = "docs/index.htm" },
+        .{ .request = "scripts", .entry = "scripts/index.ts", .body = "scripts/index.ts", .script = true },
+        .{ .request = "js-only/", .entry = "js-only/index.js", .body = "js-only/index.js", .script = true },
+        .{ .request = "sp%20ace%25?x=%23", .entry = "sp%20ace%25/index.htm?x=%23", .body = "sp ace%/index.htm" },
+    };
+    for (windows, 0..) |window, index| {
+        for (cases) |case| {
+            const target = try std.fmt.allocPrint(gpa, "/{s}/{s}", .{ window.state.capability, case.request });
+            defer gpa.free(target);
+            const destination = try std.fmt.allocPrint(gpa, "/{s}/{s}", .{ window.state.capability, case.entry });
+            defer gpa.free(destination);
+            var response: [2048]u8 = undefined;
+            const wire = try getTestPath(running.inner.address, io, target, "\x00", &response);
+            try std.testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 302 "));
+            const header = try std.fmt.allocPrint(gpa, "Location: {s}\r\n", .{destination});
+            defer gpa.free(header);
+            try std.testing.expect(std.mem.indexOf(u8, wire, header) != null);
+            // Scripts are served verbatim only when interpretation is disabled;
+            // the separate real-runtime tests exercise their execution.
+            if (index == 0 or !case.script) {
+                const page = try getTestPath(running.inner.address, io, destination, "\x00", &response);
+                try std.testing.expect(std.mem.startsWith(u8, page, "HTTP/1.1 200 "));
+                const body_at = (std.mem.indexOf(u8, page, "\r\n\r\n") orelse return error.MissingHttpHeaders) + 4;
+                try std.testing.expectEqualStrings(case.body, page[body_at..]);
+            }
+        }
+        for ([_][]const u8{ "empty", "missing" }) |path| {
+            const target = try std.fmt.allocPrint(gpa, "/{s}/{s}", .{ window.state.capability, path });
+            defer gpa.free(target);
+            var response: [2048]u8 = undefined;
+            const wire = try getTestPath(running.inner.address, io, target, "\x00", &response);
+            try std.testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 404 "));
+        }
+    }
+    var response: [2048]u8 = undefined;
+    const asset = try std.fmt.allocPrint(gpa, "/{s}/docs/asset.txt", .{windows[0].state.capability});
+    defer gpa.free(asset);
+    const page = try getTestPath(running.inner.address, io, asset, "\x00", &response);
+    try std.testing.expect(std.mem.startsWith(u8, page, "HTTP/1.1 200 "));
+    const body_at = (std.mem.indexOf(u8, page, "\r\n\r\n") orelse return error.MissingHttpHeaders) + 4;
+    try std.testing.expectEqualStrings("docs/asset.txt", page[body_at..]);
 }
 
 test "runtime selection serves static HTTP requests without executing scripts" {
@@ -6114,12 +6188,12 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         ) == null);
     }
     {
-        var target: [capability_len + 2]u8 = undefined;
+        var target: [capability_len + 12]u8 = undefined;
         var response: [1024]u8 = undefined;
         const bytes = try getTestPath(
             running.inner.address,
             io,
-            try std.fmt.bufPrint(&target, "/{s}/", .{
+            try std.fmt.bufPrint(&target, "/{s}/index.html", .{
                 default_window.state.capability,
             }),
             "directory page",
@@ -6538,12 +6612,12 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
     );
     try std.testing.expectEqualStrings(first_url, directory_reload.payload);
     {
-        var target: [capability_len + 2]u8 = undefined;
+        var target: [capability_len + 12]u8 = undefined;
         var response: [1024]u8 = undefined;
         _ = try getTestPath(
             running.inner.address,
             io,
-            try std.fmt.bufPrint(&target, "/{s}/", .{
+            try std.fmt.bufPrint(&target, "/{s}/index.html", .{
                 window.state.capability,
             }),
             "directory page",
@@ -7332,9 +7406,17 @@ test "runtime rejects final and intermediate symlinks and nonregular scripts" {
     try tmp.dir.symLink(io, "../private", "public/linked", .{ .is_directory = true });
     const root = try tmp.dir.openDir(io, "public", .{});
     defer root.close(io);
-    try std.testing.expect(!readableScript(root, io, "link.js"));
-    try std.testing.expect(!readableScript(root, io, "linked/secret.js"));
-    try std.testing.expect(!readableScript(root, io, "not-file.js"));
+    try std.testing.expect(!readableResource(root, io, "link.js"));
+    try std.testing.expect(!readableResource(root, io, "linked/secret.js"));
+    try std.testing.expect(!readableResource(root, io, "not-file.js"));
+    try tmp.dir.writeFile(io, .{ .sub_path = "private/index.html", .data = "private index" });
+    try tmp.dir.symLink(io, "../private/index.html", "public/index.html", .{});
+    try std.testing.expect(directoryIndex(root, io, "") == null);
+    try std.testing.expect(directoryIndex(root, io, "linked") == null);
+    try std.testing.expect(directoryIndex(root, io, "../private") == null);
+    try tmp.dir.createDirPath(io, "public/index.htm");
+    try tmp.dir.writeFile(io, .{ .sub_path = "public/index.js", .data = "public script" });
+    try std.testing.expectEqualStrings("index.js", directoryIndex(root, io, "").?);
 }
 
 test "upgrade admission owns only accepted connections and removes every state" {
