@@ -8905,8 +8905,11 @@ test "silent and control-pinging upgrades expire and restore admission capacity"
     defer pinging.close(io);
     try waitForCount(io, &app.unauthenticated_connections, 2);
     // Control traffic must not refresh the absolute authentication deadline.
-    for (0..30) |_| {
-        try sendClientFrameOpcode(pinging, io, .ping, "");
+    // Ping for three seconds of wall time; a slow runner may already reach
+    // the five-second deadline, which closes the socket under the pings.
+    const pings_started = std.Io.Clock.Timestamp.now(io, .awake).raw.toMilliseconds();
+    while (std.Io.Clock.Timestamp.now(io, .awake).raw.toMilliseconds() - pings_started < 3000) {
+        sendClientFrameOpcode(pinging, io, .ping, "") catch break;
         try std.Io.sleep(io, .fromMilliseconds(100), .awake);
     }
     try std.Io.sleep(io, .fromMilliseconds(2500), .awake);
