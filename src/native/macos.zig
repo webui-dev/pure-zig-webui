@@ -269,6 +269,7 @@ pub const Backend = struct {
         // A close removes this window, but must not release our owning ref.
         send1(void, self.window, "setReleasedWhenClosed:", ObjcBool, yes(false));
         send1(void, self.window, "setDelegate:", Id, self.delegate);
+        self.applyMovable();
         // Suppress AppKit automatic tab grouping across independent WebUI windows.
         if (truth(send1(ObjcBool, self.window, "respondsToSelector:", Sel, sel_registerName("setTabbingMode:"))))
             send1(void, self.window, "setTabbingMode:", isize, 2);
@@ -395,6 +396,12 @@ pub const Backend = struct {
         send1(void, self.window, "setContentView:", Id, self.webview);
         send1(void, self.window, "setContentSize:", Size, content.size);
         send1(void, self.window, "setFrameOrigin:", Point, frame.origin);
+        self.applyMovable();
+    }
+    fn applyMovable(self: *Backend) void {
+        // Upstream WebUI: frameless windows move by dragging their background.
+        // WebKit decides which page points count as background.
+        send1(void, self.window, "setMovableByWindowBackground:", ObjcBool, yes(self.frameless and !self.kiosk));
     }
 
     pub fn close(self: *Backend) !void {
@@ -534,6 +541,7 @@ pub const Backend = struct {
             self.kiosk_level = send0(isize, self.window, "level");
             self.kiosk = true;
             send1(void, self.window, "setStyleMask:", usize, self.style());
+            self.applyMovable();
             // NSMainMenuWindowLevel + 1, from NSWindow.h/CGWindowLevel.h.
             // Per-window presentation: no app-wide menu/Dock changes or quit.
             send1(void, self.window, "setLevel:", isize, 25);
@@ -542,6 +550,7 @@ pub const Backend = struct {
             self.kiosk = false;
             send1(void, self.window, "setLevel:", isize, self.kiosk_level);
             send1(void, self.window, "setStyleMask:", usize, self.style());
+            self.applyMovable();
             send2(void, self.window, "setFrame:display:", Rect, self.kiosk_frame, ObjcBool, yes(true));
         }
     }
