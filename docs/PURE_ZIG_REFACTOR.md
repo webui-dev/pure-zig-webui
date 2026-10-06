@@ -52,13 +52,18 @@ is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 | Content composition | Embedded HTML plus disk assets and a custom override/fallthrough handler cannot be composed; resource-only replacement currently replaces page content and navigates. |
 | Entry and custom routing | No configured local entry file; custom handlers lack virtual-directory index probing. Physical directory index precedence and 302 redirects are fixed in this rescan. |
 | Live window lifecycle | `createWindow` rejects after start; no independent destroy/unregister/reclaim while other windows run. `close` is not a replacement for `destroy`. |
-| Wait lifecycle | Sticky cross-window close intent can bypass an unrelated reconnect grace; initial no-client `wait` lacks startup/stop completion. These are source findings, not newly reproduced regressions. |
 | Callback metadata | Named `Call` does not expose its binding name or click-vs-explicit-call origin; callbacks cannot access a bounded snapshot of the connection's cookies. |
 | Firefox app mode | No generated Firefox app profile/userChrome.css or managed preference setup. Existing caller-profile support and explicit high-contrast error do not implement those capabilities. |
 | Browser discovery | Registered Windows Chromium using `chrome.exe` and macOS bundles outside the fixed application directories lack upstream discovery paths. |
 | Native interaction | Missing GTK custom drag/edge resize, Windows draggable-region setup and resizable frameless host behavior, and Cocoa frameless background movement. |
 | Native page integration | No upstream page-title-to-host synchronization; no GTK engine-level navigation-policy interception independent of a live bridge. |
 | Default presentation | No upstream default fallback favicon. F5/context-menu/DevTools policy differences are intentional UI-policy candidates, not proof of missing protocol support. |
+
+Closed after the rescan, each with focused tests in the same change:
+
+| Area | Resolution |
+|---|---|
+| Wait lifecycle | Close intent, reconnect grace, and first-connection waiting are per window; `startup_timeout` and `Running.requestExit()` give the initial wait upstream's timeout and `webui_exit` completion. Tests: `wait state tracks startup, activity, reconnect grace, and close per window`, `wait keeps per-window close intent and honours exit requests`. |
 
 Borrowed custom HTTP handlers can await work before returning through `std.Io`;
 there is no owned post-return HTTP reply handle. This is an explicit Zig task
@@ -428,8 +433,8 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_set_icon()`, `webui_set_icon_file()` | `Window.setIcon()` copies inline data and MIME type; `Window.setIconFile()` loads a supported image file as the window favicon. |
 | `webui_set_profile()` | Caller-managed profiles and isolated owned Chromium profile leaves are supported. Partial: Firefox managed app profiles, chrome suppression and preference setup remain absent. |
 | `webui_set_proxy()` | `App.WindowOptions.proxy_server` is copied and passed as one Chromium-family `--proxy-server` argument. Unsupported browsers return an explicit error. |
-| `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. A 1.5-second reconnect grace is implemented, but sticky cross-window close intent and initial no-client wait completion remain known lifecycle gaps. |
-| `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `Running.stop()`, and `App.deinit()`. Partial: there is no independent running-window destroy/reclaim. |
+| `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. Each window is evaluated independently: a backend close ends only that window, other disconnects get a 1.5-second grace from the latest disconnect, and a new client clears that window's close intent. Never-connected windows wait for the startup timeout. A second concurrent waiter returns `error.AlreadyWaiting`. |
+| `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `Running.requestExit()`, `Running.stop()`, and `App.deinit()`. `requestExit()` closes every page and ends the active wait from any thread. Partial: there is no independent running-window destroy/reclaim. |
 | `webui_set_context()`, `webui_get_context()` | Binding and event-handler `user_data`. |
 | `webui_bind()` | `Window.bind(io, name, handler, user_data)` supports explicit calls, DOM clicks, and runtime replacement. `Window.onEvent(io, handler, user_data)` updates event handling. `CMD_ADD_ID` pushes new registrations and authentication replays current state; in-flight work keeps its handler snapshot. |
 | `webui_get_count()`, `webui_get_size()`, `webui_get_size_at()` | `Call.arguments.len` and `Call.bytes(index).len`. |
@@ -437,7 +442,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_return_string()`, `webui_return_int()`, `webui_return_float()`, `webui_return_bool()` | `Call.reply()`, `Call.replyInt()`, `Call.replyFloat()`, and `Call.replyBool()`. |
 | `webui_set_config(asynchronous_response)` | `Call.deferReply()` transfers the response to a bounded, owned, one-shot `PendingReply`. |
 | `webui_set_config(ui_event_blocking)`, `webui_set_event_blocking()` | `WindowOptions.event_mode` and `Window.setEventMode()` select serial or bounded concurrent binding and event execution. |
-| `webui_set_config(show_wait_connection)`, `webui_set_timeout()` | `Window.open()` remains non-blocking; callers explicitly compose it with `Window.waitForConnection(io, timeout)`. |
+| `webui_set_config(show_wait_connection)`, `webui_set_timeout()` | `App.Options.startup_timeout` (15 seconds by default, null for no limit) bounds first-connection waiting in `Running.wait()`, restarted by `Window.open()`/`openWithBrowser()` and extended five seconds per page or bridge request, like upstream. `Window.open()` stays non-blocking; compose it with `Window.waitForConnection(io, timeout)` for an explicit blocking show. |
 | `webui_run()`, `webui_script()` | `Window.run()` and `Window.eval()`. |
 | `webui_run_client()`, `webui_script_client()` | `Client.run()` and `Client.eval()`. |
 | `webui_close_client()`, `webui_navigate_client()`, `webui_send_raw_client()` | `Client.close()`, `Client.navigate()`, and `Client.sendRaw()`. |

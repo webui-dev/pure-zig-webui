@@ -16,6 +16,9 @@ pub fn main(init: std.process.Init) !void {
         .public = true,
         .use_cookies = true,
         .tls = .{ .certificate_pem = certificate, .private_key_pem = private_key },
+        // Remote visitors arrive whenever they like; never time out the
+        // first connection.
+        .startup_timeout = null,
     });
     defer app.deinit();
     const window = try app.createWindow(.{ .content = .{ .html = "<!doctype html><title>Caller-provided TLS</title><h1>Pure Zig WebUI over TLS</h1><script src='webui.js'></script>" } });

@@ -17,6 +17,11 @@ const cookie_name = "webui_auth";
 /// backend navigation before `Running.wait()` treats the application as
 /// closed. Matches upstream `WEBUI_RELOAD_TIMEOUT`.
 const reconnect_grace: std.Io.Duration = .fromMilliseconds(1500);
+/// Extra first-connection time after the latest page or bridge request,
+/// matching upstream's five-second "wait more" startup extension.
+const startup_activity_grace: std.Io.Duration = .fromSeconds(5);
+const no_activity = std.math.minInt(i64);
+const wait_forever = std.math.maxInt(i64);
 const favicon_link = "<link rel=\"icon\" href=\"favicon.ico\">";
 const directory_reload_script = "location.reload();";
 
@@ -583,8 +588,22 @@ const WindowState = struct {
     /// Whether registry updates should notify active browser peers.
     running: std.atomic.Value(bool) = .init(false),
     /// Set by backend `close` calls so `Running.wait()` skips the
-    /// reconnect grace period.
+    /// reconnect grace period. Cleared when a new client authenticates, so a
+    /// close intent never outlives this window's reconnection.
     close_requested: std.atomic.Value(bool) = .init(false),
+    /// Set when a client first authenticates during the current run.
+    ever_connected: std.atomic.Value(bool) = .init(false),
+    /// Awake-clock milliseconds of the latest HTTP request for this window.
+    last_request_ms: std.atomic.Value(i64) = .init(no_activity),
+    /// Awake-clock milliseconds of the first-connection deadline;
+    /// `wait_forever` when the startup timeout is disabled.
+    startup_deadline_ms: std.atomic.Value(i64) = .init(wait_forever),
+    /// Set when the app opened or launched a browser for this window, the
+    /// equivalent of upstream `webui_show`.
+    shown: std.atomic.Value(bool) = .init(false),
+    startup_timeout: ?std.Io.Duration = null,
+    /// Awake-clock milliseconds of the latest client disconnect.
+    last_disconnect_ms: std.atomic.Value(i64) = .init(no_activity),
     /// Single-client windows hand their cookie to exactly one client.
     cookie_issued: std.atomic.Value(bool) = .init(false),
     clients: std.ArrayList(ConnectedClient) = .empty,
@@ -958,7 +977,71 @@ const WindowState = struct {
         });
         self.next_client_id +%= 1;
         if (self.next_client_id == 0) self.next_client_id = 1;
+        // Upstream clears `is_closed` on reconnection; a stale backend close
+        // must not make a later reload of this window skip its grace period.
+        self.close_requested.store(false, .release);
+        self.ever_connected.store(true, .release);
         return .{ .state = self, .client_id = client_id };
+    }
+
+    /// Prepare first-connection tracking when this window starts serving.
+    fn beginServing(self: *WindowState, io: std.Io, startup_timeout: ?std.Io.Duration) void {
+        self.close_requested.store(false, .release);
+        self.cookie_issued.store(false, .release);
+        self.ever_connected.store(false, .release);
+        self.last_request_ms.store(no_activity, .release);
+        self.last_disconnect_ms.store(no_activity, .release);
+        self.shown.store(false, .release);
+        self.startup_timeout = startup_timeout;
+        self.restartStartup(io);
+    }
+
+    fn restartStartup(self: *WindowState, io: std.Io) void {
+        const timeout = self.startup_timeout orelse {
+            self.startup_deadline_ms.store(wait_forever, .release);
+            return;
+        };
+        const now = std.Io.Clock.Timestamp.now(io, .awake).raw.toMilliseconds();
+        self.startup_deadline_ms.store(now +| timeout.toMilliseconds(), .release);
+    }
+
+    /// Record a browser open or launch. Like upstream `webui_show`, the
+    /// startup timeout of a not-yet-connected window restarts here.
+    fn markShown(self: *WindowState, io: std.Io) void {
+        self.shown.store(true, .release);
+        if (!self.ever_connected.load(.acquire)) self.restartStartup(io);
+    }
+
+    fn recordRequest(self: *WindowState, io: std.Io) void {
+        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        self.last_request_ms.store(now.raw.toMilliseconds(), .release);
+    }
+
+    /// Whether this window keeps `Running.wait()` alive at `now`.
+    /// `any_connected` reports whether any window has connected this run:
+    /// until then every window waits for the startup timeout, so manually
+    /// opened URLs keep working; afterwards only shown windows do.
+    fn keepsWaiting(
+        self: *WindowState,
+        io: std.Io,
+        now: std.Io.Clock.Timestamp,
+        any_connected: bool,
+    ) bool {
+        if (self.hasClients(io)) return true;
+        if (self.close_requested.load(.acquire)) return false;
+        const now_ms = now.raw.toMilliseconds();
+        if (!self.ever_connected.load(.acquire)) {
+            const last = self.last_request_ms.load(.acquire);
+            if (last != no_activity and
+                now_ms -| last < startup_activity_grace.toMilliseconds())
+                return true;
+            if (any_connected and !self.shown.load(.acquire)) return false;
+            return now_ms < self.startup_deadline_ms.load(.acquire);
+        }
+        // Each disconnect restarts the grace, so a quick reload followed by
+        // a real close is still measured from the final disconnect.
+        const last = self.last_disconnect_ms.load(.acquire);
+        return last != no_activity and now_ms -| last < reconnect_grace.toMilliseconds();
     }
 
     fn client(self: *WindowState, connection: *Linsang.Connection) ?Client {
@@ -1014,6 +1097,10 @@ const WindowState = struct {
         const index = self.clientIndexByKey(@intFromPtr(connection)) orelse
             return null;
         var disconnected_client = self.clients.swapRemove(index);
+        self.last_disconnect_ms.store(
+            std.Io.Clock.Timestamp.now(connection.io, .awake).raw.toMilliseconds(),
+            .release,
+        );
         if (disconnected_client.multi) |*multi| multi.deinit(self.gpa);
         disconnected_client.retired_eval_ids.deinit(self.gpa);
         disconnected_client.peer.deinit();
@@ -1986,6 +2073,7 @@ pub const Window = struct {
             return error.ExplicitBrowserRequired;
         const page_url = try self.url(running, self.state.gpa);
         defer self.state.gpa.free(page_url);
+        self.state.markShown(io);
         try browser.openUrl(self.state.gpa, io, page_url);
     }
 
@@ -2001,6 +2089,7 @@ pub const Window = struct {
         const page_url = try self.url(running, self.state.gpa);
         defer self.state.gpa.free(page_url);
         const controls = self.state.browserControls(running.inner.io);
+        self.state.markShown(running.inner.io);
         return running.app.launchBrowser(
             running.inner.io,
             self.state,
@@ -2252,7 +2341,10 @@ pub const App = struct {
     managed_browsers: std.ArrayList(ManagedBrowser) = .empty,
     browser_mutex: std.Io.Mutex = .init,
     started: bool = false,
-    ever_connected: std.atomic.Value(bool) = .init(false),
+    /// Set by `Running.requestExit()` from any thread or handler.
+    exit_requested: std.atomic.Value(bool) = .init(false),
+    /// Guards the per-window reconnect state owned by one `Running.wait()`.
+    waiting: std.atomic.Value(bool) = .init(false),
     unauthenticated_connections: std.atomic.Value(usize) = .init(0),
     upgrades: std.ArrayList(Upgrade) = .empty,
     upgrade_mutex: std.Io.Mutex = .init,
@@ -2320,6 +2412,10 @@ pub const App = struct {
         /// Null disables monitoring. A positive duration recursively polls
         /// directory content and reloads connected clients after changes.
         folder_monitor_interval: ?std.Io.Duration = null,
+        /// How long `Running.wait()` keeps a never-connected window alive,
+        /// extended by five seconds after each page or bridge request. Null
+        /// waits indefinitely, like upstream `webui_set_timeout(0)`.
+        startup_timeout: ?std.Io.Duration = .fromSeconds(15),
         logger: ?Logger = null,
         logger_user_data: ?*anyopaque = null,
         limits: Limits = .{},
@@ -2497,12 +2593,10 @@ pub const App = struct {
                 } else break;
             }
         }
-        self.ever_connected.store(false, .release);
+        self.exit_requested.store(false, .release);
         self.unauthenticated_connections.store(0, .release);
-        for (self.windows.items) |window| {
-            window.close_requested.store(false, .release);
-            window.cookie_issued.store(false, .release);
-        }
+        for (self.windows.items) |window|
+            window.beginServing(io, self.options.startup_timeout);
         self.server = Linsang.Server.init(self.gpa, .{
             .address = self.options.address,
             .port = self.options.port,
@@ -2540,6 +2634,9 @@ pub const App = struct {
         if (self.options.folder_monitor_interval) |interval|
             if (interval.nanoseconds <= 0)
                 return error.InvalidFolderMonitorInterval;
+        if (self.options.startup_timeout) |timeout|
+            if (timeout.nanoseconds <= 0)
+                return error.InvalidStartupTimeout;
         const address = std.Io.net.IpAddress.parse(
             self.options.address,
             self.options.port,
@@ -2694,12 +2791,6 @@ pub const App = struct {
             if (window.hasClients(io)) return true;
         return false;
     }
-
-    fn closeRequested(self: *const App) bool {
-        for (self.windows.items) |window|
-            if (window.close_requested.load(.acquire)) return true;
-        return false;
-    }
 };
 
 pub const Running = struct {
@@ -2727,31 +2818,51 @@ pub const Running = struct {
         );
     }
 
+    /// Ask the active `wait()` to stop the application, like upstream
+    /// `webui_exit()`. Connected pages receive a backend close first. Safe to
+    /// call from any thread or handler; it never blocks on `wait()` itself.
+    pub fn requestExit(self: *const Running) void {
+        if (self.stopped) return;
+        for (self.app.windows.items) |window|
+            _ = window.broadcast(self.inner.io, .close, "") catch |err|
+                window.log(.warn, "Exit close notification failed: {}", .{err});
+        self.app.exit_requested.store(true, .release);
+    }
+
+    /// Block until every window is finished, then stop the application.
+    ///
+    /// Each window is evaluated independently. A connected window keeps the
+    /// wait alive. After its last client leaves, a backend close ends that
+    /// window immediately; other disconnects get the 1.5-second reconnect
+    /// grace so reloads and content replacement survive. Until any window
+    /// connects, every window waits up to `Options.startup_timeout`. After
+    /// that, a never-connected window keeps the wait alive only if it was
+    /// opened or launched, timed from that call like upstream `webui_show`.
+    /// A page or bridge request extends first-connection waiting by five
+    /// seconds. `requestExit()` ends the wait.
     pub fn wait(self: *Running) !void {
+        if (self.stopped) return;
+        const app = self.app;
+        if (app.waiting.swap(true, .acq_rel)) return error.AlreadyWaiting;
+        defer app.waiting.store(false, .release);
+        const io = self.inner.io;
         // ponytail: polling is enough for UI shutdown; use an event if latency
         // below 10 ms becomes meaningful.
-        const io = self.inner.io;
-        // A refresh or a backend navigation disconnects the page briefly, so
-        // an empty application only counts as closed after the reconnect
-        // grace period, matching upstream. A backend `close` ends the wait
-        // immediately.
-        var deadline: ?std.Io.Clock.Timestamp = null;
-        while (true) {
+        while (!app.exit_requested.load(.acquire)) {
+            const now = std.Io.Clock.Timestamp.now(io, .awake);
+            var any_connected = false;
+            for (app.windows.items) |window| {
+                if (window.ever_connected.load(.acquire)) any_connected = true;
+            }
+            var active = false;
+            for (app.windows.items) |window| {
+                if (window.keepsWaiting(io, now, any_connected)) {
+                    active = true;
+                    break;
+                }
+            }
+            if (!active) break;
             try std.Io.sleep(io, .fromMilliseconds(10), .awake);
-            if (!self.app.ever_connected.load(.acquire)) continue;
-            if (self.app.hasClients(io)) {
-                deadline = null;
-                continue;
-            }
-            if (self.app.closeRequested()) break;
-            if (deadline) |limit| {
-                if (limit.compare(.lte, .now(io, .awake))) break;
-            } else {
-                deadline = .fromNow(io, .{
-                    .clock = .awake,
-                    .raw = reconnect_grace,
-                });
-            }
         }
         try self.stop();
     }
@@ -3171,6 +3282,7 @@ fn onRequest(
     };
     const window = resolved.window;
     const io = app.server_io orelse return failResponse(response);
+    window.recordRequest(io);
     window.content_mutex.lockSharedUncancelable(io);
     defer window.content_mutex.unlockShared(io);
     if (std.mem.eql(u8, resolved.resource, "_webui_ws_connect")) {
@@ -3390,7 +3502,6 @@ fn onMessage(
         };
         app.authenticatedUpgrade(connection.io, @intFromPtr(connection));
         if (new_client) |client| {
-            app.ever_connected.store(true, .release);
             std.debug.assert(authenticated == null);
             window.applyGeometry(connection) catch |err|
                 window.log(.warn, "Browser geometry update failed: {}", .{err});
@@ -3563,6 +3674,148 @@ fn noopCallHandler(_: *Call, _: ?*anyopaque) !void {}
 /// not validated their shutdown timing, so only that platform skips them.
 fn requireSocketIntegration() !void {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+}
+
+test "wait state tracks startup, activity, reconnect grace, and close per window" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "wait" } });
+    const state = window.state;
+    const later = struct {
+        fn at(base: std.Io.Clock.Timestamp, milliseconds: i64) std.Io.Clock.Timestamp {
+            return base.addDuration(.{
+                .clock = .awake,
+                .raw = .fromMilliseconds(milliseconds),
+            });
+        }
+    }.at;
+
+    state.beginServing(io, .fromMilliseconds(100));
+    const base = std.Io.Clock.Timestamp.now(io, .awake);
+    try std.testing.expect(state.keepsWaiting(io, base, false));
+    try std.testing.expect(!state.keepsWaiting(io, later(base, 200), false));
+    // Once another window connected, only an opened window keeps waiting,
+    // and opening it restarts its startup timeout.
+    try std.testing.expect(!state.keepsWaiting(io, base, true));
+    state.markShown(io);
+    try std.testing.expect(state.shown.load(.acquire));
+    try std.testing.expect(state.keepsWaiting(io, base, true));
+    try std.testing.expect(!state.keepsWaiting(io, later(base, 5000), true));
+    // A page or bridge request extends first-connection waiting by 5 s.
+    state.last_request_ms.store(later(base, 150).raw.toMilliseconds(), .release);
+    try std.testing.expect(state.keepsWaiting(io, later(base, 200), false));
+    try std.testing.expect(state.keepsWaiting(io, later(base, 5100), true));
+    try std.testing.expect(!state.keepsWaiting(io, later(base, 5200), false));
+
+    // After a connection, a plain disconnect gets exactly the reload grace,
+    // measured from the latest disconnect.
+    state.ever_connected.store(true, .release);
+    state.last_disconnect_ms.store(base.raw.toMilliseconds(), .release);
+    try std.testing.expect(state.keepsWaiting(io, base, true));
+    try std.testing.expect(state.keepsWaiting(io, later(base, 1499), true));
+    try std.testing.expect(!state.keepsWaiting(io, later(base, 1500), true));
+    state.last_disconnect_ms.store(later(base, 1400).raw.toMilliseconds(), .release);
+    try std.testing.expect(state.keepsWaiting(io, later(base, 2800), true));
+    try std.testing.expect(!state.keepsWaiting(io, later(base, 2900), true));
+    // A backend close ends the window without any grace.
+    state.close_requested.store(true, .release);
+    try std.testing.expect(!state.keepsWaiting(io, base, true));
+
+    // Null startup timeout waits indefinitely for the first client, and a
+    // new run forgets the previous close intent and connection.
+    state.beginServing(io, null);
+    try std.testing.expect(!state.close_requested.load(.acquire));
+    try std.testing.expect(!state.ever_connected.load(.acquire));
+    try std.testing.expect(!state.shown.load(.acquire));
+    try std.testing.expect(state.keepsWaiting(io, later(base, 60 * 60 * 1000), false));
+    try std.testing.expect(!state.keepsWaiting(io, base, true));
+
+    var invalid = App.init(gpa, .{ .startup_timeout = .zero });
+    defer invalid.deinit();
+    _ = try invalid.createWindow(.{ .content = .{ .html = "invalid" } });
+    try std.testing.expectError(error.InvalidStartupTimeout, invalid.start(io));
+}
+
+test "wait keeps per-window close intent and honours exit requests" {
+    try requireSocketIntegration();
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var response_buffer: [256]u8 = undefined;
+
+    {
+        var app = App.init(gpa, .{});
+        defer app.deinit();
+        const first = try app.createWindow(.{ .content = .{ .html = "first" } });
+        const second = try app.createWindow(.{ .content = .{ .html = "second" } });
+        var running = try app.start(io);
+        defer running.stop() catch {};
+        const first_stream = try connectTestWebSocket(running.inner.address, io, &first.state.capability);
+        defer first_stream.close(io);
+        try std.testing.expect(try authenticateTestClient(first_stream, io, gpa, first.state.token, &first.state.capability, &response_buffer));
+        const second_stream = try connectTestWebSocket(running.inner.address, io, &second.state.capability);
+        defer second_stream.close(io);
+        try std.testing.expect(try authenticateTestClient(second_stream, io, gpa, second.state.token, &second.state.capability, &response_buffer));
+
+        var waiting = io.async(Running.wait, .{&running});
+        defer waiting.cancel(io) catch {};
+        for (0..1000) |_| {
+            if (app.waiting.load(.acquire)) break;
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectError(error.AlreadyWaiting, running.wait());
+
+        // Close the first window, then reload the second one. The first
+        // window's close intent must not end the second window's grace.
+        try std.testing.expectEqual(@as(usize, 1), try first.close(io));
+        const close = try protocol.decode(try readServerFrame(first_stream, io, &response_buffer));
+        try std.testing.expectEqual(protocol.Command.close, close.header.command);
+        try first_stream.shutdown(io, .both);
+        try second_stream.shutdown(io, .both);
+        for (0..200) |_| {
+            if (!first.isShown(io) and !second.isShown(io)) break;
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+        try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+        const reloaded = try connectTestWebSocket(running.inner.address, io, &second.state.capability);
+        defer reloaded.close(io);
+        try std.testing.expect(try authenticateTestClient(reloaded, io, gpa, second.state.token, &second.state.capability, &response_buffer));
+        try std.testing.expect(second.isShown(io));
+
+        const started = std.Io.Clock.Timestamp.now(io, .awake);
+        try reloaded.shutdown(io, .both);
+        try waiting.await(io);
+        const elapsed = started.untilNow(io).raw.toMilliseconds();
+        try std.testing.expect(elapsed >= reconnect_grace.toMilliseconds() - 50);
+    }
+
+    {
+        var app = App.init(gpa, .{ .startup_timeout = null });
+        defer app.deinit();
+        _ = try app.createWindow(.{ .content = .{ .html = "never connected" } });
+        var running = try app.start(io);
+        defer running.stop() catch {};
+        var waiting = io.async(Running.wait, .{&running});
+        defer waiting.cancel(io) catch {};
+        try std.Io.sleep(io, .fromMilliseconds(50), .awake);
+        running.requestExit();
+        try waiting.await(io);
+    }
+
+    {
+        var app = App.init(gpa, .{ .startup_timeout = .fromMilliseconds(50) });
+        defer app.deinit();
+        _ = try app.createWindow(.{ .content = .{ .html = "startup timeout" } });
+        var running = try app.start(io);
+        defer running.stop() catch {};
+        const started = std.Io.Clock.Timestamp.now(io, .awake);
+        try running.wait();
+        try std.testing.expect(started.untilNow(io).raw.toMilliseconds() < 1000);
+        try running.wait();
+    }
 }
 
 test "application logger receives level, message, and user data" {
@@ -6326,7 +6579,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         ));
         try unauthenticated.shutdown(io, .both);
         try std.Io.sleep(io, .fromMilliseconds(20), .awake);
-        try std.testing.expect(!app.ever_connected.load(.acquire));
+        try std.testing.expect(!window.state.ever_connected.load(.acquire));
     }
 
     const client = try connectTestWebSocket(

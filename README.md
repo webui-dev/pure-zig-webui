@@ -138,14 +138,28 @@ should run `zig build test-bridge`, which fails when Node is unavailable.
 `Window.evalAll` returns owned results; call `deinit` on them after consuming
 every per-client outcome.
 
-`Running.wait()` normally returns once every client is gone. Backend close
-requests bypass its 1.5-second reconnect grace period; other disconnects should
-receive that grace so reloads and `Window.setContent()` can reconnect.
-Known limitation: close intent is currently sticky across windows, so closing
-one window can bypass a later unrelated window's reload grace. An initial wait
-with no clients also lacks a startup/stop completion condition; explicitly use
-`Window.waitForConnection()` with a timeout before waiting for client shutdown.
-Bridge retries do not extend this grace period or restart a stopped backend.
+`Running.wait()` evaluates every window independently and returns, then stops
+the application, once no window remains active. A connected window is active.
+After its last client leaves, a backend `Window.close()` finishes that window
+immediately, while any other disconnect gets a 1.5-second reconnect grace
+measured from the latest disconnect, so reloads and `Window.setContent()` can
+reconnect. A close intent belongs to its own window and is cleared when that
+window authenticates a new client, so closing one window never shortens another
+window's reload grace.
+
+Until any window connects, every window waits up to
+`App.Options.startup_timeout` (15 seconds by default, like upstream
+`webui_set_timeout`). After that, a never-connected window keeps the wait alive
+only if `Window.open()` or `Window.openWithBrowser()` was called for it, timed
+from that call like upstream `webui_show`. Each page or bridge request extends
+first-connection waiting by five seconds for slow pages. Set
+`startup_timeout = null` to wait indefinitely for the first client; zero and
+negative durations return `error.InvalidStartupTimeout` from `start`.
+`Running.requestExit()` sends a backend close to every page and makes the
+active wait return, like `webui_exit()`; it is safe from handlers and other
+threads. Only one `wait()` may run at a time; another returns
+`error.AlreadyWaiting`, and `wait()` after `stop()` returns immediately.
+Bridge retries do not extend the grace period or restart a stopped backend.
 Longer outages can recover only while the application keeps its server running.
 
 `Window.open()` discovers the best installed browser and launches it as a
