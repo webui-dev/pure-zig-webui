@@ -10,8 +10,8 @@ compile or link the upstream WebUI C library or CivetWeb.
 support.
 
 The core rewrite is substantial, but full upstream behavioral parity is not
-complete. A fresh source audit found gaps in browser discovery and native
-drag/resize, title and navigation integration. See the
+complete. A fresh source audit found gaps in macOS browser discovery and
+native drag/resize, title and navigation integration. See the
 [open semantic gaps](docs/PURE_ZIG_REFACTOR.md#open-semantic-gaps)
 and the [source comparison](docs/UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
@@ -193,9 +193,13 @@ total timeout for connection waiting and JavaScript execution.
 Call `openUrl(gpa, io, url)` to open any non-empty URL with the OS default
 handler. `browserExists(gpa, io, browser)` checks an explicit `Browser`, while
 `bestBrowser(gpa, io)` returns the first installed browser in the preferred
-platform order or `null`. Discovery probes Windows application registration,
-standard macOS application bundles, and executable candidates on other
-platforms without opening the selected browser.
+platform order or `null`. Discovery never opens the selected browser. On
+Windows it probes `PATH` and the `App Paths` registration. Chrome and Chromium
+both install `chrome.exe`, so, like upstream, a folder with Google's
+`initial_preferences` or `master_preferences` file is Google Chrome and any
+other `chrome.exe` is Chromium. On macOS it checks the standard
+`/Applications` and `/System/Applications` bundles. Other platforms run each executable candidate
+on `PATH` with `--version`, like upstream.
 
 `Window.openWithBrowser(&running, options)` launches a selected `Browser`
 with an optional full executable path and additional argv. Chromium-family

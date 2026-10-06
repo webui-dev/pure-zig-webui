@@ -668,10 +668,17 @@ fn resolveWindowsExecutable(
     selected: Browser,
 ) !?[]u8 {
     const executable = windowsExecutable(selected);
-    if (try commandValue(gpa, io, &.{ "where.exe", executable }, null)) |path| return path;
-    // ponytail: Chrome and Chromium share chrome.exe on Windows; inspect
-    // installation metadata if standalone Chromium detection becomes needed.
-    if (selected == .chromium) return null;
+    if (try commandValue(gpa, io, &.{ "where.exe", executable }, null)) |path| {
+        if (try windowsChromeMatches(io, selected, path)) return path;
+        gpa.free(path);
+    }
+    // Chromium builds also install and register `chrome.exe`.
+    const registered = if (selected == .chromium) windowsExecutable(.chrome) else executable;
+    if (selected == .chromium)
+        if (try commandValue(gpa, io, &.{ "where.exe", registered }, null)) |path| {
+            if (try windowsChromeMatches(io, selected, path)) return path;
+            gpa.free(path);
+        };
 
     var key_buffer: [160]u8 = undefined;
     for ([_][]const u8{ "HKCU", "HKLM" }) |root| {
@@ -679,16 +686,46 @@ fn resolveWindowsExecutable(
             &key_buffer,
             "{s}\\Software\\Microsoft\\Windows\\CurrentVersion\\" ++
                 "App Paths\\{s}",
-            .{ root, executable },
+            .{ root, registered },
         );
-        if (try commandValue(gpa, io, &.{
+        const path = try commandValue(gpa, io, &.{
             "reg.exe",
             "query",
             key,
             "/ve",
-        }, "REG_SZ")) |path| return path;
+        }, "REG_SZ") orelse continue;
+        if (try windowsChromeMatches(io, selected, path)) return path;
+        gpa.free(path);
     }
     return null;
+}
+
+/// Chrome and Chromium share `chrome.exe`. Like upstream, a Google Chrome
+/// install is recognised by the `initial_preferences` or legacy
+/// `master_preferences` file Google's installer leaves beside it. Other
+/// browsers and a `chromium.exe` always match.
+fn windowsChromeMatches(io: std.Io, selected: Browser, executable_path: []const u8) !bool {
+    const shared = std.ascii.eqlIgnoreCase(std.fs.path.basenameWindows(executable_path), "chrome.exe");
+    return switch (selected) {
+        .chrome => try isGoogleChromeInstall(io, executable_path),
+        .chromium => !shared or !try isGoogleChromeInstall(io, executable_path),
+        else => true,
+    };
+}
+
+fn isGoogleChromeInstall(io: std.Io, executable_path: []const u8) !bool {
+    const folder = std.fs.path.dirnameWindows(executable_path) orelse return false;
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "initial_preferences", "master_preferences" }) |name| {
+        const path = std.fmt.bufPrint(&path_buffer, "{s}{c}{s}", .{ folder, std.fs.path.sep, name }) catch
+            return false;
+        std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied => continue,
+            else => return err,
+        };
+        return true;
+    }
+    return false;
 }
 
 fn resolveMacosExecutable(
@@ -1097,6 +1134,33 @@ test "browser focus has an explicit platform contract" {
             focusProcess(@as(ProcessId, 1)),
         );
     }
+}
+
+test "Windows Chrome and Chromium installs are told apart by Google's installer files" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "google/chrome.exe", "google/initial_preferences", "legacy/CHROME.EXE", "legacy/master_preferences", "chromium/chrome.exe", "renamed/chromium.exe" }) |sub_path| {
+        try tmp.dir.createDirPath(io, std.fs.path.dirname(sub_path).?);
+        try tmp.dir.writeFile(io, .{ .sub_path = sub_path, .data = "" });
+    }
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const Case = struct { path: []const u8, chrome: bool, chromium: bool };
+    for ([_]Case{
+        .{ .path = "google/chrome.exe", .chrome = true, .chromium = false },
+        .{ .path = "legacy/CHROME.EXE", .chrome = true, .chromium = false },
+        .{ .path = "chromium/chrome.exe", .chrome = false, .chromium = true },
+        // A dedicated executable name needs no installer evidence.
+        .{ .path = "renamed/chromium.exe", .chrome = false, .chromium = true },
+        // A registered path whose folder vanished is never Google Chrome.
+        .{ .path = "missing/chrome.exe", .chrome = false, .chromium = true },
+    }) |case| {
+        const path = try std.fmt.bufPrint(&buffer, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, case.path });
+        try std.testing.expectEqual(case.chrome, try windowsChromeMatches(io, .chrome, path));
+        try std.testing.expectEqual(case.chromium, try windowsChromeMatches(io, .chromium, path));
+        try std.testing.expect(try windowsChromeMatches(io, .edge, path));
+    }
+    try std.testing.expect(!try windowsChromeMatches(io, .chrome, "chrome.exe"));
 }
 
 test "browser candidates and preference order cover every browser" {
