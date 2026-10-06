@@ -24,6 +24,16 @@ const Backend = switch (builtin.os.tag) {
     else => void,
 };
 
+test {
+    // Backend files keep their focused tests beside the platform code.
+    _ = switch (builtin.os.tag) {
+        .macos => @import("native/macos.zig"),
+        .linux => @import("native/linux.zig"),
+        .windows => @import("native/windows.zig"),
+        else => void,
+    };
+}
+
 pub const Task = *const fn (Window, ?*anyopaque) anyerror!void;
 const QueuedTask = struct { callback: Task, user_data: ?*anyopaque };
 const State = struct {
