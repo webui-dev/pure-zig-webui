@@ -21,7 +21,12 @@ const GeometryHints = extern struct {
 const Rgba = extern struct { red: f64, green: f64, blue: f64, alpha: f64 };
 const Rectangle = extern struct { x: c_int, y: c_int, width: c_int, height: c_int };
 const close_channel = "pureZigWebUIClose";
-const close_script_source =
+const drag_channel = "pureZigWebUIDrag";
+const message_channels = [_][:0]const u8{ close_channel, drag_channel };
+// WebKitGTK has no CSS app-region support. Like upstream WebUI on Linux, a
+// press on an element whose `--webui-app-region` resolves to `drag` requests
+// one native move once the primary button starts moving.
+const document_script_source =
     \\(() => {
     \\    const post = window.webkit.messageHandlers.pureZigWebUIClose.postMessage.bind(
     \\        window.webkit.messageHandlers.pureZigWebUIClose);
@@ -30,7 +35,92 @@ const close_script_source =
     \\    });
     \\    Object.defineProperty(window, "__zigWebuiNativeClose", { value: window.close });
     \\})();
+    \\(() => {
+    \\    const handler = window.webkit.messageHandlers.pureZigWebUIDrag;
+    \\    const post = handler.postMessage.bind(handler);
+    \\    const region = (element) => {
+    \\        for (; element; element = element.parentElement) {
+    \\            const value = getComputedStyle(element).getPropertyValue("--webui-app-region").trim();
+    \\            if (value === "drag" || value === "no-drag") return value;
+    \\        }
+    \\        return "";
+    \\    };
+    \\    let armed = false;
+    \\    let dragging = false;
+    \\    document.addEventListener("mousedown", (event) => {
+    \\        dragging = false;
+    \\        armed = event.button === 0 && event.target instanceof Element && region(event.target) === "drag";
+    \\    });
+    \\    document.addEventListener("mousemove", (event) => {
+    \\        if (event.buttons !== 1) {
+    \\            armed = false;
+    \\            dragging = false;
+    \\            return;
+    \\        }
+    \\        if (armed && !dragging) {
+    \\            dragging = true;
+    \\            post(true);
+    \\        }
+    \\    });
+    \\    document.addEventListener("mouseup", () => {
+    \\        armed = false;
+    \\        dragging = false;
+    \\    });
+    \\})();
 ;
+// Frameless resize hit area inside the WebView edges, as in upstream WebUI.
+const resize_border = 6;
+// GdkWindowEdge values; corners are tested before sides.
+const Edge = enum(c_int) { north_west = 0, north = 1, north_east = 2, west = 3, east = 4, south_west = 5, south = 6, south_east = 7 };
+const cursor_names = [_][:0]const u8{ "ns-resize", "ew-resize", "nwse-resize", "nesw-resize" };
+/// Resize edge under a WebView-relative point, or null for the interior.
+fn hitEdge(width: c_int, height: c_int, x: f64, y: f64) ?Edge {
+    const right_band: f64 = @floatFromInt(width - resize_border);
+    const bottom_band: f64 = @floatFromInt(height - resize_border);
+    const left = x < resize_border;
+    const right = x >= right_band;
+    const top = y < resize_border;
+    const bottom = y >= bottom_band;
+    if (top and left) return .north_west;
+    if (top and right) return .north_east;
+    if (bottom and left) return .south_west;
+    if (bottom and right) return .south_east;
+    if (top) return .north;
+    if (bottom) return .south;
+    if (left) return .west;
+    if (right) return .east;
+    return null;
+}
+
+// GdkEventButton and GdkEventMotion from gdk/gdkevents.h (GTK 3).
+const EventButton = extern struct {
+    type: c_int,
+    window: ?Object,
+    send_event: i8,
+    time: u32,
+    x: f64,
+    y: f64,
+    axes: ?*f64,
+    state: c_uint,
+    button: c_uint,
+    device: ?Object,
+    x_root: f64,
+    y_root: f64,
+};
+const EventMotion = extern struct {
+    type: c_int,
+    window: ?Object,
+    send_event: i8,
+    time: u32,
+    x: f64,
+    y: f64,
+    axes: ?*f64,
+    state: c_uint,
+    is_hint: i16,
+    device: ?Object,
+    x_root: f64,
+    y_root: f64,
+};
 
 const Api = struct {
     gtk_init_check: *const fn (?*c_int, ?*?[*:null]?[*:0]u8) callconv(.c) c_int,
@@ -49,6 +139,7 @@ const Api = struct {
     gtk_widget_get_realized: *const fn (Object) callconv(.c) c_int,
     gtk_widget_get_mapped: *const fn (Object) callconv(.c) c_int,
     gtk_widget_get_window: *const fn (Object) callconv(.c) ?Object,
+    gtk_widget_add_events: *const fn (Object, c_int) callconv(.c) void,
     gtk_container_add: *const fn (Object, Object) callconv(.c) void,
     gtk_window_set_title: *const fn (Object, [*:0]const u8) callconv(.c) void,
     gtk_window_get_title: *const fn (Object) callconv(.c) ?[*:0]const u8,
@@ -68,11 +159,19 @@ const Api = struct {
     gtk_window_maximize: *const fn (Object) callconv(.c) void,
     gtk_window_unmaximize: *const fn (Object) callconv(.c) void,
     gtk_window_present: *const fn (Object) callconv(.c) void,
+    gtk_window_begin_move_drag: *const fn (Object, c_int, c_int, c_int, u32) callconv(.c) void,
+    gtk_window_begin_resize_drag: *const fn (Object, c_int, c_int, c_int, c_int, u32) callconv(.c) void,
     gdk_screen_get_rgba_visual: *const fn (Object) callconv(.c) ?Object,
     gdk_screen_is_composited: *const fn (Object) callconv(.c) c_int,
     gdk_display_get_monitor_at_window: *const fn (Object, Object) callconv(.c) ?Object,
     gdk_monitor_get_workarea: *const fn (Object, *Rectangle) callconv(.c) void,
     gdk_window_get_frame_extents: *const fn (Object, *Rectangle) callconv(.c) void,
+    gdk_window_get_device_position: *const fn (Object, Object, ?*c_int, ?*c_int, *c_uint) callconv(.c) ?Object,
+    gdk_window_set_cursor: *const fn (Object, ?Object) callconv(.c) void,
+    gdk_display_get_default_seat: *const fn (Object) callconv(.c) ?Object,
+    gdk_seat_get_pointer: *const fn (Object) callconv(.c) ?Object,
+    gdk_device_get_position: *const fn (Object, ?*?Object, *c_int, *c_int) callconv(.c) void,
+    gdk_cursor_new_from_name: *const fn (Object, [*:0]const u8) callconv(.c) ?Object,
     g_type_check_instance_is_a: *const fn (Object, usize) callconv(.c) c_int,
     g_object_ref: *const fn (Object) callconv(.c) Object,
     g_object_ref_sink: *const fn (Object) callconv(.c) Object,
@@ -154,11 +253,15 @@ pub const Backend = struct {
     view: ?Object = null,
     context: ?Object = null,
     content_manager: ?Object = null,
-    close_script: ?Object = null,
-    message_signal: c_ulong = 0,
-    message_registered: bool = false,
+    document_script: ?Object = null,
+    message_signals: [message_channels.len]c_ulong = @splat(0),
+    registered_channels: usize = 0,
     window_signals: [3]c_ulong = .{ 0, 0, 0 },
-    view_signals: [2]c_ulong = .{ 0, 0 },
+    view_signals: [4]c_ulong = @splat(0),
+    cursors: [cursor_names.len]?Object = @splat(null),
+    edge_cursor_shown: bool = false,
+    frameless: bool = false,
+    resizable: bool = true,
     close_handler: ?types.CloseHandler,
     user_data: ?*anyopaque,
     closed: bool = false,
@@ -233,20 +336,28 @@ pub const Backend = struct {
         // Intercept at document start instead: veto never closes the DOM page.
         const content_manager = api.webkit_web_view_get_user_content_manager(view) orelse return error.NativeInitializationFailed;
         self.content_manager = api.g_object_ref(content_manager);
-        self.message_signal = try self.connect(content_manager, "script-message-received::" ++ close_channel, @ptrCast(&scriptMessage));
-        if (api.webkit_user_content_manager_register_script_message_handler(content_manager, close_channel) == 0)
-            return error.NativeInitializationFailed;
-        self.message_registered = true;
+        self.message_signals[0] = try self.connect(content_manager, "script-message-received::" ++ close_channel, @ptrCast(&scriptMessage));
+        self.message_signals[1] = try self.connect(content_manager, "script-message-received::" ++ drag_channel, @ptrCast(&dragMessage));
+        for (message_channels) |channel| {
+            if (api.webkit_user_content_manager_register_script_message_handler(content_manager, channel) == 0)
+                return error.NativeInitializationFailed;
+            self.registered_channels += 1;
+        }
         // WEBKIT_USER_CONTENT_INJECT_TOP_FRAME, DOCUMENT_START. The manager
         // installs the script for every navigation; BFCache retains the override.
-        self.close_script = api.webkit_user_script_new(close_script_source, 1, 0, null, null) orelse return error.NativeInitializationFailed;
-        api.webkit_user_content_manager_add_script(content_manager, self.close_script.?);
+        self.document_script = api.webkit_user_script_new(document_script_source, 1, 0, null, null) orelse return error.NativeInitializationFailed;
+        api.webkit_user_content_manager_add_script(content_manager, self.document_script.?);
 
         self.window_signals[0] = try self.connect(window, "delete-event", @ptrCast(&deleteEvent));
         self.window_signals[1] = try self.connect(window, "destroy", @ptrCast(&destroyed));
         self.window_signals[2] = try self.connect(window, "draw", @ptrCast(&draw));
         self.view_signals[0] = try self.connect(view, "web-process-terminated", @ptrCast(&processTerminated));
         self.view_signals[1] = try self.connect(view, "notify::title", @ptrCast(&titleChanged));
+        // Edge handlers stay connected and consult the current frameless and
+        // resizable state, so runtime setters need no reconnection.
+        api.gtk_widget_add_events(view, 4 | 256); // GDK_POINTER_MOTION_MASK | GDK_BUTTON_PRESS_MASK
+        self.view_signals[2] = try self.connect(view, "button-press-event", @ptrCast(&buttonPressed));
+        self.view_signals[3] = try self.connect(view, "motion-notify-event", @ptrCast(&pointerMoved));
 
         // GTK/WebKit setters copy strings synchronously; no borrowed Options
         // slices or URL buffers are retained in this backend.
@@ -276,23 +387,24 @@ pub const Backend = struct {
     fn releaseObjects(self: *Backend) void {
         self.removePendingClose();
         if (self.content_manager) |manager| {
-            self.disconnect(manager, self.message_signal);
-            self.message_signal = 0;
-            if (self.message_registered) {
-                self.api.webkit_user_content_manager_unregister_script_message_handler(manager, close_channel);
-                self.message_registered = false;
+            for (&self.message_signals) |*signal| {
+                self.disconnect(manager, signal.*);
+                signal.* = 0;
             }
-            if (self.close_script) |script| {
+            for (message_channels[0..self.registered_channels]) |channel|
+                self.api.webkit_user_content_manager_unregister_script_message_handler(manager, channel);
+            self.registered_channels = 0;
+            if (self.document_script) |script| {
                 self.api.webkit_user_content_manager_remove_script(manager, script);
                 self.api.webkit_user_script_unref(script);
-                self.close_script = null;
+                self.document_script = null;
             }
             self.api.g_object_unref(manager);
             self.content_manager = null;
         }
         if (self.view) |view| {
             for (self.view_signals) |signal| self.disconnect(view, signal);
-            self.view_signals = .{ 0, 0 };
+            self.view_signals = @splat(0);
             // A retained GtkWidget pointer can already have been disposed by
             // gtk_widget_destroy; only call WebKit methods before that point.
             if (!self.closed) self.api.webkit_web_view_stop_loading(view);
@@ -312,6 +424,10 @@ pub const Backend = struct {
         if (self.context) |context| {
             self.api.g_object_unref(context);
             self.context = null;
+        }
+        for (&self.cursors) |*cursor| {
+            if (cursor.*) |value| self.api.g_object_unref(value);
+            cursor.* = null;
         }
     }
 
@@ -430,10 +546,12 @@ pub const Backend = struct {
 
     pub fn setResizable(self: *Backend, value: bool) !void {
         self.api.gtk_window_set_resizable(try self.liveWindow(), @intFromBool(value));
+        self.resizable = value;
     }
 
     pub fn setFrameless(self: *Backend, value: bool) !void {
         self.api.gtk_window_set_decorated(try self.liveWindow(), @intFromBool(!value));
+        self.frameless = value;
     }
 
     pub fn setTransparent(self: *Backend, value: bool) !void {
@@ -566,6 +684,73 @@ pub const Backend = struct {
         self.requestClose();
     }
 
+    fn dragMessage(_: Object, result: Object, data: ?Object) callconv(.c) void {
+        const self: *Backend = @ptrCast(@alignCast(data.?));
+        const value = self.api.webkit_javascript_result_get_js_value(result) orelse return;
+        if (self.api.jsc_value_is_boolean(value) == 0 or self.api.jsc_value_to_boolean(value) == 0) return;
+        self.beginMove();
+    }
+
+    /// Hand a page-requested move to the window manager. Pages control this
+    /// channel, so a request is honored only while the primary button is held.
+    fn beginMove(self: *Backend) void {
+        if (self.closed or self.close_requested) return;
+        const window = self.window orelse return;
+        const display = self.api.gtk_widget_get_display(window) orelse return;
+        const native_window = self.api.gtk_widget_get_window(window) orelse return;
+        const seat = self.api.gdk_display_get_default_seat(display) orelse return;
+        const pointer = self.api.gdk_seat_get_pointer(seat) orelse return;
+        var mask: c_uint = 0;
+        _ = self.api.gdk_window_get_device_position(native_window, pointer, null, null, &mask);
+        if (mask & (1 << 8) == 0) return; // GDK_BUTTON1_MASK
+        var x: c_int = 0;
+        var y: c_int = 0;
+        self.api.gdk_device_get_position(pointer, null, &x, &y);
+        self.api.gtk_window_begin_move_drag(window, 1, x, y, 0); // GDK_CURRENT_TIME
+    }
+
+    fn edgeAt(self: *const Backend, widget: Object, x: f64, y: f64) ?Edge {
+        if (!self.frameless or !self.resizable or self.closed or self.close_requested) return null;
+        return hitEdge(self.api.gtk_widget_get_allocated_width(widget), self.api.gtk_widget_get_allocated_height(widget), x, y);
+    }
+
+    fn cursorFor(self: *Backend, widget: Object, edge: Edge) ?Object {
+        const index: usize = switch (edge) {
+            .north, .south => 0,
+            .west, .east => 1,
+            .north_west, .south_east => 2,
+            .north_east, .south_west => 3,
+        };
+        if (self.cursors[index] == null) {
+            const display = self.api.gtk_widget_get_display(widget) orelse return null;
+            self.cursors[index] = self.api.gdk_cursor_new_from_name(display, cursor_names[index]);
+        }
+        return self.cursors[index];
+    }
+
+    fn buttonPressed(widget: Object, event: *const EventButton, data: ?Object) callconv(.c) c_int {
+        const self: *Backend = @ptrCast(@alignCast(data.?));
+        if (event.type != 4 or event.button != 1) return 0; // GDK_BUTTON_PRESS, primary
+        const edge = self.edgeAt(widget, event.x, event.y) orelse return 0;
+        const window = self.window orelse return 0;
+        self.api.gtk_window_begin_resize_drag(window, @intFromEnum(edge), 1, std.math.lossyCast(c_int, event.x_root), std.math.lossyCast(c_int, event.y_root), event.time);
+        return 1;
+    }
+
+    fn pointerMoved(widget: Object, event: *const EventMotion, data: ?Object) callconv(.c) c_int {
+        const self: *Backend = @ptrCast(@alignCast(data.?));
+        const native_window = self.api.gtk_widget_get_window(widget) orelse return 0;
+        const edge = self.edgeAt(widget, event.x, event.y) orelse {
+            // WebKit caches its own cursor; drop ours so the page's shows again.
+            if (self.edge_cursor_shown) self.api.gdk_window_set_cursor(native_window, null);
+            self.edge_cursor_shown = false;
+            return 0;
+        };
+        self.api.gdk_window_set_cursor(native_window, self.cursorFor(widget, edge));
+        self.edge_cursor_shown = true;
+        return 1;
+    }
+
     fn destroyed(_: Object, data: ?Object) callconv(.c) void {
         const self: *Backend = @ptrCast(@alignCast(data.?));
         self.closed = true;
@@ -594,3 +779,20 @@ pub const Backend = struct {
         return 0; // Continue GTK's draw so the WebKit child is painted.
     }
 };
+
+test "frameless resize hit-testing prefers corners within the edge band" {
+    try std.testing.expectEqual(Edge.north_west, hitEdge(640, 420, 0, 0).?);
+    try std.testing.expectEqual(Edge.north_east, hitEdge(640, 420, 639, 5.5).?);
+    try std.testing.expectEqual(Edge.south_west, hitEdge(640, 420, 5.9, 419).?);
+    try std.testing.expectEqual(Edge.south_east, hitEdge(640, 420, 634, 414).?);
+    try std.testing.expectEqual(Edge.north, hitEdge(640, 420, 320, 0).?);
+    try std.testing.expectEqual(Edge.south, hitEdge(640, 420, 320, 414).?);
+    try std.testing.expectEqual(Edge.west, hitEdge(640, 420, 0, 210).?);
+    try std.testing.expectEqual(Edge.east, hitEdge(640, 420, 638, 210).?);
+    // Just inside the 6 px band on each side is interior.
+    try std.testing.expectEqual(@as(?Edge, null), hitEdge(640, 420, 6, 6));
+    try std.testing.expectEqual(@as(?Edge, null), hitEdge(640, 420, 633.9, 413.9));
+    // Tiny allocations stay well-defined: every point is on an edge.
+    try std.testing.expectEqual(Edge.north_west, hitEdge(4, 4, 1, 1).?);
+    try std.testing.expectEqual(Edge.north_west, hitEdge(0, 0, 0, 0).?);
+}
