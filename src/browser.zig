@@ -493,6 +493,49 @@ pub fn deleteManagedProfile(
     return deleteProfilePath(io, path);
 }
 
+/// Preferences written to every generated Firefox profile, like upstream:
+/// userChrome.css support, no default-browser check, close warning, or tabs
+/// in the title bar. The first-run pages are also suppressed, matching
+/// Chromium's `--no-first-run`.
+const firefox_user_js =
+    \\user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
+    \\user_pref("browser.shell.checkDefaultBrowser", false);
+    \\user_pref("browser.tabs.warnOnClose", false);
+    \\user_pref("browser.tabs.inTitlebar", 0);
+    \\user_pref("browser.startup.homepage_override.mstone", "ignore");
+    \\user_pref("startup.homepage_welcome_url", "");
+    \\user_pref("startup.homepage_welcome_url.additional", "");
+    \\user_pref("browser.aboutwelcome.enabled", false);
+    \\user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
+    \\
+;
+/// Upstream's userChrome.css: hide the toolbars so the page fills the window.
+const firefox_user_chrome =
+    "#navigator-toolbox,#TabsToolbar,#nav-bar,#PersonalToolbar,#sidebar-box{" ++
+    "visibility:collapse!important;height:0!important;margin:0!important;padding:0!important;}" ++
+    "#titlebar{visibility:visible!important;display:flex!important;}#browser{" ++
+    "margin-top:0!important;padding-top:0!important;}";
+
+/// Write WebUI's app-mode settings into a generated Firefox profile. Firefox
+/// applies `user.js` at every start, so it is rewritten on each launch and a
+/// changed high-contrast setting takes effect; 0 restores Firefox's default
+/// after an earlier launch stored 1 in prefs.js.
+fn prepareFirefoxProfile(io: std.Io, directory: []const u8, high_contrast: bool) !void {
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, directory);
+    var profile = try cwd.openDir(io, directory, .{});
+    defer profile.close(io);
+    try profile.writeFile(io, .{
+        .sub_path = "user.js",
+        .data = if (high_contrast)
+            firefox_user_js ++ "user_pref(\"browser.display.document_color_use\", 0);\n"
+        else
+            firefox_user_js ++ "user_pref(\"browser.display.document_color_use\", 1);\n",
+    });
+    try profile.createDirPath(io, "chrome");
+    try profile.writeFile(io, .{ .sub_path = "chrome/userChrome.css", .data = firefox_user_chrome });
+}
+
 /// Internal ownership helper; only call with a generated root or retained leaf.
 pub fn deleteProfilePath(io: std.Io, path: []const u8) !bool {
     const parent_path = std.fs.path.dirname(path) orelse return false;
@@ -871,6 +914,41 @@ test "managed profiles and default arguments cover the chromium family" {
     );
     for (chromium_defaults) |argument|
         try std.testing.expectStringStartsWith(argument, "--");
+}
+
+test "generated Firefox profiles receive WebUI app-mode settings" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/firefox/window",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(directory);
+    var buffer: [2048]u8 = undefined;
+    try prepareFirefoxProfile(io, directory, false);
+    var user_js = try tmp.dir.readFile(io, "firefox/window/user.js", &buffer);
+    try std.testing.expect(std.mem.startsWith(u8, user_js, firefox_user_js));
+    try std.testing.expect(std.mem.endsWith(u8, user_js, "user_pref(\"browser.display.document_color_use\", 1);\n"));
+    try std.testing.expectEqualStrings(
+        firefox_user_chrome,
+        try tmp.dir.readFile(io, "firefox/window/chrome/userChrome.css", &buffer),
+    );
+    // Relaunching rewrites rather than appends, and restores the default.
+    try prepareFirefoxProfile(io, directory, true);
+    user_js = try tmp.dir.readFile(io, "firefox/window/user.js", &buffer);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, user_js, "legacyUserProfileCustomizations"));
+    try std.testing.expect(std.mem.endsWith(u8, user_js, "user_pref(\"browser.display.document_color_use\", 0);\n"));
+    try std.testing.expectEqualStrings(
+        firefox_user_chrome,
+        try tmp.dir.readFile(io, "firefox/window/chrome/userChrome.css", &buffer),
+    );
+    // A file where the profile should be is reported, not replaced.
+    try tmp.dir.writeFile(io, .{ .sub_path = "occupied", .data = "" });
+    const occupied = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/occupied", .{tmp.sub_path});
+    defer std.testing.allocator.free(occupied);
+    try std.testing.expectError(error.NotDir, prepareFirefoxProfile(io, occupied, true));
 }
 
 test "parent process ID identifies the backend process" {
