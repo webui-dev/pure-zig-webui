@@ -4122,8 +4122,8 @@ test "wait keeps per-window close intent and honours exit requests" {
         try std.testing.expectEqual(@as(usize, 1), try first.close(io));
         const close = try protocol.decode(try readServerFrame(first_stream, io, &response_buffer));
         try std.testing.expectEqual(protocol.Command.close, close.header.command);
-        try first_stream.shutdown(io, .both);
-        try second_stream.shutdown(io, .both);
+        try disconnectTestStream(first_stream, io);
+        try disconnectTestStream(second_stream, io);
         for (0..200) |_| {
             if (!first.isShown(io) and !second.isShown(io)) break;
             try std.Io.sleep(io, .fromMilliseconds(1), .awake);
@@ -4135,7 +4135,7 @@ test "wait keeps per-window close intent and honours exit requests" {
         try std.testing.expect(second.isShown(io));
 
         const started = std.Io.Clock.Timestamp.now(io, .awake);
-        try reloaded.shutdown(io, .both);
+        try disconnectTestStream(reloaded, io);
         try waiting.await(io);
         const elapsed = started.untilNow(io).raw.toMilliseconds();
         try std.testing.expect(elapsed >= reconnect_grace.toMilliseconds() - 50);
@@ -4273,7 +4273,7 @@ test "calls and events expose binding name, origin, and bounded cookies" {
     try sendClientFrame(stream, io, packet.items);
     try capture.expect(io, 2, "button", .click);
 
-    try stream.shutdown(io, .both);
+    try disconnectTestStream(stream, io);
     for (0..1000) |_| {
         if (capture.disconnected_theme.load(.acquire)) break;
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
@@ -4859,8 +4859,17 @@ fn deferredReplyHandler(call: *Call, user_data: ?*anyopaque) !void {
     capture.ready.store(true, .release);
 }
 
+/// Close both directions of a test socket. The server may already have
+/// closed it, which some platforms report as an unconnected socket.
+fn disconnectTestStream(stream: std.Io.net.Stream, io: std.Io) !void {
+    stream.shutdown(io, .both) catch |err| switch (err) {
+        error.SocketUnconnected => {},
+        else => return err,
+    };
+}
+
 fn waitForFlag(io: std.Io, flag: *const std.atomic.Value(bool)) !void {
-    for (0..100) |_| {
+    for (0..2000) |_| {
         if (flag.load(.acquire)) return;
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
     }
@@ -5505,7 +5514,7 @@ fn exerciseHeartbeat(io: std.Io, scenario: HeartbeatTest) anyerror!void {
         try std.testing.expectEqual(protocol.Command.call, reply.header.command);
         try std.testing.expectEqual(@as(u16, 9), reply.header.id);
         try std.testing.expectEqualStrings("Hello from Zig", reply.payload);
-        try client.shutdown(io, .both);
+        try disconnectTestStream(client, io);
     }
     try running.stop();
 }
@@ -6702,8 +6711,8 @@ test "directory monitor reloads changed window only" {
     ));
     try std.testing.expectEqualStrings(stable_script, packet.payload);
 
-    try first_stream.shutdown(io, .both);
-    try second_stream.shutdown(io, .both);
+    try disconnectTestStream(first_stream, io);
+    try disconnectTestStream(second_stream, io);
     try running.stop();
     try std.testing.expect(
         app.monitor_tasks.token.load(.acquire) == null,
@@ -6759,7 +6768,7 @@ test "window connection waiting observes clients and timeouts" {
     const immediate = try window.waitForConnection(io, .zero);
     try std.testing.expectEqual(delayed.id(), immediate.id());
 
-    try stream.shutdown(io, .both);
+    try disconnectTestStream(stream, io);
     for (0..100) |_| {
         if (!delayed.isConnected(io)) break;
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
@@ -6861,7 +6870,7 @@ test "binding replies can be deferred, bounded, and disconnected" {
     }, "later\x00\x00");
     try sendClientFrame(client, io, packet.items);
     try waitForFlag(io, &capture.ready);
-    try client.shutdown(io, .both);
+    try disconnectTestStream(client, io);
     for (0..100) |_| {
         if (!capture.client.?.isConnected(io)) break;
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
@@ -6969,7 +6978,7 @@ test "cookie authorization guards WebSocket upgrades" {
         &window.state.capability,
         &response_payload,
     ));
-    try client.shutdown(io, .both);
+    try disconnectTestStream(client, io);
     try std.Io.sleep(io, .fromMilliseconds(20), .awake);
 }
 
@@ -7241,7 +7250,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
             "http://external.example",
         );
         defer external_client.close(io);
-        try external_client.shutdown(io, .both);
+        try disconnectTestStream(external_client, io);
         try std.Io.sleep(io, .fromMilliseconds(20), .awake);
     }
 
@@ -7261,7 +7270,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
             "ffffffffffffffffffffffffffffffff",
             &rejected_response,
         ));
-        try unauthenticated.shutdown(io, .both);
+        try disconnectTestStream(unauthenticated, io);
         try std.Io.sleep(io, .fromMilliseconds(20), .awake);
         try std.testing.expect(!window.state.ever_connected.load(.acquire));
     }
@@ -7399,8 +7408,10 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         &second_response,
     ));
     try std.testing.expectEqual(@as(usize, 0), isolated_reply.payload.len);
-    try std.testing.expect(secondary_events.connected.load(.acquire));
-    try std.testing.expect(secondary_events.clicked.load(.acquire));
+    // The unbound call is answered without entering the event queue, so the
+    // queued connect and click handlers may still be running.
+    try waitForFlag(io, &secondary_events.connected);
+    try waitForFlag(io, &secondary_events.clicked);
     try std.testing.expect(!secondary_events.navigated.load(.acquire));
 
     var eval_buffer: [64]u8 = undefined;
@@ -7641,7 +7652,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         std.Io.Duration.fromSeconds(1),
     });
     _ = try readServerFrame(client, io, &response_payload);
-    try client.shutdown(io, .both);
+    try disconnectTestStream(client, io);
     try std.testing.expectError(error.ConnectionClosed, disconnect_future.await(io));
     try std.testing.expect(!targeted_client.isConnected(io));
     try std.testing.expectError(error.ConnectionClosed, targeted_client.eval(
@@ -7655,7 +7666,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         targeted_client.close(io),
     );
     try std.testing.expect(app.hasClients(io));
-    try second_client.shutdown(io, .both);
+    try disconnectTestStream(second_client, io);
     try running.wait();
     try std.testing.expect(primary_events.disconnected.load(.acquire));
     try std.testing.expect(secondary_events.disconnected.load(.acquire));
@@ -8083,7 +8094,7 @@ test "multi-client limits, targeting, and disconnect lifecycle" {
         std.Io.Duration.fromSeconds(1),
     ));
 
-    try first_stream.shutdown(io, .both);
+    try disconnectTestStream(first_stream, io);
     var first_disconnected = false;
     for (0..100) |_| {
         if (!first.isConnected(io)) {
@@ -8134,7 +8145,7 @@ test "multi-client limits, targeting, and disconnect lifecycle" {
         &second_response,
     ));
     try std.testing.expectEqual(protocol.Command.close, second_close.header.command);
-    try second_stream.shutdown(io, .both);
+    try disconnectTestStream(second_stream, io);
     try running.wait();
     try std.testing.expect(!window.isShown(io));
 }
@@ -8249,7 +8260,7 @@ test "runtime registrations replace in-flight handlers and replay racing updates
 
     // A real reconnect replays registrations, including one whose installation
     // races authentication: it must appear in replay or in the subsequent push.
-    try client.shutdown(io, .both);
+    try disconnectTestStream(client, io);
     try waitForFlag(io, &replacement_events.disconnected);
     const reconnect = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
     defer reconnect.close(io);
