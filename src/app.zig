@@ -2906,21 +2906,27 @@ pub const App = struct {
             const index = indexOfWindow(self.windows.items, state) orelse
                 return error.UnknownWindow;
             try self.retiring.ensureUnusedCapacity(self.gpa, 1);
-            // Keep the state alive for the close notification below; the
-            // reaper may otherwise free it first.
+            // Keep the state alive until this call returns; once it is in
+            // `retiring`, stop() may reap it concurrently.
             state.retain();
             _ = self.windows.orderedRemove(index);
             self.retiring.appendAssumeCapacity(state);
             state.running.store(false, .release);
             state.markRetired(io);
-            // Spawned under the lock: stop() closes registration with this
-            // lock before it awaits the group, so no spawn races that await.
-            self.reaper_tasks.concurrent(io, reapWindow, .{ self, state, io }) catch |err|
-                state.log(.warn, "Window cleanup deferred until stop: {}", .{err});
         }
         defer state.release();
+        // Notify before the reaper starts: it cancels this window's handlers,
+        // which may include the caller and would cancel this write.
         _ = state.broadcast(io, .close, "") catch |err|
             state.log(.warn, "Destroy close notification failed: {}", .{err});
+        self.windows_lock.lockUncancelable(io);
+        defer self.windows_lock.unlock(io);
+        // Once registration closed, stop() reaps everything in `retiring`.
+        // Spawning only under the lock while accepting means no spawn can
+        // race its await of the group.
+        if (self.accepting_windows)
+            self.reaper_tasks.concurrent(io, reapWindow, .{ self, state, io }) catch |err|
+                state.log(.warn, "Window cleanup deferred until stop: {}", .{err});
     }
 
     pub fn start(self: *App, io: std.Io) !Running {
