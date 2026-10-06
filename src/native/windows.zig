@@ -38,7 +38,8 @@ const Com = extern struct {
     vtable: [*]const *const anyopaque,
 
     fn method(self: *Com, comptime slot: usize, comptime F: type) F {
-        return @ptrCast(self.vtable[slot]);
+        // Function pointers are aligned on targets such as aarch64.
+        return @ptrCast(@alignCast(self.vtable[slot]));
     }
     fn retain(self: *Com) void {
         _ = self.method(1, *const fn (*Com) callconv(.winapi) u32)(self);
@@ -295,7 +296,7 @@ pub const Backend = struct {
         loader.* = .{ .module = module };
         self.loader = loader;
         const create_environment: *const fn (?[*:0]const u16, ?[*:0]const u16, ?*Com, *Completion) callconv(.winapi) HRESULT =
-            @ptrCast(GetProcAddress(module, "CreateCoreWebView2EnvironmentWithOptions") orelse return error.NativeRuntimeNotFound);
+            @ptrCast(@alignCast(GetProcAddress(module, "CreateCoreWebView2EnvironmentWithOptions") orelse return error.NativeRuntimeNotFound));
         self.instance = GetModuleHandleW(null) orelse return error.NativeInitializationFailed;
         var class_buffer: [64]u8 = undefined;
         const class_name = try std.fmt.bufPrint(&class_buffer, "PureZigWebUI-{x}", .{@intFromPtr(self)});
