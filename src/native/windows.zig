@@ -16,6 +16,7 @@ const iid_unknown = GUID.parse("{00000000-0000-0000-c000-000000000046}");
 const iid_environment_callback = GUID.parse("{4e8a3389-c9d8-4bd2-b6b5-124fee6cc14d}");
 const iid_controller_callback = GUID.parse("{6c4819f3-c9b7-4260-8127-c9f5bde7f68c}");
 const iid_close_callback = GUID.parse("{57213f19-00e6-49fa-8e07-898ea01ecbd2}"); // WebMessageReceived
+const iid_title_callback = GUID.parse("{f5f2b923-953e-4042-9f95-f3a118e1afd4}"); // DocumentTitleChanged
 const iid_script_callback = GUID.parse("{b99369f3-9b11-47b5-bc6f-8e7895fcea17}");
 const iid_controller2 = GUID.parse("{c979903e-d4ca-4228-92eb-47ee3fa96eab}");
 
@@ -240,6 +241,7 @@ fn EventCallback(comptime iid: GUID, comptime handle: fn (*Backend, ?*Com) void)
 }
 
 const CloseCallback = EventCallback(iid_close_callback, closeMessage);
+const TitleCallback = EventCallback(iid_title_callback, titleChanged);
 
 fn closeMessage(owner: *Backend, args: ?*Com) void {
     const message_args = args orelse return;
@@ -255,6 +257,10 @@ fn closeMessage(owner: *Backend, args: ?*Com) void {
     if (value[close_message.len] == 0) owner.close_requested = true;
 }
 
+fn titleChanged(owner: *Backend, _: ?*Com) void {
+    owner.applyPageTitle();
+}
+
 pub const Backend = struct {
     gpa: std.mem.Allocator,
     loader: ?*Loader = null,
@@ -267,6 +273,9 @@ pub const Backend = struct {
     webview: ?*Com = null,
     close_callback: ?*CloseCallback = null,
     close_token: ?Token = null,
+    title_callback: ?*TitleCallback = null,
+    title_token: ?Token = null,
+    follow_page_title: bool,
     close_handler: ?types.CloseHandler,
     user_data: ?*anyopaque,
     close_requested: bool = false,
@@ -292,6 +301,7 @@ pub const Backend = struct {
             .resizable = options.resizable,
             .frameless = options.frameless,
             .transparent = options.transparent,
+            .follow_page_title = options.follow_page_title,
         };
         errdefer self.destroy();
         self.next = live_windows;
@@ -327,13 +337,13 @@ pub const Backend = struct {
         };
         self.class_atom = RegisterClassExW(&wc);
         if (self.class_atom == 0) return error.NativeInitializationFailed;
-        const title = try std.unicode.utf8ToUtf16LeAllocZ(gpa, options.title);
-        defer gpa.free(title);
+        const initial_title = try std.unicode.utf8ToUtf16LeAllocZ(gpa, options.title);
+        defer gpa.free(initial_title);
         const outer = try self.outerSize(options.size);
         const initial = options.position orelse types.Position{ .x = std.math.minInt(i32), .y = std.math.minInt(i32) };
         // Redirection surfaces cannot be toggled after HWND creation. Reserve
         // the composition host up front; WebView2's background controls opacity.
-        self.hwnd = CreateWindowExW(0x00200000, class_wide.ptr, title.ptr, self.style(), initial.x, initial.y, outer.x, outer.y, null, null, self.instance, self) orelse return error.NativeWindowCreationFailed;
+        self.hwnd = CreateWindowExW(0x00200000, class_wide.ptr, initial_title.ptr, self.style(), initial.x, initial.y, outer.x, outer.y, null, null, self.instance, self) orelse return error.NativeWindowCreationFailed;
         const profile = if (options.profile_directory) |path| try std.unicode.utf8ToUtf16LeAllocZ(gpa, path) else null;
         defer if (profile) |path| gpa.free(path);
         const start = std.Io.Clock.awake.now(io);
@@ -359,6 +369,10 @@ pub const Backend = struct {
         var token: Token = .{};
         try check(webview.method(34, *const fn (*Com, *CloseCallback, *Token) callconv(.winapi) HRESULT)(webview, self.close_callback.?, &token));
         self.close_token = token;
+        self.title_callback = try TitleCallback.create(self);
+        var title_token: Token = .{};
+        try check(webview.method(46, *const fn (*Com, *TitleCallback, *Token) callconv(.winapi) HRESULT)(webview, self.title_callback.?, &title_token));
+        self.title_token = title_token;
         // WindowCloseRequested is too late to guarantee veto or repeat requests;
         // Chromium can also refuse native window.close after history navigation.
         // Replace it before page scripts run, without marking the page closed.
@@ -421,10 +435,15 @@ pub const Backend = struct {
 
     fn releaseWebView(self: *Backend) void {
         if (self.close_callback) |callback| callback.owner = null;
+        if (self.title_callback) |callback| callback.owner = null;
         if (self.webview) |webview| {
             if (self.close_token) |token| {
                 _ = webview.method(35, *const fn (*Com, Token) callconv(.winapi) HRESULT)(webview, token);
                 self.close_token = null;
+            }
+            if (self.title_token) |token| {
+                _ = webview.method(47, *const fn (*Com, Token) callconv(.winapi) HRESULT)(webview, token);
+                self.title_token = null;
             }
         }
         if (self.controller) |controller| _ = controller.closeController();
@@ -434,6 +453,8 @@ pub const Backend = struct {
         self.controller = null;
         if (self.close_callback) |callback| _ = CloseCallback.release(callback);
         self.close_callback = null;
+        if (self.title_callback) |callback| _ = TitleCallback.release(callback);
+        self.title_callback = null;
     }
 
     pub fn pump(self: *Backend) !bool {
@@ -502,11 +523,39 @@ pub const Backend = struct {
         if (GetClientRect(try self.window(), &rect) == 0) return error.NativeOperationFailed;
         try check(controller.method(6, *const fn (*Com, RECT) callconv(.winapi) HRESULT)(controller, rect));
     }
-    pub fn setTitle(self: *Backend, title: [:0]const u8) !void {
+    pub fn setTitle(self: *Backend, value: [:0]const u8) !void {
         const hwnd = try self.window();
-        const text = try std.unicode.utf8ToUtf16LeAllocZ(self.gpa, title);
+        const text = try std.unicode.utf8ToUtf16LeAllocZ(self.gpa, value);
         defer self.gpa.free(text);
         if (SetWindowTextW(hwnd, text.ptr) == 0) return error.NativeOperationFailed;
+    }
+    pub fn title(self: *Backend, gpa: std.mem.Allocator) ![]u8 {
+        const hwnd = try self.window();
+        const length = GetWindowTextLengthW(hwnd);
+        if (length <= 0) return gpa.dupe(u8, "");
+        const buffer = try gpa.alloc(u16, @as(usize, @intCast(length)) + 1);
+        defer gpa.free(buffer);
+        const copied = GetWindowTextW(hwnd, buffer.ptr, @intCast(buffer.len));
+        if (copied < 0) return error.NativeOperationFailed;
+        return std.unicode.utf16LeToUtf8Alloc(gpa, buffer[0..@intCast(copied)]) catch error.InvalidNativeText;
+    }
+    pub fn setFollowPageTitle(self: *Backend, value: bool) !void {
+        _ = try self.window();
+        self.follow_page_title = value;
+        if (value) self.applyPageTitle();
+    }
+    fn applyPageTitle(self: *Backend) void {
+        if (!self.follow_page_title or self.closed) return;
+        const hwnd = self.hwnd orelse return;
+        const webview = self.webview orelse return;
+        var text: ?[*:0]u16 = null;
+        const status = webview.method(48, *const fn (*Com, *?[*:0]u16) callconv(.winapi) HRESULT)(webview, &text);
+        defer if (text) |value| CoTaskMemFree(value);
+        if (status < 0) return;
+        const value = text orelse return;
+        // An empty document title keeps the current host title.
+        if (value[0] == 0) return;
+        _ = SetWindowTextW(hwnd, value);
     }
     pub fn navigate(self: *Backend, url: [:0]const u8) !void {
         _ = try self.window();
@@ -804,6 +853,8 @@ extern "user32" fn PeekMessageW(*MSG, ?HWND, u32, u32, u32) callconv(.winapi) i3
 extern "user32" fn TranslateMessage(*const MSG) callconv(.winapi) i32;
 extern "user32" fn DispatchMessageW(*const MSG) callconv(.winapi) isize;
 extern "user32" fn AdjustWindowRectEx(*RECT, u32, i32, u32) callconv(.winapi) i32;
+extern "user32" fn GetWindowTextLengthW(HWND) callconv(.winapi) i32;
+extern "user32" fn GetWindowTextW(HWND, [*]u16, i32) callconv(.winapi) i32;
 extern "user32" fn GetClientRect(HWND, *RECT) callconv(.winapi) i32;
 extern "user32" fn GetWindowRect(HWND, *RECT) callconv(.winapi) i32;
 extern "user32" fn SetWindowPos(HWND, ?HWND, i32, i32, i32, i32, u32) callconv(.winapi) i32;

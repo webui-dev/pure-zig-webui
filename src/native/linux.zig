@@ -51,6 +51,7 @@ const Api = struct {
     gtk_widget_get_window: *const fn (Object) callconv(.c) ?Object,
     gtk_container_add: *const fn (Object, Object) callconv(.c) void,
     gtk_window_set_title: *const fn (Object, [*:0]const u8) callconv(.c) void,
+    gtk_window_get_title: *const fn (Object) callconv(.c) ?[*:0]const u8,
     gtk_window_set_default_size: *const fn (Object, c_int, c_int) callconv(.c) void,
     gtk_window_resize: *const fn (Object, c_int, c_int) callconv(.c) void,
     gtk_window_move: *const fn (Object, c_int, c_int) callconv(.c) void,
@@ -94,6 +95,7 @@ const Api = struct {
     webkit_web_view_get_settings: *const fn (Object) callconv(.c) ?Object,
     webkit_settings_set_enable_javascript: *const fn (Object, c_int) callconv(.c) void,
     webkit_web_view_load_uri: *const fn (Object, [*:0]const u8) callconv(.c) void,
+    webkit_web_view_get_title: *const fn (Object) callconv(.c) ?[*:0]const u8,
     webkit_web_view_stop_loading: *const fn (Object) callconv(.c) void,
     webkit_web_view_set_background_color: *const fn (Object, *const Rgba) callconv(.c) void,
     webkit_web_view_get_user_content_manager: *const fn (Object) callconv(.c) ?Object,
@@ -156,7 +158,7 @@ pub const Backend = struct {
     message_signal: c_ulong = 0,
     message_registered: bool = false,
     window_signals: [3]c_ulong = .{ 0, 0, 0 },
-    view_signals: [1]c_ulong = .{0},
+    view_signals: [2]c_ulong = .{ 0, 0 },
     close_handler: ?types.CloseHandler,
     user_data: ?*anyopaque,
     closed: bool = false,
@@ -168,6 +170,7 @@ pub const Backend = struct {
     rgba_visual: bool = false,
     x11: bool = false,
     minimum_size: ?types.Size = null,
+    follow_page_title: bool,
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, url: [:0]const u8, options: types.Options) !*Backend {
         if (options.webview2_loader != null) return error.UnsupportedNativeControl;
@@ -184,7 +187,7 @@ pub const Backend = struct {
         if (api.gtk_init_check(null, null) == 0) return error.NativeDisplayUnavailable;
         const self = try gpa.create(Backend);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .gtk = gtk, .webkit = webkit, .api = api, .close_handler = options.close_handler, .user_data = options.user_data };
+        self.* = .{ .gpa = gpa, .gtk = gtk, .webkit = webkit, .api = api, .close_handler = options.close_handler, .user_data = options.user_data, .follow_page_title = options.follow_page_title };
         errdefer self.releaseObjects();
 
         const window = api.gtk_window_new(0) orelse return error.NativeInitializationFailed;
@@ -243,12 +246,13 @@ pub const Backend = struct {
         self.window_signals[1] = try self.connect(window, "destroy", @ptrCast(&destroyed));
         self.window_signals[2] = try self.connect(window, "draw", @ptrCast(&draw));
         self.view_signals[0] = try self.connect(view, "web-process-terminated", @ptrCast(&processTerminated));
+        self.view_signals[1] = try self.connect(view, "notify::title", @ptrCast(&titleChanged));
 
         // GTK/WebKit setters copy strings synchronously; no borrowed Options
         // slices or URL buffers are retained in this backend.
-        const title = try gpa.dupeZ(u8, options.title);
-        defer gpa.free(title);
-        api.gtk_window_set_title(window, title);
+        const initial_title = try gpa.dupeZ(u8, options.title);
+        defer gpa.free(initial_title);
+        api.gtk_window_set_title(window, initial_title);
         api.gtk_window_set_default_size(window, @intCast(options.size.width), @intCast(options.size.height));
         if (options.minimum_size) |minimum| try self.setMinimumSize(minimum);
         try self.setResizable(options.resizable);
@@ -288,7 +292,7 @@ pub const Backend = struct {
         }
         if (self.view) |view| {
             for (self.view_signals) |signal| self.disconnect(view, signal);
-            self.view_signals = .{0};
+            self.view_signals = .{ 0, 0 };
             // A retained GtkWidget pointer can already have been disposed by
             // gtk_widget_destroy; only call WebKit methods before that point.
             if (!self.closed) self.api.webkit_web_view_stop_loading(view);
@@ -344,8 +348,29 @@ pub const Backend = struct {
         return self.window orelse error.NativeWindowClosed;
     }
 
-    pub fn setTitle(self: *Backend, title: [:0]const u8) !void {
-        self.api.gtk_window_set_title(try self.liveWindow(), title);
+    pub fn setTitle(self: *Backend, value: [:0]const u8) !void {
+        self.api.gtk_window_set_title(try self.liveWindow(), value);
+    }
+
+    pub fn title(self: *Backend, gpa: std.mem.Allocator) ![]u8 {
+        const value = self.api.gtk_window_get_title(try self.liveWindow()) orelse "";
+        return gpa.dupe(u8, std.mem.sliceTo(value, 0));
+    }
+
+    pub fn setFollowPageTitle(self: *Backend, value: bool) !void {
+        _ = try self.liveWindow();
+        self.follow_page_title = value;
+        if (value) self.applyPageTitle();
+    }
+
+    fn applyPageTitle(self: *Backend) void {
+        if (!self.follow_page_title or self.closed or self.close_requested) return;
+        const window = self.window orelse return;
+        // WebKitGTK reports NULL before a title exists; an empty title also
+        // keeps the current host title instead of blanking the window.
+        const value = self.api.webkit_web_view_get_title(self.view orelse return) orelse return;
+        if (value[0] == 0) return;
+        self.api.gtk_window_set_title(window, value);
     }
 
     pub fn navigate(self: *Backend, url: [:0]const u8) !void {
@@ -545,6 +570,11 @@ pub const Backend = struct {
         const self: *Backend = @ptrCast(@alignCast(data.?));
         self.closed = true;
         self.removePendingClose();
+    }
+
+    fn titleChanged(_: Object, _: Object, data: ?Object) callconv(.c) void {
+        const self: *Backend = @ptrCast(@alignCast(data.?));
+        self.applyPageTitle();
     }
 
     fn processTerminated(_: Object, _: c_int, data: ?Object) callconv(.c) void {

@@ -84,6 +84,42 @@ fn expectSize(io: std.Io, view: webui.native.Window, size: webui.native.Size) !v
     return error.NativeClosedEarly;
 }
 
+fn readTitle(view: webui.native.Window, buffer: []u8) ![]const u8 {
+    var fixed: std.heap.FixedBufferAllocator = .init(buffer);
+    return view.title(fixed.allocator());
+}
+
+/// Pump until `view` shows `expected`, bounded like the other smoke waits.
+fn expectTitle(io: std.Io, pump: webui.native.Window, view: webui.native.Window, expected: []const u8) !void {
+    const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(5) });
+    var buffer: [256]u8 = undefined;
+    while (try pump.poll()) {
+        const actual = try readTitle(view, &buffer);
+        if (std.mem.eql(u8, actual, expected)) return;
+        if (deadline.compare(.lte, .now(io, .awake))) {
+            std.log.err("native title {s}, expected {s}", .{ actual, expected });
+            return error.NativeTitleMismatch;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+    return error.NativeClosedEarly;
+}
+
+/// Pump for a settle period and fail if `view` ever leaves `expected`.
+fn expectTitleKept(io: std.Io, pump: webui.native.Window, view: webui.native.Window, expected: []const u8) !void {
+    const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(500) });
+    var buffer: [256]u8 = undefined;
+    while (deadline.compare(.gt, .now(io, .awake))) {
+        if (!try pump.poll()) return error.NativeClosedEarly;
+        const actual = try readTitle(view, &buffer);
+        if (!std.mem.eql(u8, actual, expected)) {
+            std.log.err("native title changed to {s}, expected {s}", .{ actual, expected });
+            return error.NativeTitleChanged;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+}
+
 const Evaluation = struct {
     io: std.Io,
     window: webui.Window,
@@ -210,6 +246,25 @@ fn smoke(io: std.Io, first: *Page, second: *Page) !void {
     }
     try workers.await(io);
     if (!dispatch.rejected) return error.NativeThreadGuardFailed;
+    // setTitle applies at once; later page titles replace it while following.
+    try expectTitle(io, a, a, "Pure Zig: owner-thread dispatch passed");
+    try evaluate(io, a, first.window, "document.title = 'Page title sync'; return 'titled'", "titled");
+    try expectTitle(io, a, a, "Page title sync");
+    try a.setTitle("Host title");
+    try expectTitle(io, a, a, "Host title");
+    // WebView2 substitutes its own default for an empty document title.
+    if (builtin.os.tag != .windows) {
+        try evaluate(io, a, first.window, "document.title = ''; return 'emptied'", "emptied");
+        try expectTitleKept(io, a, a, "Host title");
+    }
+    try evaluate(io, a, first.window, "document.title = 'After empty'; return 'titled'", "titled");
+    try expectTitle(io, a, a, "After empty");
+    // The second view opened with follow_page_title = false.
+    try expectTitle(io, a, b, "Second host title");
+    try evaluate(io, a, second.window, "document.title = 'Second page title'; return 'titled'", "titled");
+    try expectTitleKept(io, a, b, "Second host title");
+    try b.setFollowPageTitle(true);
+    try expectTitle(io, a, b, "Second page title");
     try evaluate(io, a, second.window, "history.pushState({},'', '#second'); window.close(); return 'requested'", "requested");
     try pumpUntil(io, a, second, 1);
     if (!second.reentrant_destroy_rejected) return error.NativeCallbackGuardFailed;
@@ -226,7 +281,7 @@ fn smoke(io: std.Io, first: *Page, second: *Page) !void {
     try evaluate(io, a, first.window, "return await webui.call('ready')", "Connected to Zig");
     try a.close();
     if (try a.poll()) return error.NativeForceCloseFailed;
-    std.debug.print("NATIVE SMOKE PASS: bridge, geometry, controls, dispatch, veto, history, multiwindow close\n", .{});
+    std.debug.print("NATIVE SMOKE PASS: bridge, geometry, controls, dispatch, titles, veto, history, multiwindow close\n", .{});
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -269,6 +324,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("NATIVE READY\n", .{});
     if (is_smoke) {
         options.user_data = &second;
+        options.title = "Second host title";
+        options.follow_page_title = false;
         var second_view = try webui.native.Window.open(init.gpa, init.io, second.window, &running, options);
         defer second_view.deinit() catch |err| std.log.err("native cleanup: {}", .{err});
         second.native = second_view;

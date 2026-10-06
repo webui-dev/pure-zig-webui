@@ -127,7 +127,8 @@ fn registerClasses() !void {
             !truth(class_addMethod(class, sel_registerName("windowShouldClose:"), @ptrCast(&windowShouldClose), if (ObjcBool == bool) "B@:@" else "c@:@")) or
             !truth(class_addMethod(class, sel_registerName("windowWillClose:"), @ptrCast(&windowWillClose), "v@:@")) or
             !truth(class_addMethod(class, sel_registerName("webViewDidClose:"), @ptrCast(&webViewDidClose), "v@:@")) or
-            !truth(class_addMethod(class, sel_registerName("userContentController:didReceiveScriptMessage:"), @ptrCast(&didReceiveScriptMessage), "v@:@@")))
+            !truth(class_addMethod(class, sel_registerName("userContentController:didReceiveScriptMessage:"), @ptrCast(&didReceiveScriptMessage), "v@:@@")) or
+            !truth(class_addMethod(class, sel_registerName("observeValueForKeyPath:ofObject:change:context:"), @ptrCast(&observeValue), "v@:@@@^v")))
             return error.NativeInitializationFailed;
         objc_registerClassPair(class);
         delegate_class = class;
@@ -168,6 +169,12 @@ fn webViewDidClose(delegate: Id, _: Sel, webview: Id) callconv(.c) void {
     // This is completion, not a veto point: WebKit has already closed the page.
     // The document-start override below handles ordinary JS close requests.
     self.pending_close = true;
+}
+fn observeValue(delegate: Id, _: Sel, _: Id, object: Id, _: Id, _: ?*anyopaque) callconv(.c) void {
+    // Only the WKWebView `title` key path is registered with this observer.
+    const self = context(delegate) orelse return;
+    if (object != self.webview) return;
+    self.applyPageTitle();
 }
 fn didReceiveScriptMessage(delegate: Id, _: Sel, controller: Id, message: Id) callconv(.c) void {
     const self = context(delegate) orelse return;
@@ -215,6 +222,11 @@ pub const Backend = struct {
     kiosk_frame: Rect = undefined,
     kiosk_level: isize = 0,
     minimum_size: types.Size = .{ .width = 1, .height = 1 },
+    follow_page_title: bool,
+    // +1 key path. KVO does not retain the observer; destroy removes it once
+    // with this retained key, so teardown never allocates.
+    title_key: Id = null,
+    title_observed: bool = false,
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, url: [:0]const u8, options: types.Options) !*Backend {
         _ = io; // No asynchronous initialization or waiting: loadRequest starts navigation.
@@ -246,6 +258,7 @@ pub const Backend = struct {
             .user_data = options.user_data,
             .resizable = options.resizable,
             .frameless = options.frameless,
+            .follow_page_title = options.follow_page_title,
         };
         errdefer self.destroy();
         self.delegate = send0(Id, send0(Id, delegate_class, "alloc"), "init") orelse return error.NativeInitializationFailed;
@@ -281,9 +294,14 @@ pub const Backend = struct {
         send1(void, self.webview, "setUIDelegate:", Id, self.delegate);
         send1(void, self.webview, "setAutoresizingMask:", usize, 2 | 16);
         send1(void, self.window, "setContentView:", Id, self.webview);
-        const title = try string(options.title);
-        defer release(title);
-        send1(void, self.window, "setTitle:", Id, title);
+        // WKWebView's title is KVO-compliant and also reports document.title
+        // changes after load, which upstream's didFinishNavigation misses.
+        self.title_key = try string("title");
+        send4(void, self.webview, "addObserver:forKeyPath:options:context:", Id, self.delegate, Id, self.title_key, usize, 1, ?*anyopaque, null);
+        self.title_observed = true;
+        const initial_title = try string(options.title);
+        defer release(initial_title);
+        send1(void, self.window, "setTitle:", Id, initial_title);
         if (options.minimum_size) |minimum| try self.setMinimumSize(minimum);
         if (options.position) |position| try self.setPosition(position);
         if (options.center) try self.center();
@@ -310,6 +328,10 @@ pub const Backend = struct {
         // reference before releasing the controller/webview and our owning refs.
         if (self.delegate != null)
             _ = object_setInstanceVariable(self.delegate, context_ivar, null);
+        if (self.title_observed) {
+            send2(void, self.webview, "removeObserver:forKeyPath:", Id, self.delegate, Id, self.title_key);
+            self.title_observed = false;
+        }
         if (self.message_name != null)
             send1(void, self.content_controller, "removeScriptMessageHandlerForName:", Id, self.message_name);
         send0(void, self.content_controller, "removeAllUserScripts");
@@ -322,6 +344,7 @@ pub const Backend = struct {
         release(self.content_controller);
         release(self.message_body);
         release(self.message_name);
+        release(self.title_key);
         release(self.window);
         release(self.delegate);
         self.gpa.destroy(self);
@@ -383,13 +406,36 @@ pub const Backend = struct {
         self.closed = true;
         self.pending_close = false;
     }
-    pub fn setTitle(self: *Backend, title: [:0]const u8) !void {
+    pub fn setTitle(self: *Backend, value: [:0]const u8) !void {
         try self.requireOpen();
         const autorelease_pool = pool();
         defer drain(autorelease_pool);
-        const text = try string(title);
+        const text = try string(value);
         defer release(text);
         send1(void, self.window, "setTitle:", Id, text);
+    }
+    pub fn title(self: *Backend, gpa: std.mem.Allocator) ![]u8 {
+        try self.requireOpen();
+        const autorelease_pool = pool();
+        defer drain(autorelease_pool);
+        const value = send0(Id, self.window, "title") orelse return gpa.dupe(u8, "");
+        // UTF8String is autoreleased; copy it before draining the pool.
+        const bytes = send0(?[*:0]const u8, value, "UTF8String") orelse return error.InvalidNativeText;
+        return gpa.dupe(u8, std.mem.sliceTo(bytes, 0));
+    }
+    pub fn setFollowPageTitle(self: *Backend, value: bool) !void {
+        try self.requireOpen();
+        self.follow_page_title = value;
+        if (value) self.applyPageTitle();
+    }
+    fn applyPageTitle(self: *Backend) void {
+        if (!self.follow_page_title or self.closed) return;
+        const autorelease_pool = pool();
+        defer drain(autorelease_pool);
+        // nil before a document title exists; empty keeps the host title.
+        const value = send0(Id, self.webview, "title") orelse return;
+        if (send0(usize, value, "length") == 0) return;
+        send1(void, self.window, "setTitle:", Id, value);
     }
     pub fn navigate(self: *Backend, url: [:0]const u8) !void {
         try self.requireOpen();

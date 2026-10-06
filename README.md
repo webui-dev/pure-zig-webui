@@ -10,7 +10,7 @@ compile or link the upstream WebUI C library or CivetWeb.
 support.
 
 The core rewrite is substantial, but full upstream behavioral parity is not
-complete. A fresh source audit found gaps in native drag/resize, title and
+complete. A fresh source audit found gaps in native drag/resize and
 navigation integration. See the
 [open semantic gaps](docs/PURE_ZIG_REFACTOR.md#open-semantic-gaps)
 and the [source comparison](docs/UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
@@ -567,6 +567,15 @@ geometry requests: `setSize`, `setPosition`, `center`, `setMinimumSize`,
 logical coordinates: content size and outer-window position (Cocoa uses its
 native lower-left origin). `handle()` returns a borrowed tagged Cocoa,
 GTK, or Win32 handle, invalid after native close or deinit.
+
+Like upstream, each non-empty page title replaces the host window title,
+including later `document.title` changes. `Options.title` is the initial title
+and `setTitle` applies at once until the page reports another title. An empty
+page title keeps the host title; WebView2 instead reports its own default title
+for untitled documents. Set `follow_page_title = false`, or call
+`setFollowPageTitle(false)`, to keep the title under host control; re-enabling
+applies the current page title. `title(gpa)` returns an owned copy of the host
+title.
 
 `setCloseHandler(handler, user_data)` handles OS and JavaScript close requests on
 the UI thread; return `false` to veto. Document-start native integration keeps a

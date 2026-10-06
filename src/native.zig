@@ -184,6 +184,20 @@ pub const Window = struct {
         if (supported) try self.state.backend.setTitle(terminated);
     }
 
+    /// Current host window title. Caller owns the returned UTF-8 copy.
+    pub fn title(self: Window, gpa: std.mem.Allocator) ![]u8 {
+        try self.checkOpen();
+        if (supported) return self.state.backend.title(gpa);
+        return error.UnsupportedPlatform;
+    }
+
+    /// Enable or disable page-title mirroring. Enabling applies the current
+    /// non-empty page title at once; disabling keeps the current host title.
+    pub fn setFollowPageTitle(self: Window, value: bool) !void {
+        try self.checkOpen();
+        if (supported) try self.state.backend.setFollowPageTitle(value);
+    }
+
     pub fn navigate(self: Window, value: []const u8) !void {
         try self.checkOpen();
         try validateUrl(value);

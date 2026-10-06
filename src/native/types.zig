@@ -22,7 +22,11 @@ pub const Handle = union(enum) {
 pub const CloseHandler = *const fn (?*anyopaque) bool;
 
 pub const Options = struct {
+    /// Initial host title, shown until the page reports a non-empty title.
     title: []const u8 = "WebUI",
+    /// Mirror each non-empty page title into the host window title, like
+    /// upstream. It replaces any earlier `title` or `setTitle` value.
+    follow_page_title: bool = true,
     size: Size = .{ .width = 800, .height = 600 },
     position: ?Position = null,
     minimum_size: ?Size = null,
@@ -69,6 +73,8 @@ pub fn validateSize(value: Size) !void {
 }
 
 test "native options reject unsafe sizes and contradictory placement" {
+    // Page titles drive the host title by default, matching upstream.
+    try std.testing.expect((Options{}).follow_page_title);
     try (Options{ .position = .{ .x = -100, .y = 0 } }).validate();
     try std.testing.expectError(error.InvalidWindowSize, (Options{ .size = .{ .width = 0, .height = 1 } }).validate());
     try std.testing.expectError(error.InvalidWindowSize, validateSize(.{ .width = std.math.maxInt(u32), .height = 1 }));
