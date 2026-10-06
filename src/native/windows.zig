@@ -23,6 +23,7 @@ const iid_title_callback = GUID.parse("{f5f2b923-953e-4042-9f95-f3a118e1afd4}");
 const initialization_timeout_ms = 60_000;
 const iid_script_callback = GUID.parse("{b99369f3-9b11-47b5-bc6f-8e7895fcea17}");
 const iid_controller2 = GUID.parse("{c979903e-d4ca-4228-92eb-47ee3fa96eab}");
+const iid_settings9 = GUID.parse("{0528a73b-e92d-49f4-927a-e547dddaa37d}");
 
 const close_message = "pure-zig-webui:close-request";
 const close_script = blk: {
@@ -289,6 +290,7 @@ pub const Backend = struct {
     resizable: bool,
     frameless: bool,
     kiosk: bool = false,
+    non_client_regions: bool = false,
     transparent: bool = false,
     placement: WINDOWPLACEMENT = .{},
     previous: ?*Backend = null,
@@ -369,6 +371,16 @@ pub const Backend = struct {
         defer script_settings.release();
         try check(script_settings.method(4, *const fn (*Com, i32) callconv(.winapi) HRESULT)(script_settings, 1));
         try check(script_settings.method(6, *const fn (*Com, i32) callconv(.winapi) HRESULT)(script_settings, 1));
+        // Settings9 makes CSS app-region drag areas act as the host caption
+        // (upstream WebUI PR #718). Older runtimes report `.none` instead.
+        var settings9: ?*Com = null;
+        if (script_settings.method(0, *const fn (*Com, *const GUID, *?*Com) callconv(.winapi) HRESULT)(script_settings, &iid_settings9, &settings9) >= 0) {
+            if (settings9) |value| {
+                defer value.release();
+                try check(value.method(38, *const fn (*Com, i32) callconv(.winapi) HRESULT)(value, 1));
+                self.non_client_regions = true;
+            }
+        }
         self.close_callback = try CloseCallback.create(self);
         var token: Token = .{};
         try check(webview.method(34, *const fn (*Com, *CloseCallback, *Token) callconv(.winapi) HRESULT)(webview, self.close_callback.?, &token));
@@ -509,7 +521,10 @@ pub const Backend = struct {
         return self.hwnd orelse error.NativeWindowClosed;
     }
     fn style(self: *const Backend) u32 {
-        if (self.kiosk or self.frameless) return 0x80000000 | 0x02000000 | 0x04000000; // POPUP, CLIPCHILDREN, CLIPSIBLINGS
+        if (self.kiosk) return 0x80000000 | 0x02000000 | 0x04000000; // POPUP, CLIPCHILDREN, CLIPSIBLINGS
+        // Upstream keeps a sizing frame on resizable frameless windows.
+        if (self.frameless) return 0x80000000 | 0x02000000 | 0x04000000 |
+            @as(u32, if (self.resizable) 0x00040000 else 0); // THICKFRAME
         return 0x00c80000 | 0x00020000 | 0x02000000 | 0x04000000 |
             @as(u32, if (self.resizable) 0x00050000 else 0); // caption, system menu, minimize, size/maximize
     }
