@@ -128,7 +128,8 @@ fn registerClasses() !void {
             !truth(class_addMethod(class, sel_registerName("windowWillClose:"), @ptrCast(&windowWillClose), "v@:@")) or
             !truth(class_addMethod(class, sel_registerName("webViewDidClose:"), @ptrCast(&webViewDidClose), "v@:@")) or
             !truth(class_addMethod(class, sel_registerName("userContentController:didReceiveScriptMessage:"), @ptrCast(&didReceiveScriptMessage), "v@:@@")) or
-            !truth(class_addMethod(class, sel_registerName("observeValueForKeyPath:ofObject:change:context:"), @ptrCast(&observeValue), "v@:@@@^v")))
+            !truth(class_addMethod(class, sel_registerName("observeValueForKeyPath:ofObject:change:context:"), @ptrCast(&observeValue), "v@:@@@^v")) or
+            !truth(class_addMethod(class, sel_registerName("webView:decidePolicyForNavigationAction:decisionHandler:"), @ptrCast(&decidePolicy), "v@:@@@?")))
             return error.NativeInitializationFailed;
         objc_registerClassPair(class);
         delegate_class = class;
@@ -196,6 +197,35 @@ fn didReceiveScriptMessage(delegate: Id, _: Sel, controller: Id, message: Id) ca
     // per-State callback-depth guard also rejects deinit from the user handler.
 }
 
+/// Leading fields of the Clang block ABI; WebKit passes a stack or heap
+/// block that is only invoked, never copied or retained here.
+const DecisionBlock = extern struct {
+    isa: ?*anyopaque,
+    flags: c_int,
+    reserved: c_int,
+    invoke: *const fn (*DecisionBlock, isize) callconv(.c) void,
+};
+fn decidePolicy(delegate: Id, _: Sel, webview: Id, action: Id, decision: *DecisionBlock) callconv(.c) void {
+    // WebKit requires exactly one decision per request, on every path.
+    const allow = if (context(delegate)) |self| self.allowNavigation(webview, action) else true;
+    decision.invoke(decision, @intFromBool(allow)); // WKNavigationActionPolicyCancel = 0, Allow = 1
+}
+fn isMainFrame(action: Id) bool {
+    const frame = send0(Id, action, "targetFrame") orelse return false;
+    return truth(send0(ObjcBool, frame, "isMainFrame"));
+}
+/// WKNavigationType to the portable kind.
+fn navigationKind(value: isize) types.NavigationKind {
+    return switch (value) {
+        0 => .link,
+        1 => .form_submission,
+        2 => .back_forward,
+        3 => .reload,
+        4 => .form_resubmission,
+        else => .other,
+    };
+}
+
 pub const Backend = struct {
     gpa: std.mem.Allocator,
     // +1 ownership: window, webview, delegate, content controller and message
@@ -215,7 +245,10 @@ pub const Backend = struct {
     closed: bool = false,
     in_close_handler: bool = false,
     close_handler: ?types.CloseHandler,
+    navigation_handler: ?types.NavigationHandler,
     user_data: ?*anyopaque,
+    // Set before each host load so its own policy decision is not reported.
+    host_navigation: bool = false,
     resizable: bool,
     frameless: bool,
     kiosk: bool = false,
@@ -255,6 +288,7 @@ pub const Backend = struct {
             .gpa = gpa,
             .app = app,
             .close_handler = options.close_handler,
+            .navigation_handler = options.navigation_handler,
             .user_data = options.user_data,
             .resizable = options.resizable,
             .frameless = options.frameless,
@@ -293,6 +327,7 @@ pub const Backend = struct {
         send1(void, configuration, "setUserContentController:", Id, self.content_controller);
         self.webview = send2(Id, send0(Id, objc_getClass("WKWebView"), "alloc"), "initWithFrame:configuration:", Rect, frame, Id, configuration) orelse return error.NativeInitializationFailed;
         send1(void, self.webview, "setUIDelegate:", Id, self.delegate);
+        send1(void, self.webview, "setNavigationDelegate:", Id, self.delegate);
         send1(void, self.webview, "setAutoresizingMask:", usize, 2 | 16);
         send1(void, self.window, "setContentView:", Id, self.webview);
         // WKWebView's title is KVO-compliant and also reports document.title
@@ -338,6 +373,7 @@ pub const Backend = struct {
         send0(void, self.content_controller, "removeAllUserScripts");
         send1(void, self.window, "setDelegate:", Id, null);
         send1(void, self.webview, "setUIDelegate:", Id, null);
+        send1(void, self.webview, "setNavigationDelegate:", Id, null);
         send0(void, self.webview, "stopLoading");
         if (self.window != null and !self.closed) send0(void, self.window, "close");
         send1(void, self.window, "setContentView:", Id, null);
@@ -455,7 +491,31 @@ pub const Backend = struct {
         defer release(text);
         const address = send1(Id, objc_getClass("NSURL"), "URLWithString:", Id, text) orelse return error.InvalidNativeUrl;
         const request = send1(Id, objc_getClass("NSURLRequest"), "requestWithURL:", Id, address) orelse return error.InvalidNativeUrl;
+        self.host_navigation = true;
+        errdefer self.host_navigation = false;
         _ = send1(Id, self.webview, "loadRequest:", Id, request) orelse return error.NativeNavigationFailed;
+    }
+    /// Like upstream's WebKitGTK policy handler, decide page and frame
+    /// navigations in the engine, independent of any bridge connection.
+    fn allowNavigation(self: *Backend, webview: Id, action: Id) bool {
+        if (self.closed or webview != self.webview) return true;
+        // Only a main-frame navigation can be the host's own request.
+        if (self.host_navigation and isMainFrame(action)) {
+            self.host_navigation = false;
+            return true;
+        }
+        const handler = self.navigation_handler orelse return true;
+        const autorelease_pool = pool();
+        defer drain(autorelease_pool);
+        // A navigation the handler cannot be asked about is cancelled.
+        const request = send0(Id, action, "request") orelse return false;
+        const address = send0(Id, request, "URL") orelse return false;
+        const text = send0(Id, address, "absoluteString") orelse return false;
+        const bytes = send0(?[*:0]const u8, text, "UTF8String") orelse return false;
+        return handler(self.user_data, .{
+            .url = std.mem.sliceTo(bytes, 0),
+            .kind = navigationKind(send0(isize, action, "navigationType")),
+        });
     }
     pub fn setSize(self: *Backend, value: types.Size) !void {
         try self.requireOpen();
@@ -629,4 +689,11 @@ fn dimension(value: f64) !u32 {
     if (!std.math.isFinite(rounded) or rounded < 1 or rounded > 2147483647.0)
         return error.NativeGeometryOutOfRange;
     return @intFromFloat(rounded);
+}
+
+test "WKNavigationType values map to portable kinds" {
+    const expected = [_]types.NavigationKind{ .link, .form_submission, .back_forward, .reload, .form_resubmission };
+    for (expected, 0..) |kind, value| try std.testing.expectEqual(kind, navigationKind(@intCast(value)));
+    try std.testing.expectEqual(types.NavigationKind.other, navigationKind(-1));
+    try std.testing.expectEqual(types.NavigationKind.other, navigationKind(42));
 }
