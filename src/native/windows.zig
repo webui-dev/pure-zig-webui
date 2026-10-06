@@ -17,6 +17,10 @@ const iid_environment_callback = GUID.parse("{4e8a3389-c9d8-4bd2-b6b5-124fee6cc1
 const iid_controller_callback = GUID.parse("{6c4819f3-c9b7-4260-8127-c9f5bde7f68c}");
 const iid_close_callback = GUID.parse("{57213f19-00e6-49fa-8e07-898ea01ecbd2}"); // WebMessageReceived
 const iid_title_callback = GUID.parse("{f5f2b923-953e-4042-9f95-f3a118e1afd4}"); // DocumentTitleChanged
+// Upper bound for environment, controller, and document-script creation.
+// Cold starts spawn the browser processes and user data folder; CI runners
+// take about 7 s for two windows and occasionally exceed 15 s.
+const initialization_timeout_ms = 60_000;
 const iid_script_callback = GUID.parse("{b99369f3-9b11-47b5-bc6f-8e7895fcea17}");
 const iid_controller2 = GUID.parse("{c979903e-d4ca-4228-92eb-47ee3fa96eab}");
 
@@ -383,7 +387,7 @@ pub const Backend = struct {
         try check(webview.method(27, *const fn (*Com, [*:0]const u16, *ScriptCompletion) callconv(.winapi) HRESULT)(webview, close_script, script_completion));
         while (!script_completion.done) {
             if (!(try self.pump())) return error.NativeWindowClosed;
-            if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= 15_000)
+            if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= initialization_timeout_ms)
                 return error.NativeInitializationTimeout;
             if (!script_completion.done) try std.Io.sleep(io, .fromMilliseconds(1), .awake);
         }
@@ -400,7 +404,7 @@ pub const Backend = struct {
     fn awaitCompletion(self: *Backend, io: std.Io, start: std.Io.Timestamp, completion: *Completion) !*Com {
         while (!completion.done) {
             if (!(try self.pump())) return error.NativeWindowClosed;
-            if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= 15_000)
+            if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= initialization_timeout_ms)
                 return error.NativeInitializationTimeout;
             if (!completion.done) try std.Io.sleep(io, .fromMilliseconds(1), .awake);
         }

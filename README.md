@@ -597,7 +597,7 @@ Platform prerequisites and explicit limits:
 - **Windows:** link `user32`, `gdi32`, `ole32`, `kernel32`, and `dwmapi`; install the
   WebView2 Runtime and provide the architecture-matching `WebView2Loader.dll`
   through `Options.webview2_loader` or normal DLL discovery. No runtime is
-  downloaded by the library. Initialization is bounded to 15 seconds; late COM
+  downloaded by the library. Initialization is bounded to 60 seconds; late COM
   callbacks retain safe independent ownership. Transparency requires DWM
   composition and the Controller2 interface.
 
