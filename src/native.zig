@@ -13,6 +13,9 @@ pub const Geometry = types.Geometry;
 pub const Handle = types.Handle;
 pub const DragRegion = types.DragRegion;
 pub const CloseHandler = types.CloseHandler;
+pub const NavigationHandler = types.NavigationHandler;
+pub const NavigationRequest = types.NavigationRequest;
+pub const NavigationKind = types.NavigationKind;
 
 const supported = switch (builtin.os.tag) {
     .macos, .linux, .windows => true,
@@ -51,6 +54,8 @@ const State = struct {
     callback_depth: usize = 0,
     close_handler: ?CloseHandler,
     user_data: ?*anyopaque,
+    navigation_handler: ?NavigationHandler = null,
+    navigation_user_data: ?*anyopaque = null,
     minimum_size: ?Size = null,
 
     fn markClosed(self: *State) void {
@@ -94,10 +99,13 @@ pub const Window = struct {
             .tasks = tasks,
             .close_handler = options.close_handler,
             .user_data = options.user_data,
+            .navigation_handler = options.navigation_handler,
+            .navigation_user_data = options.user_data,
             .minimum_size = options.minimum_size,
         };
         var backend_options = options;
         backend_options.close_handler = closeRequested;
+        backend_options.navigation_handler = navigationRequested;
         backend_options.user_data = state;
         state.backend = try Backend.create(gpa, io, terminated, backend_options);
         return .{ .state = state };
@@ -312,6 +320,14 @@ pub const Window = struct {
         self.state.close_handler = handler;
         self.state.user_data = user_data;
     }
+
+    /// Replace the navigation handler and its user data; null allows every
+    /// navigation. The close handler keeps its own user data.
+    pub fn setNavigationHandler(self: Window, handler: ?NavigationHandler, user_data: ?*anyopaque) !void {
+        try self.checkOpen();
+        self.state.navigation_handler = handler;
+        self.state.navigation_user_data = user_data;
+    }
 };
 
 fn closeRequested(user_data: ?*anyopaque) bool {
@@ -321,6 +337,14 @@ fn closeRequested(user_data: ?*anyopaque) bool {
     const allowed = if (state.close_handler) |handler| handler(state.user_data) else true;
     if (allowed) state.markClosed();
     return allowed;
+}
+
+fn navigationRequested(user_data: ?*anyopaque, request: NavigationRequest) bool {
+    const state: *State = @ptrCast(@alignCast(user_data.?));
+    const handler = state.navigation_handler orelse return true;
+    state.callback_depth += 1;
+    defer state.callback_depth -= 1;
+    return handler(state.navigation_user_data, request);
 }
 
 fn validateUrl(value: []const u8) !void {
@@ -338,4 +362,42 @@ test "native navigation only accepts valid HTTP origins" {
     try std.testing.expectError(error.InvalidUrl, validateUrl("javascript:alert(1)"));
     try std.testing.expectError(error.InvalidUrl, validateUrl("file:///tmp/page.html"));
     try std.testing.expectError(error.InvalidNativeText, validateUrl("https://example.com/\x00hidden"));
+}
+
+test "navigation requests reach the handler with its own user data inside a callback scope" {
+    const Probe = struct {
+        state: *State,
+        seen: usize = 0,
+        depth: usize = 0,
+        kind: NavigationKind = .other,
+
+        fn decide(data: ?*anyopaque, request: NavigationRequest) bool {
+            const probe: *@This() = @ptrCast(@alignCast(data.?));
+            probe.seen += 1;
+            probe.depth = probe.state.callback_depth;
+            probe.kind = request.kind;
+            return !std.mem.endsWith(u8, request.url, "/blocked");
+        }
+    };
+    var state: State = .{
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .owner = std.Thread.getCurrentId(),
+        .backend = undefined,
+        .tasks = &.{},
+        .close_handler = null,
+        .user_data = null,
+    };
+    // Without a handler every navigation proceeds.
+    try std.testing.expect(navigationRequested(&state, .{ .url = "http://127.0.0.1/blocked", .kind = .link }));
+    var probe: Probe = .{ .state = &state };
+    state.navigation_handler = Probe.decide;
+    state.navigation_user_data = &probe;
+    try std.testing.expect(navigationRequested(&state, .{ .url = "http://127.0.0.1/next", .kind = .form_submission }));
+    try std.testing.expect(!navigationRequested(&state, .{ .url = "http://127.0.0.1/blocked", .kind = .back_forward }));
+    try std.testing.expectEqual(@as(usize, 2), probe.seen);
+    // Deinit is rejected while the handler runs, and the scope ends after it.
+    try std.testing.expectEqual(@as(usize, 1), probe.depth);
+    try std.testing.expectEqual(@as(usize, 0), state.callback_depth);
+    try std.testing.expectEqual(NavigationKind.back_forward, probe.kind);
 }

@@ -33,6 +33,31 @@ pub const Handle = union(enum) {
 /// Programmatic Window.close() bypasses this veto.
 pub const CloseHandler = *const fn (?*anyopaque) bool;
 
+/// What started a page navigation, as far as the engine reports it.
+/// WebView2 distinguishes only `reload`, `back_forward`, and `other`.
+pub const NavigationKind = enum {
+    link,
+    form_submission,
+    back_forward,
+    reload,
+    form_resubmission,
+    other,
+};
+
+/// A page-initiated navigation awaiting a decision.
+pub const NavigationRequest = struct {
+    /// Target URL as reported by the engine, borrowed for the handler call.
+    url: []const u8,
+    kind: NavigationKind,
+};
+
+/// Called on the UI thread before a page or frame navigates. Return true to
+/// let it proceed, false to cancel it and keep the current page. The host's
+/// own requests (the initial load and `Window.navigate`) are not reported.
+/// Every server redirect hop is reported as its own request, so a handler
+/// can also stop a redirect to another origin.
+pub const NavigationHandler = *const fn (?*anyopaque, NavigationRequest) bool;
+
 pub const Options = struct {
     /// Initial host title, shown until the page reports a non-empty title.
     title: []const u8 = "WebUI",
@@ -51,6 +76,10 @@ pub const Options = struct {
     profile_directory: ?[]const u8 = null,
     webview2_loader: ?[]const u8 = null,
     close_handler: ?CloseHandler = null,
+    /// Engine-level navigation interception, like upstream's WebKitGTK
+    /// policy handler; it also sees navigations the browser bridge cannot.
+    navigation_handler: ?NavigationHandler = null,
+    /// Passed to both `close_handler` and `navigation_handler`.
     user_data: ?*anyopaque = null,
     max_pending_tasks: usize = 64,
 

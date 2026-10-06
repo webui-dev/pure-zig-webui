@@ -73,6 +73,18 @@ const resize_border = 6;
 // GdkWindowEdge values; corners are tested before sides.
 const Edge = enum(c_int) { north_west = 0, north = 1, north_east = 2, west = 3, east = 4, south_west = 5, south = 6, south_east = 7 };
 const cursor_names = [_][:0]const u8{ "ns-resize", "ew-resize", "nwse-resize", "nesw-resize" };
+/// WebKitNavigationType to the portable kind.
+fn navigationKind(value: c_int) types.NavigationKind {
+    return switch (value) {
+        0 => .link,
+        1 => .form_submission,
+        2 => .back_forward,
+        3 => .reload,
+        4 => .form_resubmission,
+        else => .other,
+    };
+}
+
 /// Resize edge under a WebView-relative point, or null for the interior.
 fn hitEdge(width: c_int, height: c_int, x: f64, y: f64) ?Edge {
     const right_band: f64 = @floatFromInt(width - resize_border);
@@ -205,6 +217,12 @@ const Api = struct {
     webkit_user_script_new: *const fn ([*:0]const u8, c_int, c_int, ?[*:null]const ?[*:0]const u8, ?[*:null]const ?[*:0]const u8) callconv(.c) ?Object,
     webkit_user_script_unref: *const fn (Object) callconv(.c) void,
     webkit_javascript_result_get_js_value: *const fn (Object) callconv(.c) ?Object,
+    webkit_navigation_policy_decision_get_navigation_action: *const fn (Object) callconv(.c) ?Object,
+    webkit_navigation_action_get_navigation_type: *const fn (Object) callconv(.c) c_int,
+    webkit_navigation_action_get_request: *const fn (Object) callconv(.c) ?Object,
+    webkit_uri_request_get_uri: *const fn (Object) callconv(.c) ?[*:0]const u8,
+    webkit_policy_decision_use: *const fn (Object) callconv(.c) void,
+    webkit_policy_decision_ignore: *const fn (Object) callconv(.c) void,
     jsc_value_is_boolean: *const fn (Object) callconv(.c) c_int,
     jsc_value_to_boolean: *const fn (Object) callconv(.c) c_int,
 
@@ -257,13 +275,16 @@ pub const Backend = struct {
     message_signals: [message_channels.len]c_ulong = @splat(0),
     registered_channels: usize = 0,
     window_signals: [3]c_ulong = .{ 0, 0, 0 },
-    view_signals: [4]c_ulong = @splat(0),
+    view_signals: [5]c_ulong = @splat(0),
     cursors: [cursor_names.len]?Object = @splat(null),
     edge_cursor_shown: bool = false,
     frameless: bool = false,
     resizable: bool = true,
     close_handler: ?types.CloseHandler,
+    navigation_handler: ?types.NavigationHandler,
     user_data: ?*anyopaque,
+    // Set before each host load so its own policy decision is not reported.
+    host_navigation: bool = false,
     closed: bool = false,
     close_requested: bool = false,
     next_pending_close: ?*Backend = null,
@@ -290,7 +311,7 @@ pub const Backend = struct {
         if (api.gtk_init_check(null, null) == 0) return error.NativeDisplayUnavailable;
         const self = try gpa.create(Backend);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .gtk = gtk, .webkit = webkit, .api = api, .close_handler = options.close_handler, .user_data = options.user_data, .follow_page_title = options.follow_page_title };
+        self.* = .{ .gpa = gpa, .gtk = gtk, .webkit = webkit, .api = api, .close_handler = options.close_handler, .navigation_handler = options.navigation_handler, .user_data = options.user_data, .follow_page_title = options.follow_page_title };
         errdefer self.releaseObjects();
 
         const window = api.gtk_window_new(0) orelse return error.NativeInitializationFailed;
@@ -358,6 +379,7 @@ pub const Backend = struct {
         api.gtk_widget_add_events(view, 4 | 256); // GDK_POINTER_MOTION_MASK | GDK_BUTTON_PRESS_MASK
         self.view_signals[2] = try self.connect(view, "button-press-event", @ptrCast(&buttonPressed));
         self.view_signals[3] = try self.connect(view, "motion-notify-event", @ptrCast(&pointerMoved));
+        self.view_signals[4] = try self.connect(view, "decide-policy", @ptrCast(&decidePolicy));
 
         // GTK/WebKit setters copy strings synchronously; no borrowed Options
         // slices or URL buffers are retained in this backend.
@@ -372,6 +394,7 @@ pub const Backend = struct {
         if (options.position) |position| try self.setPosition(position);
         if (options.center) try self.center();
         if (options.kiosk) try self.setKiosk(true);
+        self.host_navigation = true;
         api.webkit_web_view_load_uri(view, url);
         if (!options.hidden) api.gtk_widget_show_all(window);
         return self;
@@ -492,6 +515,7 @@ pub const Backend = struct {
     pub fn navigate(self: *Backend, url: [:0]const u8) !void {
         _ = try self.liveWindow();
         self.process_failed = false;
+        self.host_navigation = true;
         self.api.webkit_web_view_load_uri(self.view.?, url);
     }
 
@@ -679,6 +703,31 @@ pub const Backend = struct {
         return 1; // Any Backend's pump destroys accepted requests after emission.
     }
 
+    /// Like upstream's WebKitGTK policy handler, decide page navigations
+    /// in the engine, independent of any bridge connection.
+    fn decidePolicy(_: Object, decision: Object, decision_type: c_int, data: ?Object) callconv(.c) c_int {
+        const self: *Backend = @ptrCast(@alignCast(data.?));
+        if (decision_type != 0) return 0; // WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION
+        const action = self.api.webkit_navigation_policy_decision_get_navigation_action(decision) orelse return 0;
+        // Each server redirect hop is a new request; WKWebView reports hops
+        // the same way and has no public redirect flag to filter them.
+        if (self.host_navigation) {
+            self.host_navigation = false;
+            return 0;
+        }
+        const handler = self.navigation_handler orelse return 0;
+        if (self.closed or self.close_requested) return 0;
+        // A navigation the handler cannot be asked about is cancelled.
+        const request = self.api.webkit_navigation_action_get_request(action);
+        const uri = if (request) |value| self.api.webkit_uri_request_get_uri(value) else null;
+        const allowed = if (uri) |value| handler(self.user_data, .{
+            .url = std.mem.sliceTo(value, 0),
+            .kind = navigationKind(self.api.webkit_navigation_action_get_navigation_type(action)),
+        }) else false;
+        if (allowed) self.api.webkit_policy_decision_use(decision) else self.api.webkit_policy_decision_ignore(decision);
+        return 1;
+    }
+
     fn scriptMessage(_: Object, result: Object, data: ?Object) callconv(.c) void {
         const self: *Backend = @ptrCast(@alignCast(data.?));
         const value = self.api.webkit_javascript_result_get_js_value(result) orelse return;
@@ -799,4 +848,11 @@ test "frameless resize hit-testing prefers corners within the edge band" {
     // Tiny allocations stay well-defined: every point is on an edge.
     try std.testing.expectEqual(Edge.north_west, hitEdge(4, 4, 1, 1).?);
     try std.testing.expectEqual(Edge.north_west, hitEdge(0, 0, 0, 0).?);
+}
+
+test "WebKitGTK navigation types map to portable kinds" {
+    const expected = [_]types.NavigationKind{ .link, .form_submission, .back_forward, .reload, .form_resubmission, .other };
+    for (expected, 0..) |kind, value| try std.testing.expectEqual(kind, navigationKind(@intCast(value)));
+    try std.testing.expectEqual(types.NavigationKind.other, navigationKind(-1));
+    try std.testing.expectEqual(types.NavigationKind.other, navigationKind(99));
 }
