@@ -3049,19 +3049,19 @@ pub const App = struct {
             if (executable.len == 0) return error.InvalidBrowserExecutable;
         self.browser_mutex.lockUncancelable(io);
         defer self.browser_mutex.unlock(io);
-        var controls = requested_controls;
+        const controls = requested_controls;
         const profile = if (controls.profile_directory == null)
-            try browser.managedWindowProfileDirectory(self.gpa, options.browser, &window.capability)
+            try browser.managedWindowProfileDirectory(self.gpa, io, options.browser, &window.capability)
         else
             null;
         var owns_profile = true;
         defer if (owns_profile) if (profile) |path| self.gpa.free(path);
-        controls.profile_directory = controls.profile_directory orelse profile;
+        const effective_profile = controls.profile_directory orelse profile;
         for (self.managed_browsers.items) |managed| {
             if (managed.window == window or managed.child == null) continue;
             const other = managed.profile orelse managed.window.browser_controls.profile_directory;
-            if (controls.profile_directory != null and other != null and
-                std.mem.eql(u8, controls.profile_directory.?, other.?))
+            if (effective_profile != null and other != null and
+                std.mem.eql(u8, effective_profile.?, other.?))
                 return error.BrowserProfileInUse;
         }
         const managed = for (self.managed_browsers.items) |*existing| {
@@ -3080,7 +3080,7 @@ pub const App = struct {
         if (managed.profile) |path| self.gpa.free(path);
         managed.profile = profile;
         owns_profile = false;
-        managed.child = try browser.launch(self.gpa, io, url, options, controls);
+        managed.child = try browser.launch(self.gpa, io, url, options, controls, profile);
         return managed.child.?.id.?;
     }
 
@@ -6021,10 +6021,10 @@ test "managed profiles are deletable and caller directories are not" {
 
     try std.testing.expectEqual(
         @as(?[]u8, null),
-        try browser.managedProfileDirectory(gpa, .firefox),
+        try browser.managedProfileDirectory(gpa, io, .safari),
     );
     try std.testing.expect(
-        !try browser.deleteManagedProfile(gpa, io, .firefox),
+        !try browser.deleteManagedProfile(gpa, io, .safari),
     );
 
     var app = App.init(gpa, .{});
@@ -6039,7 +6039,7 @@ test "managed profiles are deletable and caller directories are not" {
     const sibling = try app.createWindow(.{ .content = .{ .html = "independent profile" } });
     var running = try app.start(io);
     defer running.stop() catch {};
-    const managed = (try browser.managedWindowProfileDirectory(gpa, .epic, &window.state.capability)).?;
+    const managed = (try browser.managedWindowProfileDirectory(gpa, io, .epic, &window.state.capability)).?;
     defer gpa.free(managed);
 
     // Nothing launched yet, so no profile can be identified.
@@ -6063,7 +6063,7 @@ test "managed profiles are deletable and caller directories are not" {
         .data = "cached",
     });
     const sibling_id = try sibling.openWithBrowser(&running, .{ .browser = .epic, .executable = executable });
-    const sibling_profile = (try browser.managedWindowProfileDirectory(gpa, .epic, &sibling.state.capability)).?;
+    const sibling_profile = (try browser.managedWindowProfileDirectory(gpa, io, .epic, &sibling.state.capability)).?;
     defer gpa.free(sibling_profile);
     defer _ = sibling.deleteProfile(&running) catch false;
     try std.Io.Dir.cwd().createDirPath(io, sibling_profile);
@@ -6095,6 +6095,105 @@ test "managed profiles are deletable and caller directories are not" {
     );
 }
 
+test "Firefox windows launch with a generated app-mode profile" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos)
+        return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited, .environ = std.testing.environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    try requireTestRuntime(gpa, io, .node_js);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Records what the browser receives at spawn time, then stays alive.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "fake-firefox",
+        .data =
+        \\#!/usr/bin/env node
+        \\const fs = require('fs'), path = require('path');
+        \\const args = process.argv.slice(2);
+        \\const profile = args[args.indexOf('--profile') + 1];
+        \\const report = {
+        \\  args,
+        \\  userJs: fs.readFileSync(path.join(profile, 'user.js'), 'utf8'),
+        \\  userChrome: fs.existsSync(path.join(profile, 'chrome', 'userChrome.css')),
+        \\};
+        \\fs.writeFileSync(path.join(__dirname, 'launch.tmp'), JSON.stringify(report));
+        \\fs.renameSync(path.join(__dirname, 'launch.tmp'), path.join(__dirname, 'launch.json'));
+        \\setInterval(() => {}, 1000);
+        \\
+        ,
+        .flags = .{ .permissions = .executable_file },
+    });
+    const executable = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/fake-firefox", .{tmp.sub_path});
+    defer gpa.free(executable);
+    try tmp.dir.createDirPath(io, "caller-profile");
+    const caller_profile = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/caller-profile", .{tmp.sub_path});
+    defer gpa.free(caller_profile);
+
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{
+        .content = .{ .html = "firefox profile" },
+        .high_contrast = false,
+        .size = .{ .width = 640, .height = 480 },
+    });
+    const caller_window = try app.createWindow(.{
+        .content = .{ .html = "caller firefox profile" },
+        .high_contrast = false,
+        .profile_directory = caller_profile,
+    });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    const profile = (try browser.managedWindowProfileDirectory(gpa, io, .firefox, &window.state.capability)).?;
+    defer gpa.free(profile);
+
+    _ = try window.openWithBrowser(&running, .{ .browser = .firefox, .executable = executable });
+    defer _ = window.deleteProfile(&running) catch false;
+    const report_bytes = for (0..1000) |_| {
+        break tmp.dir.readFileAlloc(io, "launch.json", gpa, .limited(64 << 10)) catch |err| switch (err) {
+            error.FileNotFound => {
+                try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    } else return error.Timeout;
+    defer gpa.free(report_bytes);
+    const Report = struct { args: []const []const u8, userJs: []const u8, userChrome: bool };
+    const report = try std.json.parseFromSlice(Report, gpa, report_bytes, .{});
+    defer report.deinit();
+    const args = report.value.args;
+    const page_url = try window.url(&running, gpa);
+    defer gpa.free(page_url);
+    try std.testing.expectEqual(@as(usize, 8), args.len);
+    try std.testing.expectEqualStrings("--profile", args[0]);
+    try std.testing.expectEqualStrings(profile, args[1]);
+    try std.testing.expectEqualStrings("-width", args[2]);
+    try std.testing.expectEqualStrings("640", args[3]);
+    try std.testing.expectEqualStrings("-height", args[4]);
+    try std.testing.expectEqualStrings("480", args[5]);
+    try std.testing.expectEqualStrings("-new-window", args[6]);
+    try std.testing.expectEqualStrings(page_url, args[7]);
+    // The profile is ready before the browser starts.
+    try std.testing.expect(report.value.userChrome);
+    try std.testing.expect(std.mem.indexOf(u8, report.value.userJs, "legacyUserProfileCustomizations.stylesheets\", true") != null);
+    try std.testing.expect(std.mem.endsWith(u8, report.value.userJs, "document_color_use\", 1);\n"));
+
+    // The override cannot be applied to a caller profile, which is never
+    // modified, so the launch is refused before anything is spawned.
+    try std.testing.expectError(
+        error.UnsupportedBrowserHighContrast,
+        caller_window.openWithBrowser(&running, .{ .browser = .firefox, .executable = executable }),
+    );
+    var caller_dir = try tmp.dir.openDir(io, "caller-profile", .{ .iterate = true });
+    defer caller_dir.close(io);
+    var entries = caller_dir.iterate();
+    try std.testing.expectEqual(@as(?std.Io.Dir.Entry, null), try entries.next(io));
+
+    try std.testing.expect(try window.deleteProfile(&running));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, profile, .{}));
+}
 test "selected browser launch applies window controls and owns process" {
     if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos)
         return error.SkipZigTest;

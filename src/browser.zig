@@ -79,7 +79,9 @@ pub const WindowControls = struct {
             .firefox => {
                 if (self.proxy_server != null)
                     return error.UnsupportedBrowserProxy;
-                if (!self.high_contrast)
+                // Firefox has no flag for it: the override is a preference
+                // that only a WebUI-generated profile may receive.
+                if (!self.high_contrast and self.profile_directory != null)
                     return error.UnsupportedBrowserHighContrast;
                 if (self.position != null)
                     return error.UnsupportedBrowserControl;
@@ -258,17 +260,27 @@ pub fn bestBrowser(
     return null;
 }
 
+/// Launch a browser window. `managed_profile` is a WebUI-generated profile
+/// used when `controls.profile_directory` is null; Firefox receives WebUI's
+/// app-mode settings in it. A caller profile is never modified.
 pub fn launch(
     gpa: std.mem.Allocator,
     io: std.Io,
     url: []const u8,
     options: LaunchOptions,
     controls: WindowControls,
+    managed_profile: ?[]const u8,
 ) !std.process.Child {
     if (url.len == 0) return error.InvalidUrl;
     if (options.executable) |executable|
         if (executable.len == 0) return error.InvalidBrowserExecutable;
     try controls.validateFor(options.browser);
+    if (managed_profile) |directory| {
+        if (controls.profile_directory != null) return error.InvalidBrowserProfile;
+        try (WindowControls{ .profile_directory = directory }).validate();
+    }
+    if (options.browser == .firefox and !controls.high_contrast and managed_profile == null)
+        return error.UnsupportedBrowserHighContrast;
 
     const discovered = if (options.executable == null)
         try resolveExecutable(gpa, io, options.browser) orelse
@@ -285,9 +297,12 @@ pub fn launch(
 
     // The owner supplies its retained per-window profile. Never fall back to
     // the shared family root: Chromium would hand the URL to another process.
-    if (isChromium(options.browser) and controls.profile_directory == null)
+    const profile = controls.profile_directory orelse managed_profile;
+    if (isChromium(options.browser) and profile == null)
         return error.ManagedBrowserProfileRequired;
-    const profile = controls.profile_directory;
+    if (options.browser == .firefox)
+        if (managed_profile) |directory|
+            try prepareFirefoxProfile(io, directory, controls.high_contrast);
     const profile_argument = if (profile) |directory|
         switch (options.browser) {
             .firefox, .safari => null,
@@ -435,19 +450,26 @@ fn managedProfileName(selected: Browser) ?[]const u8 {
         .yandex => "WebUIYandexProfile",
         .opera => "WebUIOperaProfile",
         .chromium => "WebUIChromiumProfile",
-        // Firefox profiles live in profiles.ini rather than a directory
-        // argument, and Safari has no profile support at all.
-        .firefox, .safari => null,
+        .firefox => "WebUIFirefoxProfile",
+        // Safari has no profile support at all.
+        .safari => null,
     };
 }
 
 /// Root of the generated per-window profiles for one browser family. Returns
-/// null when no managed profile applies. Caller owns the returned memory.
+/// null when no managed profile applies. On Linux with Snap Firefox
+/// installed, Firefox profiles live in the snap's own user directory,
+/// because a snap cannot see the host `/tmp`; it returns
+/// `error.HomeDirectoryUnavailable` when that directory is unknown.
+/// Caller owns the returned memory.
 pub fn managedProfileDirectory(
     gpa: std.mem.Allocator,
+    io: std.Io,
     selected: Browser,
 ) !?[]u8 {
     const name = managedProfileName(selected) orelse return null;
+    if (selected == .firefox)
+        if (try snapFirefoxProfileRoot(gpa, io)) |root| return root;
     return switch (builtin.os.tag) {
         .windows => blk: {
             const temp = (std.process.Environ{ .block = .global })
@@ -472,10 +494,11 @@ pub fn managedProfileDirectory(
 /// by App.start, not a caller-supplied filesystem path.
 pub fn managedWindowProfileDirectory(
     gpa: std.mem.Allocator,
+    io: std.Io,
     selected: Browser,
     identity: []const u8,
 ) !?[]u8 {
-    const root = try managedProfileDirectory(gpa, selected) orelse return null;
+    const root = try managedProfileDirectory(gpa, io, selected) orelse return null;
     defer gpa.free(root);
     return try std.fs.path.join(gpa, &.{ root, identity });
 }
@@ -488,7 +511,7 @@ pub fn deleteManagedProfile(
     io: std.Io,
     selected: Browser,
 ) !bool {
-    const path = try managedProfileDirectory(gpa, selected) orelse return false;
+    const path = try managedProfileDirectory(gpa, io, selected) orelse return false;
     defer gpa.free(path);
     return deleteProfilePath(io, path);
 }
@@ -534,6 +557,47 @@ fn prepareFirefoxProfile(io: std.Io, directory: []const u8, high_contrast: bool)
     });
     try profile.createDirPath(io, "chrome");
     try profile.writeFile(io, .{ .sub_path = "chrome/userChrome.css", .data = firefox_user_chrome });
+}
+
+/// The managed Firefox root inside Snap Firefox's user directory, or null
+/// when Snap Firefox is not installed. Upstream uses the same location.
+fn snapFirefoxProfileRoot(gpa: std.mem.Allocator, io: std.Io) !?[]u8 {
+    if (builtin.os.tag != .linux) return null;
+    std.Io.Dir.accessAbsolute(io, "/snap/bin/firefox", .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    // snapd derives a snap's user directories from the account's passwd
+    // home, which is also the only home known without a process environment.
+    const passwd = std.Io.Dir.cwd().readFileAlloc(io, "/etc/passwd", gpa, .limited(4 << 20)) catch |err|
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.HomeDirectoryUnavailable,
+        };
+    defer gpa.free(passwd);
+    const home = passwdHome(passwd, std.os.linux.getuid()) orelse
+        return error.HomeDirectoryUnavailable;
+    return try std.fs.path.join(gpa, &.{ home, "snap/firefox/common/.mozilla/firefox/.WebUI/WebUIFirefoxProfile" });
+}
+
+/// The absolute home directory of `uid` in passwd(5) text, if listed.
+fn passwdHome(passwd: []const u8, uid: u32) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, passwd, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ':');
+        _ = fields.next() orelse continue; // name
+        _ = fields.next() orelse continue; // password
+        const uid_text = fields.next() orelse continue;
+        _ = fields.next() orelse continue; // group
+        _ = fields.next() orelse continue; // comment
+        const home = fields.next() orelse continue;
+        if (fields.next() == null) continue; // shell
+        const entry_uid = std.fmt.parseInt(u32, uid_text, 10) catch continue;
+        if (entry_uid != uid) continue;
+        if (home.len < 2 or home[0] != '/') return null;
+        return home;
+    }
+    return null;
 }
 
 /// Internal ownership helper; only call with a generated root or retained leaf.
@@ -834,9 +898,12 @@ test "window controls validate browser support" {
         (WindowControls{ .proxy_server = "http://127.0.0.1:8080" })
             .validateFor(.safari),
     );
+    // Firefox gets the override only through a WebUI-generated profile.
+    try (WindowControls{ .high_contrast = false }).validateFor(.firefox);
     try std.testing.expectError(
         error.UnsupportedBrowserHighContrast,
-        (WindowControls{ .high_contrast = false }).validateFor(.firefox),
+        (WindowControls{ .high_contrast = false, .profile_directory = "profiles/firefox" })
+            .validateFor(.firefox),
     );
     try std.testing.expectError(
         error.UnsupportedBrowserHighContrast,
@@ -873,12 +940,17 @@ test "window controls validate browser support" {
 test "managed profiles and default arguments cover the chromium family" {
     const gpa = std.testing.allocator;
     for (std.enums.values(Browser)) |selected| {
-        const directory = try managedProfileDirectory(gpa, selected);
+        const directory = try managedProfileDirectory(gpa, std.testing.io, selected);
         defer if (directory) |value| gpa.free(value);
         switch (selected) {
-            .firefox, .safari => {
+            .safari => {
                 try std.testing.expect(!isChromium(selected));
                 try std.testing.expectEqual(@as(?[]u8, null), directory);
+            },
+            .firefox => {
+                try std.testing.expect(!isChromium(selected));
+                // /tmp, or the snap's user directory when Snap Firefox exists.
+                try std.testing.expectStringEndsWith(directory.?, "WebUIFirefoxProfile");
             },
             else => {
                 try std.testing.expect(isChromium(selected));
@@ -949,6 +1021,58 @@ test "generated Firefox profiles receive WebUI app-mode settings" {
     const occupied = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/occupied", .{tmp.sub_path});
     defer std.testing.allocator.free(occupied);
     try std.testing.expectError(error.NotDir, prepareFirefoxProfile(io, occupied, true));
+}
+
+test "passwd home lookup accepts only well-formed absolute entries" {
+    const passwd =
+        \\# comment line
+        \\root:x:0:0:root:/root:/bin/bash
+        \\short:x:1000
+        \\badid:x:10x0:1000::/home/bad:/bin/sh
+        \\relative:x:1001:1001::home/relative:/bin/sh
+        \\nohome:x:1002:1002:::/bin/sh
+        \\jin:x:1000:1000:Jin,,,:/home/jin:/bin/zsh
+        \\noshell:x:1003:1003::/home/noshell
+    ;
+    try std.testing.expectEqualStrings("/root", passwdHome(passwd, 0).?);
+    try std.testing.expectEqualStrings("/home/jin", passwdHome(passwd, 1000).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdHome(passwd, 1001));
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdHome(passwd, 1002));
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdHome(passwd, 1003));
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdHome(passwd, 4242));
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdHome("", 0));
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdHome("root:x:0:0:root:/:/bin/sh", 0));
+}
+
+test "Firefox launches reject profile combinations they cannot honour" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // No generated profile means no place for the high-contrast override.
+    try std.testing.expectError(error.UnsupportedBrowserHighContrast, launch(
+        gpa,
+        io,
+        "http://127.0.0.1:1/",
+        .{ .browser = .firefox, .executable = "missing-firefox" },
+        .{ .high_contrast = false },
+        null,
+    ));
+    // A generated profile never replaces a caller profile.
+    try std.testing.expectError(error.InvalidBrowserProfile, launch(
+        gpa,
+        io,
+        "http://127.0.0.1:1/",
+        .{ .browser = .firefox, .executable = "missing-firefox" },
+        .{ .profile_directory = "caller" },
+        "generated",
+    ));
+    try std.testing.expectError(error.InvalidBrowserProfile, launch(
+        gpa,
+        io,
+        "http://127.0.0.1:1/",
+        .{ .browser = .firefox, .executable = "missing-firefox" },
+        .{},
+        "",
+    ));
 }
 
 test "parent process ID identifies the backend process" {

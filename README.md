@@ -10,8 +10,8 @@ compile or link the upstream WebUI C library or CivetWeb.
 support.
 
 The core rewrite is substantial, but full upstream behavioral parity is not
-complete. A fresh source audit found gaps in Firefox app profiles, browser
-discovery, and native drag/resize, title and navigation integration. See the
+complete. A fresh source audit found gaps in browser discovery and native
+drag/resize, title and navigation integration. See the
 [open semantic gaps](docs/PURE_ZIG_REFACTOR.md#open-semantic-gaps)
 and the [source comparison](docs/UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
@@ -69,8 +69,9 @@ The current phase provides:
 - explicit browser launching with custom executable paths and argv;
 - per-window kiosk and headless modes plus persistent initial and runtime size
   and position;
-- per-window Chromium forced-color control and browser-native high-contrast
-  detection;
+- per-window Chromium and Firefox forced-color control and browser-native
+  high-contrast detection;
+- generated Firefox app profiles that hide the browser toolbars;
 - per-window browser profile directories with deletable managed profiles,
   and Chromium-family proxy rules;
 - per-window browser child identifiers and deterministic process cleanup;
@@ -230,8 +231,11 @@ OS-handler fallback inside `Window.open()` cannot honour these controls, and it
 returns `error.ExplicitBrowserRequired` instead of ignoring them.
 
 Set `.high_contrast = false` in `App.WindowOptions` to disable Chromium's
-forced-color feature for that window. Firefox and Safari return
-`error.UnsupportedBrowserHighContrast` instead of ignoring this setting.
+forced-color feature for that window. Firefox has no flag for it, so the
+setting is written into the window's generated Firefox profile; with a
+caller-managed `.profile_directory`, which zig-webui never modifies, Firefox
+returns `error.UnsupportedBrowserHighContrast`. Safari always returns that
+error instead of ignoring this setting.
 The browser-side `webui.isHighContrast()` detects active forced colors or a
 stronger contrast preference through native media queries and requires no
 external OS program.
@@ -245,16 +249,28 @@ Firefox returns `error.UnsupportedBrowserProxy` for proxy configuration;
 Safari returns `error.UnsupportedBrowserProfile` or
 `error.UnsupportedBrowserProxy` instead of silently ignoring either option.
 
-Without `.profile_directory`, each Chromium-family window gets an independent
-managed profile leaf under its browser-family temporary root, for example
-`/tmp/.WebUI/WebUIChromeProfile/<window-capability>`. Different windows no
-longer hand their URL to the same browser process. Reopening a window stops and
-reaps its previous child before launching the replacement. A failed replacement
-leaves no stale child identifier.
+Without `.profile_directory`, each Chromium-family or Firefox window gets an
+independent managed profile leaf under its browser-family temporary root, for
+example `/tmp/.WebUI/WebUIChromeProfile/<window-capability>`. Different windows
+no longer hand their URL to the same browser process. Reopening a window stops
+and reaps its previous child before launching the replacement. A failed
+replacement leaves no stale child identifier.
+
+Before each launch, a generated Firefox profile receives upstream's app-mode
+setup: a `chrome/userChrome.css` that hides the tab strip, toolbars, and
+sidebar, and a `user.js` that enables it and turns off the default-browser
+check, the close warning, tabs in the title bar, and the first-run pages.
+`user.js` is rewritten each time, so a changed `.high_contrast` applies on the
+next launch. Snap Firefox cannot see the host `/tmp`, so when
+`/snap/bin/firefox` exists on Linux, Firefox profiles live in the snap's user
+directory, `<home>/snap/firefox/common/.mozilla/firefox/.WebUI/WebUIFirefoxProfile`,
+like upstream. The home directory comes from the current user's `/etc/passwd`
+entry, as snapd does; without one, the launch returns
+`error.HomeDirectoryUnavailable`.
 
 `Window.deleteProfile(&running)` stops the retained child and removes only that
-window's generated leaf. `managedProfileDirectory(gpa, browser)` returns the
-family root; `deleteManagedProfile` and `deleteAllManagedProfiles` remove roots
+window's generated leaf. `managedProfileDirectory(gpa, io, browser)` returns
+the family root; `deleteManagedProfile` and `deleteAllManagedProfiles` remove roots
 and all their leaves, so stop every associated browser before using them.
 Caller-provided profiles remain caller-owned; `Window.deleteProfile` returns
 `error.CallerManagedProfile`. Do not share a caller profile with other live

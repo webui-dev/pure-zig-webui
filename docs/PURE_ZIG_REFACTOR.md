@@ -49,7 +49,6 @@ is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
 | Area | Remaining behavior, not covered by existing API mappings |
 |---|---|
-| Firefox app mode | No generated Firefox app profile/userChrome.css or managed preference setup. Existing caller-profile support and explicit high-contrast error do not implement those capabilities. |
 | Browser discovery | Registered Windows Chromium using `chrome.exe` and macOS bundles outside the fixed application directories lack upstream discovery paths. |
 | Native interaction | Missing GTK custom drag/edge resize, Windows draggable-region setup and resizable frameless host behavior, and Cocoa frameless background movement. |
 | Native page integration | No upstream page-title-to-host synchronization; no GTK engine-level navigation-policy interception independent of a live bridge. |
@@ -64,6 +63,7 @@ Closed after the rescan, each with focused tests in the same change:
 | Default favicon | `favicon.ico`/`favicon.svg` resolve custom icon, then a readable directory file, then upstream's default SVG (`.ico` answers `302` to `favicon.svg`), at both the capability root and the origin root. Test: `favicon falls back from custom icon to local file to the default`. |
 | Content composition | `Content.site` composes optional embedded HTML, a declinable handler, and a root folder in upstream resolution order; `Window.installContent` replaces resources without navigation. Tests: `site content resolves handler, virtual index, html, folder, and entry in upstream order`, `installed content changes resources without navigating clients`. |
 | Live window lifecycle | `App.createWindow` serves windows created while running with fresh credentials, folder, and monitor. `App.destroyWindow` unregisters at once (`404` routing, backend close, `1001` on later messages), then cancels the window's handlers, monitor, and managed browser in the background, and frees it after its last connection, request, and deferred reply. This works from the window's own handlers via `Client.window()`, and `Running.stop` finishes pending cleanup. Tests: `windows are created and destroyed while the app runs`, `destroying a window before start frees it at once`, `upgrade admission owns only accepted connections and removes every state`. |
+| Firefox app mode | Firefox windows without a caller profile get a generated per-window profile; before each launch it receives upstream's `chrome/userChrome.css` toolbar suppression and a rewritten `user.js` (stylesheet support, no default-browser check, close warning, tabs in title bar, or first-run pages, and the `browser.display.document_color_use` high-contrast override). Snap Firefox profiles live under the snap's user directory from the passwd home. A caller profile is never modified, so it rejects `high_contrast = false`. Tests: `generated Firefox profiles receive WebUI app-mode settings`, `Firefox windows launch with a generated app-mode profile`, `Firefox launches reject profile combinations they cannot honour`, `passwd home lookup accepts only well-formed absolute entries`. |
 | Entry and custom routing | `Site.entry` redirects the root to a validated relative entry file, and handlers that decline a path (empty `404`) are probed for the entry name or `index.*` with `302` redirects, for both `.site` and `.custom`. Same tests as content composition. |
 
 Borrowed custom HTTP handlers can await work before returning through `std.Io`;
@@ -424,7 +424,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_focus()` | `Window.focus()` restores and focuses the visible top-level window belonging to the retained browser child on Windows. Missing children, invalid process handles, unavailable windows, and rejected foreground requests return explicit errors; Linux and macOS return `error.UnsupportedPlatform` instead of silently doing nothing. |
 | `webui_delete_profile()`, `webui_delete_all_profiles()` | `Window.deleteProfile()`, `deleteManagedProfile()`, and `deleteAllManagedProfiles()` remove generated profile directories only. A window configured with `.profile_directory` returns `error.CallerManagedProfile`; caller-owned directories are never deleted. |
 | `webui_set_size()`, `webui_set_position()` | `App.WindowOptions.size` and `.position` set initial geometry. `Window.setSize()` and `Window.setPosition()` persist updates, notify connected clients, replay the latest geometry to later clients, and affect subsequent explicit browser launches. |
-| `webui_set_high_contrast()`, `webui_is_high_contrast()` | `App.WindowOptions.high_contrast` controls Chromium forced-color support with explicit unsupported-browser errors. Browser-side `webui.isHighContrast()` uses native forced-color and contrast media queries without external programs. |
+| `webui_set_high_contrast()`, `webui_is_high_contrast()` | `App.WindowOptions.high_contrast` controls Chromium forced-color support and the generated Firefox profile's `browser.display.document_color_use` preference, with explicit errors for Safari and caller-managed Firefox profiles. Browser-side `webui.isHighContrast()` uses native forced-color and contrast media queries without external programs. |
 | `webui_open_url()` | `openUrl()` safely passes a non-empty URL as one argument to the platform default opener. |
 | `webui_get_best_browser()`, `webui_browser_exist()` | `bestBrowser()` and `browserExists()` discover registered or executable browser candidates through the public `Browser` enum. |
 | `webui_show_browser()`, `webui_set_browser_folder()`, `webui_set_custom_parameters()` | `Window.openWithBrowser()` accepts a `BrowserLaunchOptions` value with an explicit browser, optional full executable path, and additional argv. An empty argv applies the Chromium default arguments; a non-empty argv replaces them, matching upstream `custom_parameters`. |
@@ -434,7 +434,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_set_runtime()` | `App.WindowOptions.runtime` selects Deno, Node.js, or Bun for `.js`/`.ts`. Physical directories first redirect to the first `index.html`, `index.htm`, `index.ts`, or `index.js`; only a selected script is interpreted. Executables receive argv without a shell. Failures deliberately answer `503`/`504`/`502`, never partial stdout or diagnostics. |
 | `webui_set_config(folder_monitor)` | `App.Options.folder_monitor_interval` enables portable recursive directory polling and reloads the affected window's connected clients. |
 | `webui_set_icon()`, `webui_set_icon_file()` | `Window.setIcon()` copies inline data and MIME type; `Window.setIconFile()` loads a supported image file as the window favicon. |
-| `webui_set_profile()` | Caller-managed profiles and isolated owned Chromium profile leaves are supported. Partial: Firefox managed app profiles, chrome suppression and preference setup remain absent. |
+| `webui_set_profile()` | Caller-managed profiles and isolated owned Chromium and Firefox profile leaves are supported; generated Firefox profiles receive upstream's userChrome.css and app-mode preferences, under the snap user directory for Snap Firefox. |
 | `webui_set_proxy()` | `App.WindowOptions.proxy_server` is copied and passed as one Chromium-family `--proxy-server` argument. Unsupported browsers return an explicit error. |
 | `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. Each window is evaluated independently: a backend close ends only that window, other disconnects get a 1.5-second grace from the latest disconnect, and a new client clears that window's close intent. Never-connected windows wait for the startup timeout. A second concurrent waiter returns `error.AlreadyWaiting`. |
 | `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `App.destroyWindow()`, `Running.requestExit()`, `Running.stop()`, and `App.deinit()`. `destroyWindow()` reclaims one window while others run; `requestExit()` closes every page and ends the active wait from any thread. |
@@ -508,8 +508,7 @@ Browser discovery, default URL opening, explicit browser selection, custom
 executable paths and argv, the process-wide backend identifier, per-window
 direct child identifiers, replacement, and shutdown cleanup are implemented.
 
-Discovery, profile and app-presentation behavior still has the Firefox,
-Windows Chromium and macOS resolver gaps listed above.
+Discovery still has the Windows Chromium and macOS resolver gaps listed above.
 
 ### Browser window controls
 
@@ -519,8 +518,11 @@ Windows Chromium and macOS resolver gaps listed above.
 - Profile directories and proxy rules are copied into window state and passed
   as individual browser argv entries. Chromium-family browsers support both;
   Firefox supports profiles; Safari supports neither.
-- Chromium can explicitly disable forced-color support; the browser bridge
-  detects active high-contrast media preferences.
+- Chromium can explicitly disable forced-color support, and generated Firefox
+  profiles disable it through a preference; the browser bridge detects active
+  high-contrast media preferences.
+- Generated Firefox profiles receive upstream's toolbar-hiding
+  `userChrome.css` and app-mode `user.js` before every launch.
 - Windows external-browser focus enumerates visible top-level windows owned by
   the retained browser child, restores a minimized match, and requests the
   foreground. Other platforms return `error.UnsupportedPlatform`.
