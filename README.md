@@ -293,6 +293,13 @@ path without `..`, empty components, `<>?#"`, or reserved bridge names
 (`error.InvalidEntry`) and cannot be combined with `html`
 (`error.InvalidContent`).
 
+`Window.installContent(&running, content)` replaces content for later requests
+without navigating any client, like changing the root folder or file handler
+of a shown upstream window. `Window.setContent` replaces and navigates. Because
+an external URL changes the page origin, `installContent` returns
+`error.NavigationRequired` when either the current or the new content is
+`.external_url`.
+
 Set `.runtime = .deno`, `.node_js`, or `.bun` in `App.WindowOptions` to run
 served `.js` and `.ts` files through an external interpreter instead of
 sending them to the browser. Directory index selection happens first, so an

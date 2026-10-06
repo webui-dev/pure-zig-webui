@@ -776,6 +776,7 @@ const WindowState = struct {
         self: *WindowState,
         io: std.Io,
         content: Content,
+        require_hosted: bool,
     ) !void {
         var replacement = try StoredContent.init(self.gpa, content);
         errdefer replacement.deinit(self.gpa);
@@ -784,6 +785,8 @@ const WindowState = struct {
 
         self.content_mutex.lockUncancelable(io);
         defer self.content_mutex.unlock(io);
+        if (require_hosted and self.content == .external_url)
+            return error.NavigationRequired;
 
         var previous = self.content;
         self.content = replacement;
@@ -1952,7 +1955,7 @@ pub const Client = struct {
         var peer = try self.retainPeer(running.inner.io);
         defer peer.deinit();
 
-        try self.state.replaceContent(running.inner.io, content);
+        try self.state.replaceContent(running.inner.io, content, false);
         const target_url = try (Window{ .state = self.state }).url(
             running,
             self.state.gpa,
@@ -2169,10 +2172,28 @@ pub const Window = struct {
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
         if (running.app.options.use_cookies and content == .external_url)
             return error.ExternalUrlCookiesUnsupported;
-        try self.state.replaceContent(running.inner.io, content);
+        try self.state.replaceContent(running.inner.io, content, false);
         const target_url = try self.url(running, self.state.gpa);
         defer self.state.gpa.free(target_url);
         return self.navigate(running.inner.io, target_url);
+    }
+
+    /// Replace served content for later requests without navigating any
+    /// client, like upstream `webui_set_root_folder` or
+    /// `webui_set_file_handler` on a shown window. Hosted pages keep running
+    /// and load new resources from the replacement. External URLs change
+    /// the page origin, so neither side may be `.external_url`; use
+    /// `setContent` for those (`error.NavigationRequired`).
+    pub fn installContent(
+        self: Window,
+        running: *const Running,
+        content: Content,
+    ) !void {
+        if (running.stopped or !running.app.started)
+            return error.NotRunning;
+        if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
+        if (content == .external_url) return error.NavigationRequired;
+        try self.state.replaceContent(running.inner.io, content, true);
     }
 
     /// Copy favicon data and its HTTP content type into this window.
@@ -4411,6 +4432,46 @@ test "site content resolves handler, virtual index, html, folder, and entry in u
     try expectRedirect(address, io, custom, "docs", "docs/index.htm");
     try expectBody(address, io, custom, "docs/index.htm", "HTTP/1.1 200", "custom docs");
     try expectBody(address, io, custom, "nothing", "HTTP/1.1 404", "\r\n\r\n");
+}
+
+test "installed content changes resources without navigating clients" {
+    try requireSocketIntegration();
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var calls: std.atomic.Value(usize) = .init(0);
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "<html>first</html>" } });
+    const external = try app.createWindow(.{ .content = .{ .external_url = "https://example.com/" } });
+    var capture: MetadataCapture = .{};
+    try window.bind(io, "echo", MetadataCapture.handler, &capture);
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    try std.testing.expectError(error.NavigationRequired, window.installContent(&running, .{ .external_url = "https://example.com/" }));
+    try std.testing.expectError(error.NavigationRequired, external.installContent(&running, .{ .html = "hosted" }));
+
+    const stream = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    defer stream.close(io);
+    var wire: [256]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &wire));
+    _ = try window.waitForConnection(io, .fromSeconds(1));
+    try window.installContent(&running, .{ .site = .{
+        .html = "<html>second</html>",
+        .handler = .{ .handler = siteTestHandler, .user_data = &calls },
+    } });
+    try expectBody(running.inner.address, io, window, "", "HTTP/1.1 200", "<html>second</html>");
+    try expectBody(running.inner.address, io, window, "api/data", "HTTP/1.1 200", "handler data");
+
+    // The next frame answers this call: no navigation was pushed first.
+    var packet: std.ArrayList(u8) = .empty;
+    defer packet.deinit(gpa);
+    try protocol.append(&packet, gpa, .{ .token = window.state.token, .id = 7, .command = .call }, "echo\x00\x00");
+    try sendClientFrame(stream, io, packet.items);
+    const reply = try protocol.decode(try readServerFrame(stream, io, &wire));
+    try std.testing.expectEqual(protocol.Command.call, reply.header.command);
+    try std.testing.expectEqual(@as(u16, 7), reply.header.id);
 }
 
 test "cookie values parse from raw headers" {
