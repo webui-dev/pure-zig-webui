@@ -265,8 +265,33 @@ file in this order: `index.html`, `index.htm`, `index.ts`, `index.js`.
 The redirect preserves the encoded path and query string, so relative assets
 resolve under the selected directory. Index lookup does not follow symlinks.
 Custom resources receive borrowed `webui.Request` and `webui.Response` values;
-complete the response before the handler returns. Custom handlers do not have
-built-in directory-index probing or fallthrough to a disk directory.
+complete the response before the handler returns. A handler declines a path by
+answering `404` with an empty body, like an upstream file handler returning
+`NULL`; WebUI then asks it for `index.html`, `index.htm`, `index.ts`, and
+`index.js` below that path and redirects with `302` to the first one it
+answers, matching upstream virtual-directory probing.
+
+Use `.content = .{ .site = .{ ... } }` to compose upstream's embedded HTML,
+file handler, root folder, and entry file. Every field is optional, but at
+least one of `html`, `handler`, and `directory` is required:
+
+```zig
+.content = .{ .site = .{
+    .handler = .{ .handler = apiHandler, .user_data = &state },
+    .directory = "ui",
+    .entry = "pages/main.html",
+} },
+```
+
+Requests resolve in upstream order: the `handler`, then virtual-index probing
+through it, then `html` at the root, then files from `directory` with the usual
+directory-index redirects, then the default favicon or `404`. `entry`, like
+`webui_show(window, "pages/main.html")`, makes the root redirect to that file
+(served by the handler or present in the folder) and replaces the `index.*`
+candidates with its file name when probing handler paths. It must be a relative
+path without `..`, empty components, `<>?#"`, or reserved bridge names
+(`error.InvalidEntry`) and cannot be combined with `html`
+(`error.InvalidContent`).
 
 Set `.runtime = .deno`, `.node_js`, or `.bun` in `App.WindowOptions` to run
 served `.js` and `.ts` files through an external interpreter instead of

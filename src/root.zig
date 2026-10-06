@@ -18,6 +18,7 @@ pub const Runtime = @import("app.zig").Runtime;
 pub const EventHandler = @import("app.zig").EventHandler;
 pub const EvalResult = @import("app.zig").EvalResult;
 pub const Content = @import("app.zig").Content;
+pub const Site = @import("app.zig").Site;
 pub const CustomResource = @import("app.zig").CustomResource;
 pub const ResourceHandler = @import("app.zig").ResourceHandler;
 pub const Request = @import("app.zig").Request;

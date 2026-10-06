@@ -49,8 +49,6 @@ is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
 | Area | Remaining behavior, not covered by existing API mappings |
 |---|---|
-| Content composition | Embedded HTML plus disk assets and a custom override/fallthrough handler cannot be composed; resource-only replacement currently replaces page content and navigates. |
-| Entry and custom routing | No configured local entry file; custom handlers lack virtual-directory index probing. Physical directory index precedence and 302 redirects are fixed in this rescan. |
 | Live window lifecycle | `createWindow` rejects after start; no independent destroy/unregister/reclaim while other windows run. `close` is not a replacement for `destroy`. |
 | Firefox app mode | No generated Firefox app profile/userChrome.css or managed preference setup. Existing caller-profile support and explicit high-contrast error do not implement those capabilities. |
 | Browser discovery | Registered Windows Chromium using `chrome.exe` and macOS bundles outside the fixed application directories lack upstream discovery paths. |
@@ -65,6 +63,8 @@ Closed after the rescan, each with focused tests in the same change:
 | Wait lifecycle | Close intent, reconnect grace, and first-connection waiting are per window; `startup_timeout` and `Running.requestExit()` give the initial wait upstream's timeout and `webui_exit` completion. Tests: `wait state tracks startup, activity, reconnect grace, and close per window`, `wait keeps per-window close intent and honours exit requests`. |
 | Callback metadata | `Call.name`, `Call.origin` (`.call` or `.click`), and `Call.cookies`/`Event.cookies` with `cookie(name)` expose the binding name, call origin, and the upgrade's `Cookie` header, copied per connection under `Limits.max_cookie_size` (oversized upgrades answer `431`). Tests: `calls and events expose binding name, origin, and bounded cookies`, `cookie values parse from raw headers`, `upgrade admission owns only accepted connections and removes every state`. |
 | Default favicon | `favicon.ico`/`favicon.svg` resolve custom icon, then a readable directory file, then upstream's default SVG (`.ico` answers `302` to `favicon.svg`), at both the capability root and the origin root. Test: `favicon falls back from custom icon to local file to the default`. |
+| Content composition | `Content.site` composes optional embedded HTML, a declinable handler, and a root folder in upstream resolution order. Resource-only replacement without navigation remains open. Test: `site content resolves handler, virtual index, html, folder, and entry in upstream order`. |
+| Entry and custom routing | `Site.entry` redirects the root to a validated relative entry file, and handlers that decline a path (empty `404`) are probed for the entry name or `index.*` with `302` redirects, for both `.site` and `.custom`. Same test as content composition. |
 
 Borrowed custom HTTP handlers can await work before returning through `std.Io`;
 there is no owned post-return HTTP reply handle. This is an explicit Zig task
@@ -416,7 +416,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | Upstream API | Zig replacement |
 |---|---|
 | `webui_new_window()`, `webui_new_window_id()`, `webui_get_new_window_id()` | `App.createWindow()` and application-owned IDs. Partial: runtime creation remains unsupported. |
-| `webui_show()`, `webui_start_server()`, `webui_get_url()` | Initial `Content`, runtime `Window.setContent()`, `App.start()`, `Window.open()`, and `Window.url()`. `Window.open()` launches the best installed browser in app mode and falls back to the OS URL handler, matching upstream `webui_show()` with `AnyBrowser`. |
+| `webui_show()`, `webui_start_server()`, `webui_get_url()` | Initial `Content`, runtime `Window.setContent()`, `App.start()`, `Window.open()`, and `Window.url()`. Upstream's string sniffing becomes explicit variants: HTML `.html`, URL `.external_url`, folder `.directory`, and file `.site` with `entry`. `Window.open()` launches the best installed browser in app mode and falls back to the OS URL handler, matching upstream `webui_show()` with `AnyBrowser`. |
 | `webui_show_client()` | `Client.show()` replaces the window content and navigates only the selected client. |
 | `webui_is_shown()` | `Window.isShown()` reports whether the window has at least one connected browser client. |
 | `webui_set_center()` | `App.WindowOptions.center` and `Window.setCenter()` centre the window on the primary display. Upstream reads the monitor geometry natively, which needs GDK on Linux; the browser computes the coordinates instead, so centring applies once a client connects rather than at launch. Centring and an explicit position clear each other. |
@@ -455,7 +455,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_set_public()` | `App.Options.public` permits non-loopback listening only with TLS; Origin and explicit connection and protocol limits are enforced. |
 | `webui_set_tls_certificate()` | `App.Options.tls` accepts caller-provided PEM certificate and private-key bytes. |
 | `webui_set_port()`, `webui_get_port()`, `webui_get_free_port()` | `App.Options.port`, including `0` for automatic selection, and the running window URL. |
-| `webui_set_root_folder()`, `webui_set_file_handler()`, `webui_set_file_handler_window()`, `webui_return_http()` | Initial/runtime `.directory` or `.custom` content and borrowed `Response`. Partial: modes are exclusive; no HTML-plus-assets/custom fallthrough or resource-only replacement. HTTP work may await before callback return, but there is no owned delayed HTTP reply. |
+| `webui_set_root_folder()`, `webui_set_file_handler()`, `webui_set_file_handler_window()`, `webui_return_http()` | `.directory`, `.custom`, or composed `.site` content with a borrowed `Response`; an empty `404` declines a path for virtual-index probing and folder fallthrough. Partial: no resource-only replacement without navigation. HTTP work may await before callback return, but there is no owned delayed HTTP reply. |
 | `webui_get_mime_type()` | Linsang resource handling. |
 | `webui_encode()`, `webui_decode()`, `webui_malloc()`, `webui_free()`, `webui_memcpy()` | Zig standard library and allocators. |
 | `webui_get_last_error_number()`, `webui_get_last_error_message()` | Zig error unions. |

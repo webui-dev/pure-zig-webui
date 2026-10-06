@@ -210,6 +210,66 @@ pub const Content = union(enum) {
     custom: CustomResource,
     /// HTTP(S) page opened directly. The page must load `Window.bridgeUrl`.
     external_url: []const u8,
+    /// Upstream's composed window: embedded HTML, a file handler, a root
+    /// folder, and an entry file, each optional.
+    site: Site,
+};
+
+/// Composed content resolved in upstream order: `handler` first, then
+/// virtual-directory index probing through `handler`, then `html` at the
+/// root, then `directory`, then the default favicon or 404.
+pub const Site = struct {
+    /// HTML served at the capability root when `handler` declines it.
+    /// Mutually exclusive with `entry`.
+    html: ?[]const u8 = null,
+    /// Consulted first for every resource. Answering 404 with an empty body
+    /// declines the path, like an upstream file handler returning NULL.
+    handler: ?CustomResource = null,
+    /// Folder serving resources the handler and `html` leave unanswered,
+    /// like upstream `webui_set_root_folder`.
+    directory: ?[]const u8 = null,
+    /// Relative file the root redirects to, like upstream
+    /// `webui_show(window, "page.html")`. Its file name also replaces the
+    /// `index.*` candidates when probing handler directories.
+    entry: ?[]const u8 = null,
+};
+
+const max_entry_size = 1024;
+
+fn validEntry(entry: []const u8) bool {
+    return entry.len <= max_entry_size and safeSubPath(entry) and
+        std.mem.indexOfAny(u8, entry, "<>?#\"") == null and
+        !std.mem.eql(u8, entry, "webui.js") and
+        !std.mem.eql(u8, entry, "_webui_ws_connect");
+}
+
+const StoredSite = struct {
+    html: ?[]u8 = null,
+    handler: ?CustomResource = null,
+    directory: ?*DirectoryContent = null,
+    entry: ?[]u8 = null,
+
+    fn init(gpa: std.mem.Allocator, site: Site) !StoredSite {
+        if (site.html == null and site.handler == null and site.directory == null)
+            return error.InvalidContent;
+        if (site.entry) |entry| {
+            if (site.html != null) return error.InvalidContent;
+            if (!validEntry(entry)) return error.InvalidEntry;
+        }
+        var result: StoredSite = .{ .handler = site.handler };
+        errdefer result.deinit(gpa);
+        if (site.html) |html| result.html = try gpa.dupe(u8, html);
+        if (site.directory) |path| result.directory = try DirectoryContent.init(gpa, path);
+        if (site.entry) |entry| result.entry = try gpa.dupe(u8, entry);
+        return result;
+    }
+
+    fn deinit(self: *StoredSite, gpa: std.mem.Allocator) void {
+        if (self.html) |html| gpa.free(html);
+        if (self.directory) |directory| directory.release();
+        if (self.entry) |entry| gpa.free(entry);
+        self.* = undefined;
+    }
 };
 
 const Binding = struct {
@@ -536,6 +596,7 @@ const StoredContent = union(enum) {
     directory: *DirectoryContent,
     custom: CustomResource,
     external_url: []u8,
+    site: StoredSite,
 
     fn init(gpa: std.mem.Allocator, content: Content) !StoredContent {
         return switch (content) {
@@ -548,6 +609,7 @@ const StoredContent = union(enum) {
                 try validateExternalUrl(url);
                 break :blk .{ .external_url = try gpa.dupe(u8, url) };
             },
+            .site => |site| .{ .site = try StoredSite.init(gpa, site) },
         };
     }
 
@@ -557,22 +619,26 @@ const StoredContent = union(enum) {
             .directory => |directory| directory.release(),
             .custom => {},
             .external_url => |url| gpa.free(url),
+            .site => |*site| site.deinit(gpa),
         }
         self.* = undefined;
     }
 
+    /// The folder this content serves from, if any.
+    fn folder(self: StoredContent) ?*DirectoryContent {
+        return switch (self) {
+            .directory => |directory| directory,
+            .site => |site| site.directory,
+            else => null,
+        };
+    }
+
     fn openDirectory(self: *StoredContent, io: std.Io) !void {
-        switch (self.*) {
-            .directory => |directory| try directory.open(io),
-            else => {},
-        }
+        if (self.folder()) |directory| try directory.open(io);
     }
 
     fn closeDirectory(self: *StoredContent) void {
-        switch (self.*) {
-            .directory => |directory| directory.close(),
-            else => {},
-        }
+        if (self.folder()) |directory| directory.close();
     }
 };
 
@@ -731,16 +797,9 @@ const WindowState = struct {
     ) ?struct { directory: *DirectoryContent, revision: u64 } {
         self.content_mutex.lockSharedUncancelable(io);
         defer self.content_mutex.unlockShared(io);
-        return switch (self.content) {
-            .directory => |directory| blk: {
-                directory.retain();
-                break :blk .{
-                    .directory = directory,
-                    .revision = self.content_revision,
-                };
-            },
-            else => null,
-        };
+        const directory = self.content.folder() orelse return null;
+        directory.retain();
+        return .{ .directory = directory, .revision = self.content_revision };
     }
 
     fn hasContentRevision(
@@ -3433,6 +3492,8 @@ fn onRequest(
             // Custom handlers own their namespace; external pages never
             // load icons from this server.
             .custom, .external_url => true,
+            // Sites consult their handler first and fall back themselves.
+            .site => true,
         };
         if (!local) return writeDefaultFavicon(response, resolved.resource);
     }
@@ -3460,67 +3521,17 @@ fn onRequest(
             response.status = .not_found;
             break :blk .respond;
         },
-        .directory => |directory| blk: {
-            const dir = directory.dir orelse break :blk failResponse(response);
-            if (directoryIndex(dir, io, resolved.resource)) |entry| {
-                // Keep the encoded request path: decoding it into Location
-                // would turn literal %, # or ? filenames into URL syntax.
-                const location = std.fmt.allocPrint(app.gpa, "{s}{s}{s}{s}{s}", .{
-                    request.path,
-                    if (std.mem.endsWith(u8, request.path, "/")) "" else "/",
-                    entry,
-                    if (request.query.len == 0) "" else "?",
-                    request.query,
-                }) catch break :blk failResponse(response);
-                defer app.gpa.free(location);
-                response.setHeader("Location", location) catch break :blk failResponse(response);
-                response.status = .found;
-                break :blk .respond;
-            }
-            if (window.runtime) |runtime| {
-                if (runtimeScript(
-                    dir,
-                    io,
-                    resolved.resource,
-                )) |sub_path| {
-                    interpretScript(
-                        window,
-                        io,
-                        runtime,
-                        dir,
-                        sub_path,
-                        request.query,
-                        response,
-                    ) catch |err| {
-                        window.log(
-                            .warn,
-                            "Runtime interpretation of {s} failed: {}",
-                            .{ sub_path, err },
-                        );
-                        break :blk failResponse(response);
-                    };
-                    break :blk .respond;
-                }
-                const extension = std.fs.path.extension(resolved.resource);
-                if (std.mem.eql(u8, extension, ".js") or std.mem.eql(u8, extension, ".ts")) {
-                    // An unreadable, symlinked or nonregular script must never
-                    // fall through to a source response.
-                    response.status = .not_found;
-                    break :blk .respond;
-                }
-            }
-            const static_request = app.gpa.create(StaticRequest) catch
-                break :blk failResponse(response);
-            static_request.* = .{ .directory = directory, .path_storage = path_storage };
-            owns_path = false;
-            directory.retain();
-            break :blk .{ .files = .{
-                .dir = dir,
-                .canonical_path = resolved.resource,
-                .on_complete = releaseStaticDirectory,
-                .user_data = static_request,
-            } };
-        },
+        .directory => |directory| serveDirectory(
+            app,
+            window,
+            io,
+            request,
+            response,
+            directory,
+            resolved.resource,
+            path_storage,
+            &owns_path,
+        ),
         .custom => |custom| blk: {
             custom.handler(
                 resolved.resource,
@@ -3528,13 +3539,194 @@ fn onRequest(
                 response,
                 custom.user_data,
             ) catch break :blk failResponse(response);
+            if (!declined(response)) break :blk .respond;
+            if (probeHandlerIndex(app.gpa, custom, request, resolved.resource, null)) |name|
+                break :blk redirectBelow(app.gpa, request, response, name);
             break :blk .respond;
         },
         .external_url => blk: {
             response.status = .not_found;
             break :blk .respond;
         },
+        .site => |site| serveSite(
+            app,
+            window,
+            io,
+            request,
+            response,
+            site,
+            resolved.resource,
+            path_storage,
+            &owns_path,
+        ),
     };
+}
+
+fn notFound(response: *Linsang.Response) Linsang.Action {
+    response.reset();
+    response.status = .not_found;
+    return .respond;
+}
+
+/// A resource handler declines a path by answering 404 without a body.
+fn declined(response: *const Linsang.Response) bool {
+    return response.status == .not_found and response.body_buf.items.len == 0;
+}
+
+fn isFavicon(resource: []const u8) bool {
+    return std.mem.eql(u8, resource, "favicon.ico") or
+        std.mem.eql(u8, resource, "favicon.svg");
+}
+
+/// Redirect to `name` below the requested path, keeping the encoded request
+/// path and query: decoding them into Location would turn literal %, # or ?
+/// file names into URL syntax.
+fn redirectBelow(
+    gpa: std.mem.Allocator,
+    request: *const Linsang.Request,
+    response: *Linsang.Response,
+    name: []const u8,
+) Linsang.Action {
+    var location: std.ArrayList(u8) = .empty;
+    defer location.deinit(gpa);
+    appendRedirect(&location, gpa, request, name) catch return failResponse(response);
+    response.setHeader("Location", location.items) catch return failResponse(response);
+    response.status = .found;
+    return .respond;
+}
+
+fn appendRedirect(
+    location: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    request: *const Linsang.Request,
+    name: []const u8,
+) !void {
+    try location.appendSlice(gpa, request.path);
+    if (!std.mem.endsWith(u8, request.path, "/")) try location.append(gpa, '/');
+    for (name) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~/", byte) != null) {
+            try location.append(gpa, byte);
+        } else {
+            try location.print(gpa, "%{X:0>2}", .{byte});
+        }
+    }
+    if (request.query.len != 0) {
+        try location.append(gpa, '?');
+        try location.appendSlice(gpa, request.query);
+    }
+}
+
+/// Upstream virtual-directory probing: when a handler declines `resource`,
+/// ask it for the entry's file name, or for `index.*` without an entry,
+/// below that path. Returns the first name the handler answers.
+fn probeHandlerIndex(
+    gpa: std.mem.Allocator,
+    custom: CustomResource,
+    request: *const Linsang.Request,
+    resource: []const u8,
+    entry: ?[]const u8,
+) ?[]const u8 {
+    const index_names = [_][]const u8{ "index.html", "index.htm", "index.ts", "index.js" };
+    var entry_name = [1][]const u8{std.fs.path.basenamePosix(entry orelse "")};
+    const names: []const []const u8 = if (entry != null) &entry_name else &index_names;
+    const separator = if (resource.len == 0 or std.mem.endsWith(u8, resource, "/")) "" else "/";
+    for (names) |name| {
+        const path = std.mem.concat(gpa, u8, &.{ resource, separator, name }) catch return null;
+        defer gpa.free(path);
+        var scratch = Response.init(gpa);
+        defer scratch.deinit();
+        custom.handler(path, request, &scratch, custom.user_data) catch continue;
+        if (!declined(&scratch)) return name;
+    }
+    return null;
+}
+
+fn serveSite(
+    app: *App,
+    window: *WindowState,
+    io: std.Io,
+    request: *const Linsang.Request,
+    response: *Linsang.Response,
+    site: StoredSite,
+    resource: []const u8,
+    path_storage: []u8,
+    owns_path: *bool,
+) Linsang.Action {
+    const root_entry = if (resource.len == 0) site.entry else null;
+    if (site.handler) |custom| {
+        custom.handler(root_entry orelse resource, request, response, custom.user_data) catch
+            return failResponse(response);
+        if (!declined(response)) {
+            // Like upstream, a root answered through the entry redirects to
+            // it instead of serving it under the root URL.
+            const entry = root_entry orelse return .respond;
+            response.reset();
+            return redirectBelow(app.gpa, request, response, entry);
+        }
+        response.reset();
+        if (probeHandlerIndex(app.gpa, custom, request, resource, site.entry)) |name|
+            return redirectBelow(app.gpa, request, response, name);
+    }
+    if (resource.len == 0) {
+        if (site.html) |html| {
+            response.setHeader("Content-Type", "text/html; charset=utf-8") catch
+                return failResponse(response);
+            writeHtml(response, html, window.icon != null) catch
+                return failResponse(response);
+            return .respond;
+        }
+    }
+    const directory = site.directory orelse
+        return if (isFavicon(resource)) writeDefaultFavicon(response, resource) else notFound(response);
+    const dir = directory.dir orelse return failResponse(response);
+    if (root_entry) |entry| {
+        if (!readableResource(dir, io, entry)) return notFound(response);
+        return redirectBelow(app.gpa, request, response, entry);
+    }
+    if (isFavicon(resource) and !readableResource(dir, io, resource))
+        return writeDefaultFavicon(response, resource);
+    return serveDirectory(app, window, io, request, response, directory, resource, path_storage, owns_path);
+}
+
+fn serveDirectory(
+    app: *App,
+    window: *WindowState,
+    io: std.Io,
+    request: *const Linsang.Request,
+    response: *Linsang.Response,
+    directory: *DirectoryContent,
+    resource: []const u8,
+    path_storage: []u8,
+    owns_path: *bool,
+) Linsang.Action {
+    const dir = directory.dir orelse return failResponse(response);
+    if (directoryIndex(dir, io, resource)) |entry|
+        return redirectBelow(app.gpa, request, response, entry);
+    if (window.runtime) |runtime| {
+        if (runtimeScript(dir, io, resource)) |sub_path| {
+            interpretScript(window, io, runtime, dir, sub_path, request.query, response) catch |err| {
+                window.log(.warn, "Runtime interpretation of {s} failed: {}", .{ sub_path, err });
+                return failResponse(response);
+            };
+            return .respond;
+        }
+        const extension = std.fs.path.extension(resource);
+        if (std.mem.eql(u8, extension, ".js") or std.mem.eql(u8, extension, ".ts")) {
+            // An unreadable, symlinked or nonregular script must never fall
+            // through to a source response.
+            return notFound(response);
+        }
+    }
+    const static_request = app.gpa.create(StaticRequest) catch return failResponse(response);
+    static_request.* = .{ .directory = directory, .path_storage = path_storage };
+    owns_path.* = false;
+    directory.retain();
+    return .{ .files = .{
+        .dir = dir,
+        .canonical_path = resource,
+        .on_complete = releaseStaticDirectory,
+        .user_data = static_request,
+    } };
 }
 
 fn send(
@@ -4120,6 +4312,105 @@ test "favicon falls back from custom icon to local file to the default" {
     try html.setIcon(io, "<svg>custom</svg>", "image/svg+xml");
     bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}/favicon.ico", .{html.state.capability}), "</svg>", &response);
     try std.testing.expect(std.mem.endsWith(u8, bytes, "<svg>custom</svg>"));
+}
+
+fn siteTestHandler(
+    path: []const u8,
+    _: *const Request,
+    response: *Response,
+    user_data: ?*anyopaque,
+) anyerror!void {
+    const calls: *std.atomic.Value(usize) = @ptrCast(@alignCast(user_data.?));
+    _ = calls.fetchAdd(1, .monotonic);
+    const answers = [_][2][]const u8{
+        .{ "api/data", "handler data" },
+        .{ "virtual/index.html", "virtual index" },
+        .{ "docs/index.htm", "custom docs" },
+        .{ "app page.html", "app page" },
+    };
+    for (answers) |answer| {
+        if (std.mem.eql(u8, path, answer[0])) return response.write(answer[1]);
+    }
+    response.status = .not_found;
+}
+
+fn expectRedirect(address: std.Io.net.IpAddress, io: std.Io, window: Window, path: []const u8, location: []const u8) !void {
+    var target: [capability_len + 64]u8 = undefined;
+    var expected: [capability_len + 96]u8 = undefined;
+    var response: [1024]u8 = undefined;
+    const bytes = try getTestPath(address, io, try std.fmt.bufPrint(&target, "/{s}/{s}", .{ window.state.capability, path }), "\r\n\r\n", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 302"));
+    try std.testing.expect(std.mem.indexOf(u8, bytes, try std.fmt.bufPrint(&expected, "Location: /{s}/{s}\r\n", .{ window.state.capability, location })) != null);
+}
+
+fn expectBody(address: std.Io.net.IpAddress, io: std.Io, window: Window, path: []const u8, status: []const u8, body: []const u8) !void {
+    var target: [capability_len + 64]u8 = undefined;
+    var response: [2048]u8 = undefined;
+    const bytes = try getTestPath(address, io, try std.fmt.bufPrint(&target, "/{s}/{s}", .{ window.state.capability, path }), body, &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, status));
+    try std.testing.expect(std.mem.indexOf(u8, bytes, body) != null);
+}
+
+test "site content resolves handler, virtual index, html, folder, and entry in upstream order" {
+    try requireSocketIntegration();
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "site/pages");
+    try tmp.dir.writeFile(io, .{ .sub_path = "site/style.css", .data = "body{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "site/pages/main.html", .data = "main page" });
+    const folder = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer gpa.free(folder);
+
+    var calls: std.atomic.Value(usize) = .init(0);
+    const handler: CustomResource = .{ .handler = siteTestHandler, .user_data = &calls };
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    try std.testing.expectError(error.InvalidContent, app.createWindow(.{ .content = .{ .site = .{} } }));
+    try std.testing.expectError(error.InvalidContent, app.createWindow(.{ .content = .{ .site = .{ .html = "x", .entry = "main.html" } } }));
+    for ([_][]const u8{ "../main.html", "/main.html", "a//b.html", "webui.js", "page?.html", "" }) |entry| {
+        try std.testing.expectError(error.InvalidEntry, app.createWindow(.{ .content = .{ .site = .{ .directory = folder, .entry = entry } } }));
+    }
+    const composed = try app.createWindow(.{ .content = .{ .site = .{
+        .html = "<html><head></head><body>root page</body></html>",
+        .handler = handler,
+        .directory = folder,
+    } } });
+    const entry_folder = try app.createWindow(.{ .content = .{ .site = .{ .directory = folder, .entry = "pages/main.html" } } });
+    const entry_handler = try app.createWindow(.{ .content = .{ .site = .{ .handler = handler, .entry = "app page.html" } } });
+    const custom = try app.createWindow(.{ .content = .{ .custom = handler } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    const address = running.inner.address;
+
+    // The handler is consulted first, then probed for a virtual index, then
+    // the root HTML and the folder answer.
+    try expectBody(address, io, composed, "api/data", "HTTP/1.1 200", "handler data");
+    try expectBody(address, io, composed, "", "HTTP/1.1 200", "root page</body></html>");
+    try expectBody(address, io, composed, "style.css", "HTTP/1.1 200", "body{}");
+    try expectRedirect(address, io, composed, "virtual", "virtual/index.html");
+    try expectRedirect(address, io, composed, "virtual/?q=1", "virtual/index.html?q=1");
+    try expectBody(address, io, composed, "favicon.ico", "HTTP/1.1 302", "Location: favicon.svg\r\n");
+    try expectBody(address, io, composed, "favicon.svg", "HTTP/1.1 200", default_favicon);
+    try expectBody(address, io, composed, "missing.txt", "HTTP/1.1 404", "\r\n\r\n");
+
+    // Entry files redirect the root, from the folder or through the handler.
+    try expectRedirect(address, io, entry_folder, "", "pages/main.html");
+    try expectBody(address, io, entry_folder, "pages/main.html", "HTTP/1.1 200", "main page");
+    try expectRedirect(address, io, entry_handler, "", "app%20page.html");
+    try expectBody(address, io, entry_handler, "app%20page.html", "HTTP/1.1 200", "app page");
+    // With an entry only its file name is probed, never index.*.
+    calls.store(0, .monotonic);
+    try expectBody(address, io, entry_handler, "virtual", "HTTP/1.1 404", "\r\n\r\n");
+    try std.testing.expectEqual(@as(usize, 2), calls.load(.monotonic));
+
+    // Plain custom content gains the same virtual-directory probing.
+    try expectRedirect(address, io, custom, "docs", "docs/index.htm");
+    try expectBody(address, io, custom, "docs/index.htm", "HTTP/1.1 200", "custom docs");
+    try expectBody(address, io, custom, "nothing", "HTTP/1.1 404", "\r\n\r\n");
 }
 
 test "cookie values parse from raw headers" {
