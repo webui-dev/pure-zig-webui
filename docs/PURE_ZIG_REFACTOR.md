@@ -49,7 +49,6 @@ is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
 | Area | Remaining behavior, not covered by existing API mappings |
 |---|---|
-| Live window lifecycle | `createWindow` rejects after start; no independent destroy/unregister/reclaim while other windows run. `close` is not a replacement for `destroy`. |
 | Firefox app mode | No generated Firefox app profile/userChrome.css or managed preference setup. Existing caller-profile support and explicit high-contrast error do not implement those capabilities. |
 | Browser discovery | Registered Windows Chromium using `chrome.exe` and macOS bundles outside the fixed application directories lack upstream discovery paths. |
 | Native interaction | Missing GTK custom drag/edge resize, Windows draggable-region setup and resizable frameless host behavior, and Cocoa frameless background movement. |
@@ -64,6 +63,7 @@ Closed after the rescan, each with focused tests in the same change:
 | Callback metadata | `Call.name`, `Call.origin` (`.call` or `.click`), and `Call.cookies`/`Event.cookies` with `cookie(name)` expose the binding name, call origin, and the upgrade's `Cookie` header, copied per connection under `Limits.max_cookie_size` (oversized upgrades answer `431`). Tests: `calls and events expose binding name, origin, and bounded cookies`, `cookie values parse from raw headers`, `upgrade admission owns only accepted connections and removes every state`. |
 | Default favicon | `favicon.ico`/`favicon.svg` resolve custom icon, then a readable directory file, then upstream's default SVG (`.ico` answers `302` to `favicon.svg`), at both the capability root and the origin root. Test: `favicon falls back from custom icon to local file to the default`. |
 | Content composition | `Content.site` composes optional embedded HTML, a declinable handler, and a root folder in upstream resolution order; `Window.installContent` replaces resources without navigation. Tests: `site content resolves handler, virtual index, html, folder, and entry in upstream order`, `installed content changes resources without navigating clients`. |
+| Live window lifecycle | `App.createWindow` serves windows created while running with fresh credentials, folder, and monitor. `App.destroyWindow` unregisters at once (`404` routing, backend close, `1001` on later messages), then cancels the window's handlers, monitor, and managed browser in the background, and frees it after its last connection, request, and deferred reply. This works from the window's own handlers via `Client.window()`, and `Running.stop` finishes pending cleanup. Tests: `windows are created and destroyed while the app runs`, `destroying a window before start frees it at once`, `upgrade admission owns only accepted connections and removes every state`. |
 | Entry and custom routing | `Site.entry` redirects the root to a validated relative entry file, and handlers that decline a path (empty `404`) are probed for the entry name or `index.*` with `302` redirects, for both `.site` and `.custom`. Same tests as content composition. |
 
 Borrowed custom HTTP handlers can await work before returning through `std.Io`;
@@ -337,6 +337,7 @@ protocol input never panics.
 | `window.bind()` / `binding()` | `window.bind(io, name, handler, user_data)` |
 | `Event.get*At()` | `Call.string/int/float/bool/bytes(index)` |
 | `Event.element`, `Event.event_type`, `Event.cookies` | `Call.name`, `Call.origin`, `Call.cookies`/`Call.cookie(name)`; `Event.data`, `Event.kind`, `Event.cookies` for event handlers. |
+| `Event.window` | `Call.client.window()` and `Event.client.window()`. |
 | `Event.return*()` | `Call.reply*()` |
 | `window.run()` | `Window.eval()` |
 | `Event.runClient()` | `Call.client.eval()` |
@@ -415,7 +416,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 
 | Upstream API | Zig replacement |
 |---|---|
-| `webui_new_window()`, `webui_new_window_id()`, `webui_get_new_window_id()` | `App.createWindow()` and application-owned IDs. Partial: runtime creation remains unsupported. |
+| `webui_new_window()`, `webui_new_window_id()`, `webui_get_new_window_id()` | `App.createWindow()`, before or after `start`, and application-owned IDs. |
 | `webui_show()`, `webui_start_server()`, `webui_get_url()` | Initial `Content`, runtime `Window.setContent()`, `App.start()`, `Window.open()`, and `Window.url()`. Upstream's string sniffing becomes explicit variants: HTML `.html`, URL `.external_url`, folder `.directory`, and file `.site` with `entry`. `Window.open()` launches the best installed browser in app mode and falls back to the OS URL handler, matching upstream `webui_show()` with `AnyBrowser`. |
 | `webui_show_client()` | `Client.show()` replaces the window content and navigates only the selected client. |
 | `webui_is_shown()` | `Window.isShown()` reports whether the window has at least one connected browser client. |
@@ -436,7 +437,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_set_profile()` | Caller-managed profiles and isolated owned Chromium profile leaves are supported. Partial: Firefox managed app profiles, chrome suppression and preference setup remain absent. |
 | `webui_set_proxy()` | `App.WindowOptions.proxy_server` is copied and passed as one Chromium-family `--proxy-server` argument. Unsupported browsers return an explicit error. |
 | `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. Each window is evaluated independently: a backend close ends only that window, other disconnects get a 1.5-second grace from the latest disconnect, and a new client clears that window's close intent. Never-connected windows wait for the startup timeout. A second concurrent waiter returns `error.AlreadyWaiting`. |
-| `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `Running.requestExit()`, `Running.stop()`, and `App.deinit()`. `requestExit()` closes every page and ends the active wait from any thread. Partial: there is no independent running-window destroy/reclaim. |
+| `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `App.destroyWindow()`, `Running.requestExit()`, `Running.stop()`, and `App.deinit()`. `destroyWindow()` reclaims one window while others run; `requestExit()` closes every page and ends the active wait from any thread. |
 | `webui_set_context()`, `webui_get_context()` | Binding and event-handler `user_data`. |
 | `webui_bind()` | `Window.bind(io, name, handler, user_data)` supports explicit calls, DOM clicks, and runtime replacement. `Window.onEvent(io, handler, user_data)` updates event handling. `CMD_ADD_ID` pushes new registrations and authentication replays current state; in-flight work keeps its handler snapshot. |
 | `webui_get_count()`, `webui_get_size()`, `webui_get_size_at()` | `Call.arguments.len` and `Call.bytes(index).len`. |

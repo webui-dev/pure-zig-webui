@@ -712,7 +712,13 @@ const WindowState = struct {
 
     /// Whether registry updates should notify active browser peers.
     running: std.atomic.Value(bool) = .init(false),
-    /// This window's directory monitor, cancelled on stop.
+    /// Owners: the App window list, each WebSocket upgrade record, each
+    /// in-flight HTTP request, and each deferred reply. The last release
+    /// frees the window.
+    references: std.atomic.Value(usize) = .init(1),
+    /// Set once a destroyed window stops accepting events; never cleared.
+    retired: std.atomic.Value(bool) = .init(false),
+    /// This window's directory monitor, cancelled on destroy or stop.
     monitor_task: std.Io.Group = .init,
     /// Set by backend `close` calls so `Running.wait()` skips the
     /// reconnect grace period. Cleared when a new client authenticates, so a
@@ -750,6 +756,17 @@ const WindowState = struct {
         click_binding: ?Binding = null,
         registered: ?EventBinding = null,
     };
+
+    fn retain(self: *WindowState) void {
+        const previous = self.references.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
+    }
+
+    fn release(self: *WindowState) void {
+        if (self.references.fetchSub(1, .release) != 1) return;
+        _ = self.references.load(.acquire);
+        self.deinit();
+    }
 
     fn deinit(self: *WindowState) void {
         std.debug.assert(self.pending_evals.items.len == 0);
@@ -1254,19 +1271,24 @@ const WindowState = struct {
         if (self.pending_replies >= self.max_pending_replies)
             return error.TooManyPendingReplies;
         self.pending_replies += 1;
+        self.retain();
         return self.clients.items[index].peer.clone();
     }
 
     fn releaseReply(self: *WindowState, io: std.Io) void {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        std.debug.assert(self.pending_replies > 0);
-        self.pending_replies -= 1;
+        {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            std.debug.assert(self.pending_replies > 0);
+            self.pending_replies -= 1;
+        }
+        self.release();
     }
 
     fn reserveEvent(self: *WindowState, io: std.Io) !void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        if (self.retired.load(.acquire)) return error.WindowDestroyed;
         if (self.pending_events >= self.max_pending_events)
             return error.TooManyPendingEvents;
         self.pending_events += 1;
@@ -1445,6 +1467,26 @@ const WindowState = struct {
     }
 
     fn cancelEvents(self: *WindowState, io: std.Io) void {
+        std.debug.assert(self.cancelEventsOnce(io) == 0);
+    }
+
+    /// Stop accepting events, then cancel and drain until none remain. A
+    /// dispatch that reserved before `retired` was set may still schedule,
+    /// so a single cancel is not enough.
+    fn retireEvents(self: *WindowState, io: std.Io) void {
+        self.markRetired(io);
+        while (self.cancelEventsOnce(io) != 0)
+            io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+
+    /// Refuse new events. Under `mutex` so it orders with `reserveEvent`.
+    fn markRetired(self: *WindowState, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.retired.store(true, .release);
+    }
+
+    fn cancelEventsOnce(self: *WindowState, io: std.Io) usize {
         self.event_tasks.cancel(io);
         self.event_mutex.lockUncancelable(io);
         defer self.event_mutex.unlock(io);
@@ -1456,7 +1498,7 @@ const WindowState = struct {
         self.serial_draining = false;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        std.debug.assert(self.pending_events == 0);
+        return self.pending_events;
     }
 
     fn finishEval(
@@ -1885,6 +1927,11 @@ pub const Client = struct {
     state: *WindowState,
     client_id: u64,
 
+    /// The window this client belongs to, like upstream `event->window`.
+    pub fn window(self: Client) Window {
+        return .{ .state = self.state };
+    }
+
     fn retainPeer(self: Client, io: std.Io) !Linsang.WebSocketPeer {
         self.state.mutex.lockUncancelable(io);
         defer self.state.mutex.unlock(io);
@@ -2041,6 +2088,47 @@ fn evalBroadcastClient(
             .javascript_error => |message| .{ .javascript_error = message },
         },
     };
+}
+
+fn indexOfWindow(windows: []const *WindowState, state: *WindowState) ?usize {
+    // ponytail: window counts are tiny; use a map if hundreds become normal.
+    for (windows, 0..) |window, index|
+        if (window == state) return index;
+    return null;
+}
+
+/// Give a window fresh secrets with a capability unique among `existing`.
+fn assignWindowIdentity(
+    io: std.Io,
+    window: *WindowState,
+    existing: []const *WindowState,
+) !void {
+    while (true) {
+        var random: [36]u8 = undefined;
+        try io.randomSecure(&random);
+        window.token = std.mem.readInt(u32, random[0..4], .little);
+        if (window.token == 0) continue;
+        window.capability = std.fmt.bytesToHex(random[4..20], .lower);
+        window.cookie = std.fmt.bytesToHex(random[20..], .lower);
+        for (existing) |other| {
+            if (other != window and
+                std.mem.eql(u8, &window.capability, &other.capability)) break;
+        } else return;
+    }
+}
+
+/// Finish destroying a window that `App.destroyWindow` unregistered.
+fn reapWindow(app: *App, state: *WindowState, io: std.Io) std.Io.Cancelable!void {
+    state.retireEvents(io);
+    state.monitor_task.cancel(io);
+    app.removeBrowser(io, state);
+    {
+        app.windows_lock.lockUncancelable(io);
+        defer app.windows_lock.unlock(io);
+        const index = indexOfWindow(app.retiring.items, state).?;
+        _ = app.retiring.swapRemove(index);
+    }
+    state.release();
 }
 
 fn monitorDirectory(
@@ -2506,6 +2594,14 @@ pub const App = struct {
     gpa: std.mem.Allocator,
     options: Options,
     windows: std.ArrayList(*WindowState) = .empty,
+    /// Guards `windows`, `retiring` and `accepting_windows` while running.
+    /// Lock order: windows_lock, then any WindowState lock.
+    windows_lock: std.Io.RwLock = .init,
+    /// Whether createWindow and destroyWindow may change a running app.
+    accepting_windows: bool = false,
+    /// Destroyed windows whose cleanup has not finished yet.
+    retiring: std.ArrayList(*WindowState) = .empty,
+    reaper_tasks: std.Io.Group = .init,
     server: ?Linsang.Server = null,
     server_io: ?std.Io = null,
     tls_auth: ?Linsang.tls.CertKeyPair = null,
@@ -2550,6 +2646,8 @@ pub const App = struct {
             .window = window,
             .cookies = owned,
         });
+        // The record owns a reference until onClose releases it.
+        window.retain();
         _ = self.unauthenticated_connections.fetchAdd(1, .acq_rel);
     }
 
@@ -2583,7 +2681,8 @@ pub const App = struct {
         }
     }
 
-    /// Remove one upgrade record; the caller frees its `cookies`.
+    /// Remove one upgrade record; the caller frees its `cookies` and
+    /// releases its `window`.
     fn removeUpgrade(self: *App, io: std.Io, key: usize) ?Upgrade {
         self.upgrade_mutex.lockUncancelable(io);
         defer self.upgrade_mutex.unlock(io);
@@ -2664,17 +2763,26 @@ pub const App = struct {
         std.debug.assert(!self.started);
         std.debug.assert(self.server_io == null);
         std.debug.assert(self.tls_auth == null);
+        std.debug.assert(self.reaper_tasks.token.load(.acquire) == null);
+        std.debug.assert(self.retiring.items.len == 0);
+        self.retiring.deinit(self.gpa);
         std.debug.assert(self.managed_browsers.items.len == 0);
         self.managed_browsers.deinit(self.gpa);
         std.debug.assert(self.upgrades.items.len == 0);
         self.upgrades.deinit(self.gpa);
-        for (self.windows.items) |window| window.deinit();
+        for (self.windows.items) |window| {
+            std.debug.assert(window.references.load(.acquire) == 1);
+            window.release();
+        }
         self.windows.deinit(self.gpa);
         self.* = undefined;
     }
 
+    /// Create a window. Before `start` it is served once the app starts.
+    /// While running it is served at once with fresh credentials, matching
+    /// upstream where windows may be created at any time; this is safe from
+    /// handlers and other threads.
     pub fn createWindow(self: *App, options: WindowOptions) !Window {
-        if (self.started) return error.AlreadyStarted;
         try self.options.limits.validate();
         var browser_controls: browser.WindowControls = .{
             .kiosk = options.kiosk,
@@ -2742,8 +2850,77 @@ pub const App = struct {
             .center = options.center,
             .browser_controls = browser_controls,
         };
-        try self.windows.append(self.gpa, state);
+        if (self.started)
+            try self.registerRunningWindow(state)
+        else
+            try self.windows.append(self.gpa, state);
         return .{ .state = state };
+    }
+
+    /// Serve a window created after `start`. On failure the window is left
+    /// exactly as `createWindow` built it, for its error cleanup.
+    fn registerRunningWindow(self: *App, state: *WindowState) !void {
+        const io = self.server_io.?;
+        self.windows_lock.lockUncancelable(io);
+        defer self.windows_lock.unlock(io);
+        if (!self.accepting_windows) return error.NotRunning;
+        try self.windows.ensureUnusedCapacity(self.gpa, 1);
+        try state.content.openDirectory(io);
+        errdefer state.content.closeDirectory();
+        try assignWindowIdentity(io, state, self.windows.items);
+        state.beginServing(io, self.options.startup_timeout);
+        state.running.store(true, .release);
+        errdefer state.running.store(false, .release);
+        if (self.options.folder_monitor_interval) |interval|
+            try state.monitor_task.concurrent(io, monitorDirectory, .{
+                state,
+                io,
+                interval,
+            });
+        self.windows.appendAssumeCapacity(state);
+    }
+
+    /// Destroy a window, like upstream `webui_destroy`. Before `start` the
+    /// window is freed at once. While running, routing stops immediately:
+    /// new requests and connections are refused, connected pages receive a
+    /// backend close and later messages close their connection. Queued
+    /// handlers are cancelled and the window's directory monitor and managed
+    /// browser stop in the background; its memory is freed after its last
+    /// connection and deferred reply finish, and `Running.stop` completes
+    /// any cleanup still pending. Safe from handlers, including this
+    /// window's own. The handle and its clients are invalid afterwards.
+    pub fn destroyWindow(self: *App, window: Window) !void {
+        const state = window.state;
+        if (!self.started) {
+            const index = indexOfWindow(self.windows.items, state) orelse
+                return error.UnknownWindow;
+            _ = self.windows.orderedRemove(index);
+            state.release();
+            return;
+        }
+        const io = self.server_io.?;
+        {
+            self.windows_lock.lockUncancelable(io);
+            defer self.windows_lock.unlock(io);
+            if (!self.accepting_windows) return error.NotRunning;
+            const index = indexOfWindow(self.windows.items, state) orelse
+                return error.UnknownWindow;
+            try self.retiring.ensureUnusedCapacity(self.gpa, 1);
+            // Keep the state alive for the close notification below; the
+            // reaper may otherwise free it first.
+            state.retain();
+            _ = self.windows.orderedRemove(index);
+            self.retiring.appendAssumeCapacity(state);
+            state.running.store(false, .release);
+            state.markRetired(io);
+            // Spawned under the lock: stop() closes registration with this
+            // lock before it awaits the group, so no spawn races that await.
+            self.reaper_tasks.concurrent(io, reapWindow, .{ self, state, io }) catch |err|
+                state.log(.warn, "Window cleanup deferred until stop: {}", .{err});
+        }
+        defer state.release();
+        _ = state.broadcast(io, .close, "") catch |err|
+            state.log(.warn, "Destroy close notification failed: {}", .{err});
     }
 
     pub fn start(self: *App, io: std.Io) !Running {
@@ -2773,23 +2950,8 @@ pub const App = struct {
             );
         }
         errdefer self.deinitTls();
-        for (self.windows.items, 0..) |window, index| {
-            while (true) {
-                var random: [36]u8 = undefined;
-                try io.randomSecure(&random);
-                window.token = std.mem.readInt(u32, random[0..4], .little);
-                if (window.token == 0) continue;
-                window.capability = std.fmt.bytesToHex(random[4..20], .lower);
-                window.cookie = std.fmt.bytesToHex(random[20..], .lower);
-                for (self.windows.items[0..index]) |existing| {
-                    if (std.mem.eql(
-                        u8,
-                        &window.capability,
-                        &existing.capability,
-                    )) break;
-                } else break;
-            }
-        }
+        for (self.windows.items, 0..) |window, index|
+            try assignWindowIdentity(io, window, self.windows.items[0..index]);
         self.exit_requested.store(false, .release);
         self.unauthenticated_connections.store(0, .release);
         for (self.windows.items) |window|
@@ -2822,8 +2984,13 @@ pub const App = struct {
         for (self.windows.items) |window| window.running.store(true, .release);
         errdefer for (self.windows.items) |window|
             window.running.store(false, .release);
-        const inner = try self.server.?.start(io);
+        // Published before the server spawns connection tasks, which may
+        // create or destroy windows from handlers.
         self.started = true;
+        errdefer self.started = false;
+        self.accepting_windows = true;
+        errdefer self.accepting_windows = false;
+        const inner = try self.server.?.start(io);
         return .{ .app = self, .inner = inner };
     }
 
@@ -2949,6 +3116,19 @@ pub const App = struct {
         return error.NoManagedBrowser;
     }
 
+    /// Stop and forget one window's managed browser, keeping its profile.
+    fn removeBrowser(self: *App, io: std.Io, window: *WindowState) void {
+        self.browser_mutex.lockUncancelable(io);
+        defer self.browser_mutex.unlock(io);
+        for (self.managed_browsers.items, 0..) |*managed, index| {
+            if (managed.window != window) continue;
+            if (managed.child) |*child| child.kill(io);
+            if (managed.profile) |path| self.gpa.free(path);
+            _ = self.managed_browsers.swapRemove(index);
+            return;
+        }
+    }
+
     fn stopBrowsers(self: *App, io: std.Io) void {
         self.browser_mutex.lockUncancelable(io);
         defer self.browser_mutex.unlock(io);
@@ -2959,35 +3139,59 @@ pub const App = struct {
         self.managed_browsers.clearRetainingCapacity();
     }
 
-    fn hasWindow(self: *const App, state: *WindowState) bool {
-        // ponytail: window counts are tiny; use a map if hundreds become normal.
-        for (self.windows.items) |window|
-            if (window == state) return true;
-        return false;
+    /// Whether `state` is a live window. Compares addresses only, so it
+    /// never reads a destroyed window.
+    fn hasWindow(self: *App, state: *WindowState) bool {
+        const io = self.server_io orelse
+            return indexOfWindow(self.windows.items, state) != null;
+        self.windows_lock.lockSharedUncancelable(io);
+        defer self.windows_lock.unlockShared(io);
+        return indexOfWindow(self.windows.items, state) != null;
     }
 
-    fn windowByCapability(
-        self: *const App,
+    /// The live window for `capability`, retained for the caller.
+    fn retainWindowByCapability(
+        self: *App,
+        io: std.Io,
         capability: []const u8,
     ) ?*WindowState {
+        self.windows_lock.lockSharedUncancelable(io);
+        defer self.windows_lock.unlockShared(io);
         for (self.windows.items) |window|
-            if (std.mem.eql(u8, &window.capability, capability)) return window;
+            if (std.mem.eql(u8, &window.capability, capability)) {
+                window.retain();
+                return window;
+            };
         return null;
     }
 
-    fn windowForConnection(
-        self: *const App,
-        connection: *Linsang.Connection,
-    ) ?*WindowState {
-        for (self.windows.items) |window|
-            if (window.hasConnection(connection)) return window;
-        return null;
-    }
-
-    fn hasClients(self: *const App, io: std.Io) bool {
+    fn hasClients(self: *App, io: std.Io) bool {
+        self.windows_lock.lockSharedUncancelable(io);
+        defer self.windows_lock.unlockShared(io);
         for (self.windows.items) |window|
             if (window.hasClients(io)) return true;
         return false;
+    }
+
+    /// Refuse further createWindow and destroyWindow calls, then finish
+    /// every pending destroy. Afterwards `windows` no longer changes.
+    fn closeRegistration(self: *App, io: std.Io) void {
+        {
+            self.windows_lock.lockUncancelable(io);
+            defer self.windows_lock.unlock(io);
+            self.accepting_windows = false;
+        }
+        // Group.await still waits for completion when cancelled.
+        self.reaper_tasks.await(io) catch {};
+        while (true) {
+            const next = blk: {
+                self.windows_lock.lockUncancelable(io);
+                defer self.windows_lock.unlock(io);
+                if (self.retiring.items.len == 0) break :blk null;
+                break :blk self.retiring.items[0];
+            } orelse break;
+            reapWindow(self, next, io) catch {};
+        }
     }
 };
 
@@ -2999,6 +3203,7 @@ pub const Running = struct {
     pub fn stop(self: *Running) !void {
         if (self.stopped) return;
         try self.inner.stop();
+        self.app.closeRegistration(self.inner.io);
         for (self.app.windows.items) |window| {
             window.running.store(false, .release);
             window.monitor_task.cancel(self.inner.io);
@@ -3022,10 +3227,16 @@ pub const Running = struct {
     /// call from any thread or handler; it never blocks on `wait()` itself.
     pub fn requestExit(self: *const Running) void {
         if (self.stopped) return;
-        for (self.app.windows.items) |window|
-            _ = window.broadcast(self.inner.io, .close, "") catch |err|
-                window.log(.warn, "Exit close notification failed: {}", .{err});
-        self.app.exit_requested.store(true, .release);
+        const app = self.app;
+        const io = self.inner.io;
+        {
+            app.windows_lock.lockSharedUncancelable(io);
+            defer app.windows_lock.unlockShared(io);
+            for (app.windows.items) |window|
+                _ = window.broadcast(io, .close, "") catch |err|
+                    window.log(.warn, "Exit close notification failed: {}", .{err});
+        }
+        app.exit_requested.store(true, .release);
     }
 
     /// Block until every window is finished, then stop the application.
@@ -3049,17 +3260,17 @@ pub const Running = struct {
         // below 10 ms becomes meaningful.
         while (!app.exit_requested.load(.acquire)) {
             const now = std.Io.Clock.Timestamp.now(io, .awake);
-            var any_connected = false;
-            for (app.windows.items) |window| {
-                if (window.ever_connected.load(.acquire)) any_connected = true;
-            }
-            var active = false;
-            for (app.windows.items) |window| {
-                if (window.keepsWaiting(io, now, any_connected)) {
-                    active = true;
-                    break;
+            const active = blk: {
+                app.windows_lock.lockSharedUncancelable(io);
+                defer app.windows_lock.unlockShared(io);
+                var any_connected = false;
+                for (app.windows.items) |window| {
+                    if (window.ever_connected.load(.acquire)) any_connected = true;
                 }
-            }
+                for (app.windows.items) |window|
+                    if (window.keepsWaiting(io, now, any_connected)) break :blk true;
+                break :blk false;
+            };
             if (!active) break;
             try std.Io.sleep(io, .fromMilliseconds(10), .awake);
         }
@@ -3418,7 +3629,8 @@ fn respondScript(
     try response.write(body);
 }
 
-fn route(app: *const App, path: []const u8) ?Route {
+/// Resolve a capability path. The caller releases the returned window.
+fn route(app: *App, io: std.Io, path: []const u8) ?Route {
     if (path.len < capability_len + 2 or
         path[0] != '/' or
         path[capability_len + 1] != '/')
@@ -3426,7 +3638,7 @@ fn route(app: *const App, path: []const u8) ?Route {
         return null;
     }
     return .{
-        .window = app.windowByCapability(path[1 .. capability_len + 1]) orelse
+        .window = app.retainWindowByCapability(io, path[1 .. capability_len + 1]) orelse
             return null,
         .resource = path[capability_len + 2 ..],
     };
@@ -3452,7 +3664,8 @@ fn onRequest(
     user_data: ?*anyopaque,
 ) Linsang.Action {
     const app = appFrom(user_data);
-    var resolved = route(app, request.path) orelse {
+    const io = app.server_io orelse return failResponse(response);
+    var resolved = route(app, io, request.path) orelse {
         // Browsers request /favicon.ico at the origin root for pages that do
         // not declare an icon. The default icon is public, constant data.
         if (std.mem.eql(u8, request.path, "/favicon.ico") or
@@ -3461,6 +3674,8 @@ fn onRequest(
         response.status = .not_found;
         return .respond;
     };
+    // Released last: every use of the window below happens before it.
+    defer resolved.window.release();
     const path_storage = app.gpa.alloc(u8, resolved.resource.len) catch
         return failResponse(response);
     var owns_path = true;
@@ -3470,7 +3685,6 @@ fn onRequest(
         return .respond;
     };
     const window = resolved.window;
-    const io = app.server_io orelse return failResponse(response);
     window.recordRequest(io);
     window.content_mutex.lockSharedUncancelable(io);
     defer window.content_mutex.unlockShared(io);
@@ -3774,10 +3988,11 @@ fn onOpen(connection: *Linsang.Connection, user_data: ?*anyopaque) void {
     // Linsang guarantees req remains valid through this callback. Copy only
     // stable identity and a bounded cookie copy: no request/header/path slice
     // survives the callback.
-    const resolved = route(app, connection.req.path) orelse {
+    const resolved = route(app, connection.io, connection.req.path) orelse {
         connection.wsClose(.policy_violation, "");
         return;
     };
+    defer resolved.window.release();
     const cookies = connection.req.header("cookie") orelse "";
     app.admitUpgrade(connection.io, @intFromPtr(connection), resolved.window, cookies) catch |err| {
         connection.wsClose(switch (err) {
@@ -3794,7 +4009,17 @@ fn onMessage(
     user_data: ?*anyopaque,
 ) void {
     const app = appFrom(user_data);
-    const authenticated = app.windowForConnection(connection);
+    // The upgrade record keeps its window alive until this connection's
+    // onClose, and callbacks of one connection never overlap.
+    const upgraded = app.authorizedWindow(connection.io, @intFromPtr(connection));
+    if (upgraded) |window| if (window.retired.load(.acquire)) {
+        connection.wsClose(.going_away, "");
+        return;
+    };
+    const authenticated: ?*WindowState = if (upgraded) |window|
+        if (window.hasConnection(connection)) window else null
+    else
+        null;
     if (message.opcode == .text and std.mem.eql(u8, message.data, "ping")) {
         if (authenticated == null) {
             connection.wsClose(.policy_violation, "");
@@ -3829,7 +4054,7 @@ fn onMessage(
     };
 
     if (packet.header.command == .check_token) {
-        const window = app.authorizedWindow(connection.io, @intFromPtr(connection)) orelse {
+        const window = upgraded orelse {
             connection.wsClose(.policy_violation, "");
             return;
         };
@@ -3973,14 +4198,15 @@ fn onMessage(
 fn onClose(connection: *Linsang.Connection, user_data: ?*anyopaque) void {
     const app = appFrom(user_data);
     const upgrade = app.removeUpgrade(connection.io, @intFromPtr(connection)) orelse return;
-    defer app.gpa.free(upgrade.cookies);
     const window = upgrade.window;
+    defer window.release();
+    defer app.gpa.free(upgrade.cookies);
     if (window.disconnected(connection)) |client| {
         window.dispatchEvent(connection.io, .{
             .kind = .disconnected,
             .client = client,
             .cookies = upgrade.cookies,
-        }) catch |err|
+        }) catch |err| if (err != error.WindowDestroyed)
             window.log(.err, "WebUI event dispatch failed: {}", .{err});
     }
 }
@@ -4795,13 +5021,16 @@ test "call accessors, window creation, and routes" {
     );
     const resolved = route(
         &app,
+        std.testing.io,
         "/0123456789abcdef0123456789abcdef/webui.js",
     ).?;
+    defer resolved.window.release();
     try std.testing.expect(resolved.window == window.state);
     try std.testing.expectEqualStrings("webui.js", resolved.resource);
-    try std.testing.expect(route(&app, "/short/") == null);
+    try std.testing.expect(route(&app, std.testing.io, "/short/") == null);
     try std.testing.expect(route(
         &app,
+        std.testing.io,
         "/ffffffffffffffffffffffffffffffff/",
     ) == null);
 
@@ -7688,6 +7917,144 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
     try std.testing.expect(secondary_events.disconnected.load(.acquire));
 }
 
+test "destroying a window before start frees it at once" {
+    var app = App.init(std.testing.allocator, .{});
+    defer app.deinit();
+    const first = try app.createWindow(.{ .content = .{ .html = "first" } });
+    const second = try app.createWindow(.{ .content = .{ .html = "second" } });
+    try app.destroyWindow(first);
+    // Membership compares addresses only; the freed state is never read.
+    try std.testing.expectError(error.UnknownWindow, app.destroyWindow(first));
+    try std.testing.expectEqual(@as(usize, 1), app.windows.items.len);
+    try std.testing.expect(app.windows.items[0] == second.state);
+    try app.destroyWindow(second);
+    try std.testing.expectError(error.NoWindow, app.start(std.testing.io));
+}
+
+const RuntimeDestroyCapture = struct {
+    app: *App,
+    destroyed: std.atomic.Value(bool) = .init(false),
+
+    fn leave(call: *Call, user_data: ?*anyopaque) !void {
+        const self: *RuntimeDestroyCapture = @ptrCast(@alignCast(user_data.?));
+        // Destroying the handler's own window must not wait for itself.
+        try self.app.destroyWindow(call.client.window());
+        self.destroyed.store(true, .release);
+        try call.reply("bye");
+    }
+};
+
+test "windows are created and destroyed while the app runs" {
+    try requireSocketIntegration();
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "index.html", .data = "runtime folder" });
+    const folder = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(folder);
+    var app = App.init(gpa, .{
+        .startup_timeout = null,
+        .folder_monitor_interval = .fromMilliseconds(5),
+    });
+    defer app.deinit();
+    const primary = try app.createWindow(.{ .content = .{ .html = "primary page" } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+
+    // A window created while running is served at once with fresh secrets.
+    const runtime = try app.createWindow(.{ .content = .{ .html = "runtime page" } });
+    try std.testing.expect(runtime.state.token != 0);
+    try std.testing.expect(!std.mem.eql(u8, &runtime.state.capability, &primary.state.capability));
+    try std.testing.expect(app.hasWindow(runtime.state));
+    var runtime_target: [64]u8 = undefined;
+    const runtime_path = try std.fmt.bufPrint(&runtime_target, "/{s}/", .{runtime.state.capability});
+    var primary_target: [64]u8 = undefined;
+    const primary_path = try std.fmt.bufPrint(&primary_target, "/{s}/", .{primary.state.capability});
+    var response: [2048]u8 = undefined;
+    var bytes = try getTestPath(running.inner.address, io, runtime_path, "runtime page", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200"));
+
+    var capture: RuntimeDestroyCapture = .{ .app = &app };
+    try runtime.bind(io, "leave", RuntimeDestroyCapture.leave, &capture);
+    const stream = try connectTestWebSocket(running.inner.address, io, &runtime.state.capability);
+    defer stream.close(io);
+    var frame: [256]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(
+        stream,
+        io,
+        gpa,
+        runtime.state.token,
+        &runtime.state.capability,
+        &frame,
+    ));
+    try waitForShown(runtime, io);
+    const token = runtime.state.token;
+    var packet: std.ArrayList(u8) = .empty;
+    defer packet.deinit(gpa);
+    try protocol.append(&packet, gpa, .{ .token = token, .id = 7, .command = .call }, "leave\x00\x00");
+    try sendClientFrame(stream, io, packet.items);
+    // The page is told to close. Destroy cancels the window's running
+    // handlers, the caller included, so its reply is best effort.
+    const closed = try protocol.decode(try readServerFrame(stream, io, &frame));
+    try std.testing.expectEqual(protocol.Command.close, closed.header.command);
+    try waitForFlag(io, &capture.destroyed);
+    try std.testing.expect(!app.hasWindow(runtime.state));
+    try std.testing.expectError(error.UnknownWindow, app.destroyWindow(runtime));
+    bytes = try getTestPath(running.inner.address, io, runtime_path, "\r\n\r\n", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 404"));
+    try disconnectTestStream(stream, io);
+
+    // Destroyed from outside a handler: later messages close the transport.
+    const connected = try app.createWindow(.{ .content = .{ .html = "connected page" } });
+    const second_stream = try connectTestWebSocket(running.inner.address, io, &connected.state.capability);
+    defer second_stream.close(io);
+    try std.testing.expect(try authenticateTestClient(
+        second_stream,
+        io,
+        gpa,
+        connected.state.token,
+        &connected.state.capability,
+        &frame,
+    ));
+    try waitForShown(connected, io);
+    const connected_token = connected.state.token;
+    try app.destroyWindow(connected);
+    const notified = try protocol.decode(try readServerFrame(second_stream, io, &frame));
+    try std.testing.expectEqual(protocol.Command.close, notified.header.command);
+    packet.clearRetainingCapacity();
+    try protocol.append(&packet, gpa, .{ .token = connected_token, .command = .click }, "late\x00");
+    try sendClientFrame(second_stream, io, packet.items);
+    _ = try readServerFrameOpcode(second_stream, io, .close, &frame);
+    try disconnectTestStream(second_stream, io);
+
+    // Other windows keep running.
+    bytes = try getTestPath(running.inner.address, io, primary_path, "primary page", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200"));
+
+    // Runtime directory windows get their own monitor, stopped on destroy.
+    const folder_window = try app.createWindow(.{ .content = .{ .directory = folder } });
+    try std.testing.expect(folder_window.state.monitor_task.token.load(.acquire) != null);
+    var folder_target: [80]u8 = undefined;
+    const folder_path = try std.fmt.bufPrint(&folder_target, "/{s}/index.html", .{folder_window.state.capability});
+    bytes = try getTestPath(running.inner.address, io, folder_path, "runtime folder", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200"));
+    try app.destroyWindow(folder_window);
+    bytes = try getTestPath(running.inner.address, io, folder_path, "\r\n\r\n", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 404"));
+
+    // With every window destroyed, wait() returns and stops the app.
+    try app.destroyWindow(primary);
+    try running.wait();
+    try std.testing.expect(!app.started);
+    try std.testing.expectEqual(@as(usize, 0), app.windows.items.len);
+    // After stop, windows are created for the next start again.
+    const next = try app.createWindow(.{ .content = .{ .html = "next" } });
+    try std.testing.expect(app.windows.items[0] == next.state);
+}
+
 test "multi-client limits, targeting, and disconnect lifecycle" {
     try requireSocketIntegration();
     const gpa = std.testing.allocator;
@@ -8401,10 +8768,13 @@ test "upgrade admission owns only accepted connections and removes every state" 
         fn take(owner: *App, key: usize) ?*WindowState {
             const upgrade = owner.removeUpgrade(std.testing.io, key) orelse return null;
             owner.gpa.free(upgrade.cookies);
+            // The app list still owns the window after the record's release.
+            upgrade.window.release();
             return upgrade.window;
         }
     }.take;
     try app.admitUpgrade(io, 1, first.state, "session=one; theme=dark");
+    try std.testing.expectEqual(@as(usize, 2), first.state.references.load(.acquire));
     try std.testing.expectError(error.ClientLimitReached, app.admitUpgrade(io, 2, second.state, ""));
     try std.testing.expect(removedWindow(&app, 2) == null);
     try std.testing.expect(app.authorizedWindow(io, 1) == first.state);
@@ -8546,7 +8916,10 @@ fn upgradeAllocationFailures(gpa: std.mem.Allocator) !void {
     defer app.deinit();
     const window = try app.createWindow(.{ .content = .{ .html = "admission allocation" } });
     try app.admitUpgrade(std.testing.io, 1, window.state, "session=allocation");
-    defer if (app.removeUpgrade(std.testing.io, 1)) |upgrade| gpa.free(upgrade.cookies);
+    defer if (app.removeUpgrade(std.testing.io, 1)) |upgrade| {
+        gpa.free(upgrade.cookies);
+        upgrade.window.release();
+    };
 }
 
 test "upgrade allocation failures do not retain admission ownership" {

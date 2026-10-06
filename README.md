@@ -10,9 +10,8 @@ compile or link the upstream WebUI C library or CivetWeb.
 support.
 
 The core rewrite is substantial, but full upstream behavioral parity is not
-complete. A fresh source audit found gaps in content composition, live window
-creation/destruction, Firefox app profiles, and native drag/resize, title and
-navigation integration. See the
+complete. A fresh source audit found gaps in Firefox app profiles, browser
+discovery, and native drag/resize, title and navigation integration. See the
 [open semantic gaps](docs/PURE_ZIG_REFACTOR.md#open-semantic-gaps)
 and the [source comparison](docs/UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
@@ -161,6 +160,25 @@ threads. Only one `wait()` may run at a time; another returns
 `error.AlreadyWaiting`, and `wait()` after `stop()` returns immediately.
 Bridge retries do not extend the grace period or restart a stopped backend.
 Longer outages can recover only while the application keeps its server running.
+
+`App.createWindow()` also works while the app runs, from handlers or other
+threads: the window is served at once with its own fresh token, capability,
+and cookie, opens its folder, and starts its own folder monitor.
+`App.destroyWindow()` is upstream `webui_destroy()`. Before `start` it frees
+the window at once. While running it stops routing immediately, so the
+window's page, bridge script, and WebSocket upgrades answer `404`. Connected
+pages get a backend close, and any later message on their transport closes
+it with `1001`. In the background, queued and running handlers of that window
+are cancelled, the caller included, so a reply from a handler that destroys
+its own window is best effort. Its folder monitor and managed browser stop
+too, while the browser profile is kept. The window's memory is freed once its
+last connection, request, and deferred reply finish, and `Running.stop()`
+completes any cleanup still pending. `Client.window()` returns the window of a
+call or event, so a handler can destroy its own window. Other windows keep
+running. When no window remains, `Running.wait()` returns. Destroying
+an unknown or already destroyed window returns `error.UnknownWindow` without
+reading it. A destroyed `Window` handle and its `Client` handles must not be
+used again, or concurrently with the destroy call.
 
 `Window.open()` discovers the best installed browser and launches it as a
 standalone app window, exactly like `Window.openWithBrowser()` with that
