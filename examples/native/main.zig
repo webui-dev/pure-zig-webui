@@ -514,6 +514,9 @@ fn navigation(io: std.Io, view: webui.native.Window, page: *Page, url: []const u
     }
 }
 
+/// Time for a window manager to apply one state change.
+const settle_ms = 250;
+
 fn smoke(io: std.Io, first: *Page, second: *Page, url: []const u8, require_input: bool) !void {
     const a = first.native.?;
     const b = second.native.?;
@@ -542,17 +545,26 @@ fn smoke(io: std.Io, first: *Page, second: *Page, url: []const u8, require_input
     try a.setFrameless(false);
     try a.setPosition(.{ .x = 32, .y = 48 });
     try a.center();
+    // X11 window managers apply state requests asynchronously, and GDK
+    // applies (un)maximize to a window it considers unmapped only locally.
+    // Let each change settle so a later request cannot race an earlier one
+    // and leave GTK waiting for a configure reply that never comes.
     try a.minimize();
-    _ = try a.poll();
+    try pumpFor(io, a, settle_ms);
     try a.restore();
+    try pumpFor(io, a, settle_ms);
     try a.maximize();
-    _ = try a.poll();
+    try pumpFor(io, a, settle_ms);
     try a.restore();
+    try pumpFor(io, a, settle_ms);
     try a.setKiosk(true);
-    _ = try a.poll();
+    try pumpFor(io, a, settle_ms);
     try a.setKiosk(false);
+    try pumpFor(io, a, settle_ms);
     try a.setVisible(false);
+    try pumpFor(io, a, settle_ms);
     try a.setVisible(true);
+    try pumpFor(io, a, settle_ms);
     try a.focus();
     _ = try a.handle();
     if (builtin.os.tag == .macos) {
