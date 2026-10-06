@@ -7714,6 +7714,8 @@ test "exhausted evaluation wire IDs recover after a discarded late reply" {
     defer stream.close(io);
     var wire: [125]u8 = undefined;
     try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &wire));
+    // The acknowledgement precedes client registration to keep wire order.
+    _ = try window.waitForConnection(io, .fromSeconds(1));
     window.state.mutex.lockUncancelable(io);
     window.state.clients.items[0].retired_eval_ids = std.DynamicBitSetUnmanaged.initFull(gpa, 1 << 16) catch |err| {
         window.state.mutex.unlock(io);
