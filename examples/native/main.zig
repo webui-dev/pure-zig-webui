@@ -434,7 +434,87 @@ fn frameless(io: std.Io, view: webui.native.Window, page: *Page, require_input: 
     return true;
 }
 
-fn smoke(io: std.Io, first: *Page, second: *Page, require_input: bool) !void {
+/// Records page navigations and cancels those whose URL mentions "blocked".
+const NavigationLog = struct {
+    count: usize = 0,
+    kinds: [6]webui.native.NavigationKind = undefined,
+    urls: [6][256]u8 = undefined,
+    lengths: [6]usize = undefined,
+
+    fn decide(data: ?*anyopaque, request: webui.native.NavigationRequest) bool {
+        const log: *NavigationLog = @ptrCast(@alignCast(data.?));
+        if (log.count < log.kinds.len) {
+            const length = @min(request.url.len, log.urls[log.count].len);
+            @memcpy(log.urls[log.count][0..length], request.url[0..length]);
+            log.lengths[log.count] = length;
+            log.kinds[log.count] = request.kind;
+        }
+        log.count += 1;
+        return std.mem.indexOf(u8, request.url, "blocked") == null;
+    }
+
+    fn expect(self: *const NavigationLog, index: usize, kind: webui.native.NavigationKind, suffix: []const u8) !void {
+        const url = self.urls[index][0..self.lengths[index]];
+        if (self.kinds[index] != kind or !std.mem.endsWith(u8, url, suffix)) {
+            std.log.err("native navigation {d} was {s} {s}, expected {s} ...{s}", .{ index, @tagName(self.kinds[index]), url, @tagName(kind), suffix });
+            return error.NativeNavigationMisreported;
+        }
+    }
+};
+
+fn pumpFor(io: std.Io, view: webui.native.Window, milliseconds: i64) !void {
+    const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(milliseconds) });
+    while (deadline.compare(.gt, .now(io, .awake))) {
+        if (!try view.poll()) return error.NativeClosedEarly;
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+}
+
+fn awaitNavigations(io: std.Io, view: webui.native.Window, log: *const NavigationLog, count: usize) !void {
+    const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(5) });
+    while (log.count < count) {
+        if (!try view.poll()) return error.NativeClosedEarly;
+        if (deadline.compare(.lte, .now(io, .awake))) return error.NativeNavigationNotReported;
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+}
+
+/// Engine-level navigation decisions, independent of the bridge.
+fn navigation(io: std.Io, view: webui.native.Window, page: *Page, url: []const u8) !void {
+    var log: NavigationLog = .{};
+    try view.setNavigationHandler(NavigationLog.decide, &log);
+    defer view.setNavigationHandler(null, null) catch {};
+    // Stop the bridge's own interception so the engine sees each navigation.
+    try evaluate(io, view, page.window, "webui.allowNavigation(true); window.kept = 'kept'; location.assign('blocked-script'); return 'assigned'", "assigned");
+    try awaitNavigations(io, view, &log, 1);
+    try evaluate(io, view, page.window, "const a = document.createElement('a'); a.href = 'blocked-link'; document.body.appendChild(a); a.click(); return 'clicked'", "clicked");
+    try awaitNavigations(io, view, &log, 2);
+    try pumpFor(io, view, 300);
+    try evaluate(io, view, page.window, "return window.kept", "kept");
+    try log.expect(0, .other, "/blocked-script");
+    // WebView2 reports no link or form kinds.
+    try log.expect(1, if (builtin.os.tag == .windows) .other else .link, "/blocked-link");
+    // favicon.ico answers 302 to favicon.svg; each hop is decided.
+    try evaluate(io, view, page.window, "setTimeout(() => location.assign('favicon.ico'), 50); return 'leaving'", "leaving");
+    try awaitNavigations(io, view, &log, 4);
+    try pumpFor(io, view, 500);
+    try log.expect(2, .other, "/favicon.ico");
+    try log.expect(3, .other, "/favicon.svg");
+    // Host navigations are never reported.
+    page.ready.store(false, .release);
+    var buffer: [512]u8 = undefined;
+    try view.navigate(try std.fmt.bufPrint(&buffer, "{s}?host", .{url}));
+    try pumpUntil(io, view, page, null);
+    try evaluate(io, view, page.window, "return location.search", "?host");
+    if (log.count != 4) {
+        std.log.err("native navigation reported {d} requests, expected 4", .{log.count});
+        for (0..@min(log.count, log.kinds.len)) |index|
+            std.log.err("  {d}: {s} {s}", .{ index, @tagName(log.kinds[index]), log.urls[index][0..log.lengths[index]] });
+        return error.NativeNavigationMisreported;
+    }
+}
+
+fn smoke(io: std.Io, first: *Page, second: *Page, url: []const u8, require_input: bool) !void {
     const a = first.native.?;
     const b = second.native.?;
     try pumpUntil(io, a, first, null);
@@ -528,10 +608,11 @@ fn smoke(io: std.Io, first: *Page, second: *Page, require_input: bool) !void {
     _ = try a.poll();
     if (b.geometry()) |_| return error.NativeSecondaryCloseFailed else |err| if (err != error.NativeWindowClosed) return err;
     try evaluate(io, a, first.window, "return await webui.call('ready')", "Connected to Zig");
+    try navigation(io, a, first, url);
     const interaction = if (try frameless(io, a, first, require_input)) "frameless drag+resize input" else "frameless configuration";
     try a.close();
     if (try a.poll()) return error.NativeForceCloseFailed;
-    std.debug.print("NATIVE SMOKE PASS: bridge, geometry, controls, dispatch, titles, veto, history, {s}, multiwindow close\n", .{interaction});
+    std.debug.print("NATIVE SMOKE PASS: bridge, geometry, controls, dispatch, titles, veto, history, navigation, {s}, multiwindow close\n", .{interaction});
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -582,7 +663,9 @@ pub fn main(init: std.process.Init) !void {
         var second_view = try webui.native.Window.open(init.gpa, init.io, second.window, &running, options);
         defer second_view.deinit() catch |err| std.log.err("native cleanup: {}", .{err});
         second.native = second_view;
-        try smoke(init.io, &first, &second, require_input);
+        const url = try first.window.url(&running, init.gpa);
+        defer init.gpa.free(url);
+        try smoke(init.io, &first, &second, url, require_input);
     } else {
         try first_view.run();
     }
