@@ -3559,6 +3559,12 @@ fn failingEventHandler(_: *const Event, _: ?*anyopaque) !void {
 
 fn noopCallHandler(_: *Call, _: ?*anyopaque) !void {}
 
+/// These long multi-connection scenarios run on Linux and macOS. Windows CI has
+/// not validated their shutdown timing, so only that platform skips them.
+fn requireSocketIntegration() !void {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+}
+
 test "application logger receives level, message, and user data" {
     const gpa = std.testing.allocator;
     var capture: LoggerCapture = .{};
@@ -5611,7 +5617,7 @@ fn requireTestRuntime(
 }
 
 test "directory monitor reloads changed window only" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    try requireSocketIntegration();
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
     defer threaded.deinit();
@@ -5768,7 +5774,7 @@ test "directory monitor reloads changed window only" {
 }
 
 test "window connection waiting observes clients and timeouts" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    try requireSocketIntegration();
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
     defer threaded.deinit();
@@ -5830,7 +5836,7 @@ test "window connection waiting observes clients and timeouts" {
 }
 
 test "binding replies can be deferred, bounded, and disconnected" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    try requireSocketIntegration();
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
     defer threaded.deinit();
@@ -5931,7 +5937,7 @@ test "binding replies can be deferred, bounded, and disconnected" {
 }
 
 test "cookie authorization guards WebSocket upgrades" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    try requireSocketIntegration();
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
     defer threaded.deinit();
@@ -6031,7 +6037,7 @@ test "cookie authorization guards WebSocket upgrades" {
 }
 
 test "JavaScript and Zig calls complete over HTTP and WebSocket" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    try requireSocketIntegration();
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
     defer threaded.deinit();
@@ -6719,7 +6725,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
 }
 
 test "multi-client limits, targeting, and disconnect lifecycle" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    try requireSocketIntegration();
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
     defer threaded.deinit();
