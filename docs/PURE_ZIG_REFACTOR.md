@@ -56,7 +56,7 @@ is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 | Browser discovery | Registered Windows Chromium using `chrome.exe` and macOS bundles outside the fixed application directories lack upstream discovery paths. |
 | Native interaction | Missing GTK custom drag/edge resize, Windows draggable-region setup and resizable frameless host behavior, and Cocoa frameless background movement. |
 | Native page integration | No upstream page-title-to-host synchronization; no GTK engine-level navigation-policy interception independent of a live bridge. |
-| Default presentation | No upstream default fallback favicon. F5/context-menu/DevTools policy differences are intentional UI-policy candidates, not proof of missing protocol support. |
+| Default presentation | F5/context-menu/DevTools policy differences are intentional UI-policy candidates, not proof of missing protocol support. |
 
 Closed after the rescan, each with focused tests in the same change:
 
@@ -64,6 +64,7 @@ Closed after the rescan, each with focused tests in the same change:
 |---|---|
 | Wait lifecycle | Close intent, reconnect grace, and first-connection waiting are per window; `startup_timeout` and `Running.requestExit()` give the initial wait upstream's timeout and `webui_exit` completion. Tests: `wait state tracks startup, activity, reconnect grace, and close per window`, `wait keeps per-window close intent and honours exit requests`. |
 | Callback metadata | `Call.name`, `Call.origin` (`.call` or `.click`), and `Call.cookies`/`Event.cookies` with `cookie(name)` expose the binding name, call origin, and the upgrade's `Cookie` header, copied per connection under `Limits.max_cookie_size` (oversized upgrades answer `431`). Tests: `calls and events expose binding name, origin, and bounded cookies`, `cookie values parse from raw headers`, `upgrade admission owns only accepted connections and removes every state`. |
+| Default favicon | `favicon.ico`/`favicon.svg` resolve custom icon, then a readable directory file, then upstream's default SVG (`.ico` answers `302` to `favicon.svg`), at both the capability root and the origin root. Test: `favicon falls back from custom icon to local file to the default`. |
 
 Borrowed custom HTTP handlers can await work before returning through `std.Io`;
 there is no owned post-return HTTP reply handle. This is an explicit Zig task

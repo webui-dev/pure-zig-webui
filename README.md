@@ -304,6 +304,12 @@ Use `Window.setIcon(io, data, mime_type)` for in-memory favicon data or
 files. Embedded HTML receives a relative favicon link automatically.
 Directory and custom pages can reference `favicon.ico` relative to the window
 capability root.
+Like upstream, `favicon.ico` and `favicon.svg` resolve to the custom icon, then
+a readable file of that name in directory content, then a built-in default:
+`favicon.ico` redirects with `302` to `favicon.svg`, which serves the default
+SVG. The origin-root `/favicon.ico` and `/favicon.svg` that browsers request for
+pages without an icon link also serve that default. Custom handlers keep full
+control of their own favicon paths.
 
 `Window.setContent(&running, content)` prepares and installs new content, then
 navigates every connected client to it and returns the number notified. An

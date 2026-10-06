@@ -23,6 +23,29 @@ const startup_activity_grace: std.Io.Duration = .fromSeconds(5);
 const no_activity = std.math.minInt(i64);
 const wait_forever = std.math.maxInt(i64);
 const favicon_link = "<link rel=\"icon\" href=\"favicon.ico\">";
+/// Upstream's default embedded icon: a plain WebUI-blue square.
+const default_favicon =
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"500\" height=\"500\" " ++
+    "viewBox=\"0 0 375 375\"><path fill=\"#2a6699\" " ++
+    "d=\"M 22.375 22.558594 L 352.257812 22.558594 L 352.257812 352.441406 " ++
+    "L 22.375 352.441406 Z\"/></svg>";
+
+/// Answer `favicon.ico` with a relative 302 to `favicon.svg`, and
+/// `favicon.svg` with the default icon, matching upstream.
+fn writeDefaultFavicon(response: *Response, resource: []const u8) Linsang.Action {
+    if (std.mem.eql(u8, resource, "favicon.ico")) {
+        response.setHeader("Location", "favicon.svg") catch
+            return failResponse(response);
+        response.status = .found;
+        return .respond;
+    }
+    response.setHeader("Content-Type", "image/svg+xml") catch
+        return failResponse(response);
+    response.setHeader("X-Content-Type-Options", "nosniff") catch
+        return failResponse(response);
+    response.write(default_favicon) catch return failResponse(response);
+    return .respond;
+}
 const directory_reload_script = "location.reload();";
 
 pub const Tls = struct {
@@ -3347,6 +3370,11 @@ fn onRequest(
 ) Linsang.Action {
     const app = appFrom(user_data);
     var resolved = route(app, request.path) orelse {
+        // Browsers request /favicon.ico at the origin root for pages that do
+        // not declare an icon. The default icon is public, constant data.
+        if (std.mem.eql(u8, request.path, "/favicon.ico") or
+            std.mem.eql(u8, request.path, "/favicon.svg"))
+            return writeDefaultFavicon(response, request.path[1..]);
         response.status = .not_found;
         return .respond;
     };
@@ -3395,6 +3423,18 @@ fn onRequest(
             response.write(icon.data) catch return failResponse(response);
             return .respond;
         }
+        // Like upstream: custom icon, then a local file, then the default.
+        const local = switch (window.content) {
+            .html => false,
+            .directory => |directory| if (directory.dir) |dir|
+                readableResource(dir, io, resolved.resource)
+            else
+                false,
+            // Custom handlers own their namespace; external pages never
+            // load icons from this server.
+            .custom, .external_url => true,
+        };
+        if (!local) return writeDefaultFavicon(response, resolved.resource);
     }
     if (std.mem.eql(u8, resolved.resource, "webui.js")) {
         response.setHeader("Content-Type", "text/javascript; charset=utf-8") catch
@@ -4026,6 +4066,60 @@ test "calls and events expose binding name, origin, and bounded cookies" {
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
     }
     try std.testing.expect(capture.disconnected_theme.load(.acquire));
+}
+
+test "favicon falls back from custom icon to local file to the default" {
+    try requireSocketIntegration();
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "with-icon");
+    try tmp.dir.createDirPath(io, "without-icon");
+    try tmp.dir.writeFile(io, .{ .sub_path = "with-icon/favicon.svg", .data = "<svg>local</svg>" });
+    const with_icon = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/with-icon", .{tmp.sub_path});
+    defer gpa.free(with_icon);
+    const without_icon = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/without-icon", .{tmp.sub_path});
+    defer gpa.free(without_icon);
+
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const html = try app.createWindow(.{ .content = .{ .html = "<html><head></head></html>" } });
+    const local = try app.createWindow(.{ .content = .{ .directory = with_icon } });
+    const missing = try app.createWindow(.{ .content = .{ .directory = without_icon } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+
+    var target: [capability_len + 16]u8 = undefined;
+    var response: [2048]u8 = undefined;
+    // Origin-root requests, made for pages without an icon link.
+    var bytes = try getTestPath(running.inner.address, io, "/favicon.ico", "\r\n\r\n", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 302"));
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Location: favicon.svg\r\n") != null);
+    bytes = try getTestPath(running.inner.address, io, "/favicon.svg", "</svg>", &response);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Content-Type: image/svg+xml\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, bytes, default_favicon));
+    bytes = try getTestPath(running.inner.address, io, "/favicon.png", "\r\n\r\n", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 404"));
+
+    // Capability-scoped requests for windows without a custom icon.
+    for ([_]Window{ html, missing }) |window| {
+        bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}/favicon.ico", .{window.state.capability}), "\r\n\r\n", &response);
+        try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 302"));
+        bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}/favicon.svg", .{window.state.capability}), "</svg>", &response);
+        try std.testing.expect(std.mem.endsWith(u8, bytes, default_favicon));
+    }
+    bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}/favicon.svg", .{local.state.capability}), "</svg>", &response);
+    try std.testing.expect(std.mem.endsWith(u8, bytes, "<svg>local</svg>"));
+    bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}/favicon.ico", .{local.state.capability}), "\r\n\r\n", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 302"));
+
+    // A custom icon still wins over the default.
+    try html.setIcon(io, "<svg>custom</svg>", "image/svg+xml");
+    bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}/favicon.ico", .{html.state.capability}), "</svg>", &response);
+    try std.testing.expect(std.mem.endsWith(u8, bytes, "<svg>custom</svg>"));
 }
 
 test "cookie values parse from raw headers" {
