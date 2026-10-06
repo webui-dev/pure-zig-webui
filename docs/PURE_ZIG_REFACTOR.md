@@ -49,7 +49,6 @@ is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
 | Area | Remaining behavior, not covered by existing API mappings |
 |---|---|
-| Browser discovery | macOS bundles outside the fixed application directories lack upstream discovery paths. |
 | Native interaction | Missing GTK custom drag/edge resize, Windows draggable-region setup and resizable frameless host behavior, and Cocoa frameless background movement. |
 | Native page integration | No upstream page-title-to-host synchronization; no GTK engine-level navigation-policy interception independent of a live bridge. |
 | Default presentation | F5/context-menu/DevTools policy differences are intentional UI-policy candidates, not proof of missing protocol support. |
@@ -64,7 +63,7 @@ Closed after the rescan, each with focused tests in the same change:
 | Content composition | `Content.site` composes optional embedded HTML, a declinable handler, and a root folder in upstream resolution order; `Window.installContent` replaces resources without navigation. Tests: `site content resolves handler, virtual index, html, folder, and entry in upstream order`, `installed content changes resources without navigating clients`. |
 | Live window lifecycle | `App.createWindow` serves windows created while running with fresh credentials, folder, and monitor. `App.destroyWindow` unregisters at once (`404` routing, backend close, `1001` on later messages), then cancels the window's handlers, monitor, and managed browser in the background, and frees it after its last connection, request, and deferred reply. This works from the window's own handlers via `Client.window()`, and `Running.stop` finishes pending cleanup. Tests: `windows are created and destroyed while the app runs`, `destroying a window before start frees it at once`, `upgrade admission owns only accepted connections and removes every state`. |
 | Firefox app mode | Firefox windows without a caller profile get a generated per-window profile; before each launch it receives upstream's `chrome/userChrome.css` toolbar suppression and a rewritten `user.js` (stylesheet support, no default-browser check, close warning, tabs in title bar, or first-run pages, and the `browser.display.document_color_use` high-contrast override). Snap Firefox profiles live under the snap's user directory from the passwd home. A caller profile is never modified, so it rejects `high_contrast = false`. Tests: `generated Firefox profiles receive WebUI app-mode settings`, `Firefox windows launch with a generated app-mode profile`, `Firefox launches reject profile combinations they cannot honour`, `passwd home lookup accepts only well-formed absolute entries`. |
-| Browser discovery | Windows tells Chrome from Chromium among `PATH` and `App Paths` `chrome.exe` candidates by Google's `initial_preferences`/`master_preferences` files, like upstream, so registered Chromium is found and never mistaken for Chrome. Test: `Windows Chrome and Chromium installs are told apart by Google's installer files`. |
+| Browser discovery | Windows tells Chrome from Chromium among `PATH` and `App Paths` `chrome.exe` candidates by Google's `initial_preferences`/`master_preferences` files, like upstream, so registered Chromium is found and never mistaken for Chrome. macOS adds `~/Applications` and a side-effect-free Spotlight bundle-identifier lookup in place of upstream's Finder-revealing `open -R -a`. Tests: `Windows Chrome and Chromium installs are told apart by Google's installer files`, `macOS bundles resolve from Spotlight output`. |
 | Entry and custom routing | `Site.entry` redirects the root to a validated relative entry file, and handlers that decline a path (empty `404`) are probed for the entry name or `index.*` with `302` redirects, for both `.site` and `.custom`. Same tests as content composition. |
 
 Borrowed custom HTTP handlers can await work before returning through `std.Io`;
@@ -427,7 +426,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_set_size()`, `webui_set_position()` | `App.WindowOptions.size` and `.position` set initial geometry. `Window.setSize()` and `Window.setPosition()` persist updates, notify connected clients, replay the latest geometry to later clients, and affect subsequent explicit browser launches. |
 | `webui_set_high_contrast()`, `webui_is_high_contrast()` | `App.WindowOptions.high_contrast` controls Chromium forced-color support and the generated Firefox profile's `browser.display.document_color_use` preference, with explicit errors for Safari and caller-managed Firefox profiles. Browser-side `webui.isHighContrast()` uses native forced-color and contrast media queries without external programs. |
 | `webui_open_url()` | `openUrl()` safely passes a non-empty URL as one argument to the platform default opener. |
-| `webui_get_best_browser()`, `webui_browser_exist()` | `bestBrowser()` and `browserExists()` discover registered or executable browser candidates through the public `Browser` enum, including registered Windows Chromium. |
+| `webui_get_best_browser()`, `webui_browser_exist()` | `bestBrowser()` and `browserExists()` discover registered or executable browser candidates through the public `Browser` enum, including registered Windows Chromium and macOS bundles found by bundle identifier. |
 | `webui_show_browser()`, `webui_set_browser_folder()`, `webui_set_custom_parameters()` | `Window.openWithBrowser()` accepts a `BrowserLaunchOptions` value with an explicit browser, optional full executable path, and additional argv. An empty argv applies the Chromium default arguments; a non-empty argv replaces them, matching upstream `custom_parameters`. |
 | `webui_get_child_process_id()` | `Window.openWithBrowser()` returns the retained direct child's `BrowserProcessId`; `Window.browserProcessId()` retrieves it later. |
 | `webui_get_parent_process_id()` | Root-level `parentProcessId()` returns the current Zig backend's numeric process ID without a redundant window argument. Unsupported process targets return an explicit error. |
@@ -509,8 +508,8 @@ Browser discovery, default URL opening, explicit browser selection, custom
 executable paths and argv, the process-wide backend identifier, per-window
 direct child identifiers, replacement, and shutdown cleanup are implemented.
 
-Discovery covers registered Windows Chromium; the macOS resolver gap listed
-above remains.
+Discovery covers registered Windows Chromium and macOS bundles outside the
+standard application directories.
 
 ### Browser window controls
 

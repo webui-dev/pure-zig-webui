@@ -733,28 +733,91 @@ fn resolveMacosExecutable(
     io: std.Io,
     selected: Browser,
 ) !?[]u8 {
-    for ([_][]const u8{ "/Applications", "/System/Applications" }) |root| {
-        const path = try std.fmt.allocPrint(
-            gpa,
-            "{s}/{s}.app/Contents/MacOS/{s}",
-            .{
-                root,
-                macosApplication(selected),
-                macosExecutable(selected),
-            },
-        );
-        std.Io.Dir.accessAbsolute(io, path, .{ .execute = true }) catch |err| {
-            gpa.free(path);
-            switch (err) {
-                error.FileNotFound,
-                error.AccessDenied,
-                error.PermissionDenied,
-                => continue,
-                else => return err,
-            }
-        };
-        return path;
+    const home: ?[]const u8 = if (builtin.link_libc)
+        if (std.c.getenv("HOME")) |value| std.mem.sliceTo(value, 0) else null
+    else
+        null;
+    const user_applications: ?[]u8 = if (home) |directory|
+        try std.fmt.allocPrint(gpa, "{s}/Applications", .{directory})
+    else
+        null;
+    defer if (user_applications) |path| gpa.free(path);
+    for ([_]?[]const u8{ "/Applications", "/System/Applications", user_applications }) |candidate| {
+        const root = candidate orelse continue;
+        if (!std.fs.path.isAbsolutePosix(root)) continue;
+        const bundle = try std.fmt.allocPrint(gpa, "{s}/{s}.app", .{ root, macosApplication(selected) });
+        defer gpa.free(bundle);
+        if (try macosBundleExecutable(gpa, io, bundle, selected)) |path| return path;
     }
+    // Bundles anywhere else, like upstream's LaunchServices lookup, through
+    // Spotlight's bundle-identifier index. `open -R -a` is not used: it
+    // reveals the application in Finder.
+    var query_buffer: [96]u8 = undefined;
+    const query = try std.fmt.bufPrint(
+        &query_buffer,
+        "kMDItemCFBundleIdentifier == '{s}'",
+        .{macosBundleIdentifier(selected)},
+    );
+    const output = try commandOutput(gpa, io, &.{ "mdfind", query }) orelse return null;
+    defer gpa.free(output);
+    return spotlightBundleExecutable(gpa, io, output, selected);
+}
+
+/// The first executable browser in `mdfind` output: one absolute `.app`
+/// path per line. Unexpected lines are skipped.
+fn spotlightBundleExecutable(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    output: []const u8,
+    selected: Browser,
+) !?[]u8 {
+    var lines = std.mem.tokenizeAny(u8, output, "\r\n");
+    while (lines.next()) |bundle| {
+        if (!std.fs.path.isAbsolutePosix(bundle) or !std.mem.endsWith(u8, bundle, ".app"))
+            continue;
+        if (try macosBundleExecutable(gpa, io, bundle, selected)) |path| return path;
+    }
+    return null;
+}
+
+fn macosBundleExecutable(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    bundle: []const u8,
+    selected: Browser,
+) !?[]u8 {
+    const path = try std.fmt.allocPrint(gpa, "{s}/Contents/MacOS/{s}", .{ bundle, macosExecutable(selected) });
+    std.Io.Dir.accessAbsolute(io, path, .{ .execute = true }) catch |err| {
+        gpa.free(path);
+        return switch (err) {
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied => null,
+            else => err,
+        };
+    };
+    return path;
+}
+
+/// Complete stdout of a successful command, or null when the program is
+/// missing or fails. Caller owns the returned memory.
+fn commandOutput(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) !?[]u8 {
+    const result = std.process.run(gpa, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(64 << 10),
+        .stderr_limit = .limited(64 << 10),
+    }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.InvalidExe => return null,
+        else => return err,
+    };
+    gpa.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return result.stdout,
+        else => {},
+    }
+    gpa.free(result.stdout);
     return null;
 }
 
@@ -829,6 +892,20 @@ fn macosApplication(selected: Browser) []const u8 {
     };
 }
 
+fn macosBundleIdentifier(selected: Browser) []const u8 {
+    return switch (selected) {
+        .chrome => "com.google.Chrome",
+        .firefox => "org.mozilla.firefox",
+        .edge => "com.microsoft.edgemac",
+        .safari => "com.apple.Safari",
+        .chromium => "org.chromium.Chromium",
+        .opera => "com.operasoftware.Opera",
+        .brave => "com.brave.Browser",
+        .vivaldi => "com.vivaldi.Vivaldi",
+        .epic => "com.hiddenreflex.Epic",
+        .yandex => "ru.yandex.desktop.yandex-browser",
+    };
+}
 fn macosExecutable(selected: Browser) []const u8 {
     return switch (selected) {
         .firefox => "firefox",
@@ -1161,6 +1238,48 @@ test "Windows Chrome and Chromium installs are told apart by Google's installer 
         try std.testing.expect(try windowsChromeMatches(io, .edge, path));
     }
     try std.testing.expect(!try windowsChromeMatches(io, .chrome, "chrome.exe"));
+}
+
+test "macOS bundles resolve from Spotlight output" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "Custom/Google Chrome.app/Contents/MacOS");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "Custom/Google Chrome.app/Contents/MacOS/Google Chrome",
+        .data = "",
+        .flags = .{ .permissions = .executable_file },
+    });
+    try tmp.dir.createDirPath(io, "Plain/Google Chrome.app/Contents/MacOS");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Plain/Google Chrome.app/Contents/MacOS/Google Chrome", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const output = try std.fmt.allocPrint(
+        gpa,
+        "relative/Google Chrome.app\n\n/not/a/bundle\n{0s}/Missing.app\n{0s}/Plain/Google Chrome.app\n{0s}/Custom/Google Chrome.app\r\n",
+        .{root},
+    );
+    defer gpa.free(output);
+    const found = (try spotlightBundleExecutable(gpa, io, output, .chrome)).?;
+    defer gpa.free(found);
+    const expected = try std.fmt.allocPrint(gpa, "{s}/Custom/Google Chrome.app/Contents/MacOS/Google Chrome", .{root});
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, found);
+    try std.testing.expectEqual(@as(?[]u8, null), try spotlightBundleExecutable(gpa, io, "", .chrome));
+    try std.testing.expectEqual(@as(?[]u8, null), try spotlightBundleExecutable(gpa, io, output, .firefox));
+    // A missing lookup program is an unavailable result, not an error.
+    try std.testing.expectEqual(@as(?[]u8, null), try commandOutput(gpa, io, &.{"webui-missing-lookup-program"}));
+
+    var identifiers: std.StringHashMapUnmanaged(void) = .empty;
+    defer identifiers.deinit(gpa);
+    for (std.enums.values(Browser)) |selected| {
+        const identifier = macosBundleIdentifier(selected);
+        try std.testing.expect(std.mem.indexOfScalar(u8, identifier, '.') != null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, identifier, '\'') == null);
+        try std.testing.expect(!(try identifiers.getOrPut(gpa, identifier)).found_existing);
+    }
 }
 
 test "browser candidates and preference order cover every browser" {
