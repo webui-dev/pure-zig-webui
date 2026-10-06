@@ -10,7 +10,6 @@ pub const Geometry = struct {
     size: Size,
 };
 
-/// Borrowed native window, invalid after native close or owner destruction.
 /// How pages declare areas that move the host window.
 pub const DragRegion = enum {
     /// Elements whose computed `--webui-app-region` is `drag` (WebKitGTK).
@@ -23,6 +22,7 @@ pub const DragRegion = enum {
     none,
 };
 
+/// Borrowed native window, invalid after native close or owner destruction.
 pub const Handle = union(enum) {
     cocoa: *anyopaque,
     gtk: *anyopaque,
