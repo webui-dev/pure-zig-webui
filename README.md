@@ -9,9 +9,9 @@ compile or link the upstream WebUI C library or CivetWeb.
 [Linsang](https://github.com/jinzhongjia/Linsang) provides HTTP and WebSocket
 support.
 
-The core rewrite is substantial, but full upstream behavioral parity is not
-complete. A fresh source audit found a remaining gap in GTK engine-level
-navigation integration. See the
+The semantic gaps found by the latest upstream source audit are closed. The
+remaining listed difference is the default presentation policy (F5, context
+menu, DevTools), kept as an intentional UI choice. See the
 [open semantic gaps](docs/PURE_ZIG_REFACTOR.md#open-semantic-gaps)
 and the [source comparison](docs/UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
@@ -604,6 +604,27 @@ vetoed page and its bridge alive, including after navigation history changes.
 `view.close()` force-closes without invoking that veto. Pumping one window also
 services native events and accepted close requests for other windows on its UI
 thread.
+
+`Options.navigation_handler` or `setNavigationHandler(handler, user_data)`
+decides page navigations in the engine, like upstream's WebKitGTK policy
+handler, so it also sees navigations the browser bridge cannot intercept or that
+happen without a live bridge. The handler runs on the UI thread with a borrowed
+`NavigationRequest { url, kind }` and returns `false` to cancel and keep the
+current page. Without a handler every navigation proceeds.
+
+- The host's own requests (the initial load and `navigate()`) are not reported.
+- Navigations in child frames are reported too.
+- Every server redirect hop is reported as its own request, so a handler can
+  stop a redirect to another origin. WKWebView has no public redirect flag, so
+  this is the only behavior that is consistent across engines.
+- WebKitGTK and WKWebView report `link`, `form_submission`, `back_forward`,
+  `reload`, `form_resubmission`, or `other`. WebView2 reports only `reload`,
+  `back_forward`, and `other`.
+- A navigation whose URL cannot be read is cancelled.
+
+With an `onEvent` handler installed, the bridge intercepts link clicks and
+script navigations before the engine sees them; call `webui.allowNavigation(true)`
+in the page to leave those decisions to the native handler.
 
 Platform prerequisites and explicit limits:
 
