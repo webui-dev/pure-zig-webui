@@ -17,6 +17,8 @@ const iid_environment_callback = GUID.parse("{4e8a3389-c9d8-4bd2-b6b5-124fee6cc1
 const iid_controller_callback = GUID.parse("{6c4819f3-c9b7-4260-8127-c9f5bde7f68c}");
 const iid_close_callback = GUID.parse("{57213f19-00e6-49fa-8e07-898ea01ecbd2}"); // WebMessageReceived
 const iid_title_callback = GUID.parse("{f5f2b923-953e-4042-9f95-f3a118e1afd4}"); // DocumentTitleChanged
+const iid_navigation_callback = GUID.parse("{9adbe429-f36d-432b-9ddc-f8881fbd76e3}"); // (Frame)NavigationStarting
+const iid_navigation_args3 = GUID.parse("{ddffe494-4942-4bd2-ab73-35b8ff40e19f}"); // NavigationKind
 // Upper bound for environment, controller, and document-script creation.
 // Cold starts spawn the browser processes and user data folder; CI runners
 // take about 7 s for two windows and occasionally exceed 15 s.
@@ -247,6 +249,8 @@ fn EventCallback(comptime iid: GUID, comptime handle: fn (*Backend, ?*Com) void)
 
 const CloseCallback = EventCallback(iid_close_callback, closeMessage);
 const TitleCallback = EventCallback(iid_title_callback, titleChanged);
+const NavigationCallback = EventCallback(iid_navigation_callback, navigationStarting);
+const FrameNavigationCallback = EventCallback(iid_navigation_callback, frameNavigationStarting);
 
 fn closeMessage(owner: *Backend, args: ?*Com) void {
     const message_args = args orelse return;
@@ -266,6 +270,23 @@ fn titleChanged(owner: *Backend, _: ?*Com) void {
     owner.applyPageTitle();
 }
 
+fn navigationStarting(owner: *Backend, args: ?*Com) void {
+    owner.decideNavigation(args, true);
+}
+
+fn frameNavigationStarting(owner: *Backend, args: ?*Com) void {
+    owner.decideNavigation(args, false);
+}
+
+/// COREWEBVIEW2_NAVIGATION_KIND to the portable kind.
+fn navigationKind(value: i32) types.NavigationKind {
+    return switch (value) {
+        0 => .reload,
+        1 => .back_forward,
+        else => .other, // NEW_DOCUMENT: links, forms, and scripts alike
+    };
+}
+
 pub const Backend = struct {
     gpa: std.mem.Allocator,
     loader: ?*Loader = null,
@@ -280,9 +301,16 @@ pub const Backend = struct {
     close_token: ?Token = null,
     title_callback: ?*TitleCallback = null,
     title_token: ?Token = null,
+    navigation_callback: ?*NavigationCallback = null,
+    navigation_token: ?Token = null,
+    frame_navigation_callback: ?*FrameNavigationCallback = null,
+    frame_navigation_token: ?Token = null,
     follow_page_title: bool,
     close_handler: ?types.CloseHandler,
+    navigation_handler: ?types.NavigationHandler,
     user_data: ?*anyopaque,
+    // Set before each host Navigate so its own NavigationStarting is not reported.
+    host_navigation: bool = false,
     close_requested: bool = false,
     closed: bool = false,
     event_error: ?anyerror = null,
@@ -302,6 +330,7 @@ pub const Backend = struct {
         self.* = .{
             .gpa = gpa,
             .close_handler = options.close_handler,
+            .navigation_handler = options.navigation_handler,
             .user_data = options.user_data,
             .minimum = options.minimum_size,
             .resizable = options.resizable,
@@ -389,6 +418,14 @@ pub const Backend = struct {
         var title_token: Token = .{};
         try check(webview.method(46, *const fn (*Com, *TitleCallback, *Token) callconv(.winapi) HRESULT)(webview, self.title_callback.?, &title_token));
         self.title_token = title_token;
+        self.navigation_callback = try NavigationCallback.create(self);
+        var navigation_token: Token = .{};
+        try check(webview.method(7, *const fn (*Com, *NavigationCallback, *Token) callconv(.winapi) HRESULT)(webview, self.navigation_callback.?, &navigation_token));
+        self.navigation_token = navigation_token;
+        self.frame_navigation_callback = try FrameNavigationCallback.create(self);
+        var frame_navigation_token: Token = .{};
+        try check(webview.method(17, *const fn (*Com, *FrameNavigationCallback, *Token) callconv(.winapi) HRESULT)(webview, self.frame_navigation_callback.?, &frame_navigation_token));
+        self.frame_navigation_token = frame_navigation_token;
         // WindowCloseRequested is too late to guarantee veto or repeat requests;
         // Chromium can also refuse native window.close after history navigation.
         // Replace it before page scripts run, without marking the page closed.
@@ -452,6 +489,8 @@ pub const Backend = struct {
     fn releaseWebView(self: *Backend) void {
         if (self.close_callback) |callback| callback.owner = null;
         if (self.title_callback) |callback| callback.owner = null;
+        if (self.navigation_callback) |callback| callback.owner = null;
+        if (self.frame_navigation_callback) |callback| callback.owner = null;
         if (self.webview) |webview| {
             if (self.close_token) |token| {
                 _ = webview.method(35, *const fn (*Com, Token) callconv(.winapi) HRESULT)(webview, token);
@@ -460,6 +499,14 @@ pub const Backend = struct {
             if (self.title_token) |token| {
                 _ = webview.method(47, *const fn (*Com, Token) callconv(.winapi) HRESULT)(webview, token);
                 self.title_token = null;
+            }
+            if (self.navigation_token) |token| {
+                _ = webview.method(8, *const fn (*Com, Token) callconv(.winapi) HRESULT)(webview, token);
+                self.navigation_token = null;
+            }
+            if (self.frame_navigation_token) |token| {
+                _ = webview.method(18, *const fn (*Com, Token) callconv(.winapi) HRESULT)(webview, token);
+                self.frame_navigation_token = null;
             }
         }
         if (self.controller) |controller| _ = controller.closeController();
@@ -471,6 +518,10 @@ pub const Backend = struct {
         self.close_callback = null;
         if (self.title_callback) |callback| _ = TitleCallback.release(callback);
         self.title_callback = null;
+        if (self.navigation_callback) |callback| _ = NavigationCallback.release(callback);
+        self.navigation_callback = null;
+        if (self.frame_navigation_callback) |callback| _ = FrameNavigationCallback.release(callback);
+        self.frame_navigation_callback = null;
     }
 
     pub fn pump(self: *Backend) !bool {
@@ -581,7 +632,41 @@ pub const Backend = struct {
         const webview = self.webview orelse return error.NativeWindowClosed;
         const text = try std.unicode.utf8ToUtf16LeAllocZ(self.gpa, url);
         defer self.gpa.free(text);
+        self.host_navigation = true;
+        errdefer self.host_navigation = false;
         try check(webview.method(5, *const fn (*Com, [*:0]const u16) callconv(.winapi) HRESULT)(webview, text.ptr));
+    }
+    /// Like upstream's WebKitGTK policy handler, decide page and frame
+    /// navigations in the engine, independent of any bridge connection.
+    fn decideNavigation(self: *Backend, args: ?*Com, top_level: bool) void {
+        const event = args orelse return;
+        // Only the top-level navigation can be the host's own request.
+        if (top_level and self.host_navigation) {
+            self.host_navigation = false;
+            return;
+        }
+        const handler = self.navigation_handler orelse return;
+        if (self.close_requested) return;
+        // A navigation the handler cannot be asked about is cancelled.
+        if (!self.askNavigation(event, handler))
+            _ = event.method(8, *const fn (*Com, i32) callconv(.winapi) HRESULT)(event, 1); // put_Cancel
+    }
+    fn askNavigation(self: *Backend, event: *Com, handler: types.NavigationHandler) bool {
+        var uri: ?[*:0]u16 = null;
+        if (event.method(3, *const fn (*Com, *?[*:0]u16) callconv(.winapi) HRESULT)(event, &uri) < 0) return false;
+        const wide = uri orelse return false;
+        defer CoTaskMemFree(wide);
+        const url = std.unicode.utf16LeToUtf8Alloc(self.gpa, std.mem.sliceTo(wide, 0)) catch return false;
+        defer self.gpa.free(url);
+        var kind: i32 = 2; // NEW_DOCUMENT when Args3 is unavailable
+        var args3: ?*Com = null;
+        if (event.method(0, *const fn (*Com, *const GUID, *?*Com) callconv(.winapi) HRESULT)(event, &iid_navigation_args3, &args3) >= 0) {
+            if (args3) |value| {
+                defer value.release();
+                if (value.method(12, *const fn (*Com, *i32) callconv(.winapi) HRESULT)(value, &kind) < 0) kind = 2;
+            }
+        }
+        return handler(self.user_data, .{ .url = url, .kind = navigationKind(kind) });
     }
     pub fn setSize(self: *Backend, value: types.Size) !void {
         const hwnd = try self.window();
@@ -891,3 +976,10 @@ extern "user32" fn SetForegroundWindow(HWND) callconv(.winapi) i32;
 extern "user32" fn SetFocus(HWND) callconv(.winapi) ?HWND;
 extern "user32" fn InvalidateRect(HWND, ?*const RECT, i32) callconv(.winapi) i32;
 extern "user32" fn FillRect(*anyopaque, *const RECT, *anyopaque) callconv(.winapi) i32;
+
+test "WebView2 navigation kinds map to portable kinds" {
+    try std.testing.expectEqual(types.NavigationKind.reload, navigationKind(0));
+    try std.testing.expectEqual(types.NavigationKind.back_forward, navigationKind(1));
+    try std.testing.expectEqual(types.NavigationKind.other, navigationKind(2));
+    try std.testing.expectEqual(types.NavigationKind.other, navigationKind(-1));
+}
