@@ -403,6 +403,9 @@ pub const Backend = struct {
         // WebKit decides which page points count as background.
         send1(void, self.window, "setMovableByWindowBackground:", ObjcBool, yes(self.frameless and !self.kiosk));
     }
+    pub fn dragRegion(_: *const Backend) types.DragRegion {
+        return .window_background;
+    }
 
     pub fn close(self: *Backend) !void {
         if (self.closed) return;

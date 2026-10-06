@@ -544,6 +544,10 @@ pub const Backend = struct {
         self.minimum_size = value;
     }
 
+    pub fn dragRegion(_: *const Backend) types.DragRegion {
+        return .webui_property;
+    }
+
     pub fn setResizable(self: *Backend, value: bool) !void {
         self.api.gtk_window_set_resizable(try self.liveWindow(), @intFromBool(value));
         self.resizable = value;

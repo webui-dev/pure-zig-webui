@@ -11,6 +11,7 @@ pub const Size = types.Size;
 pub const Position = types.Position;
 pub const Geometry = types.Geometry;
 pub const Handle = types.Handle;
+pub const DragRegion = types.DragRegion;
 pub const CloseHandler = types.CloseHandler;
 
 const supported = switch (builtin.os.tag) {
@@ -290,6 +291,13 @@ pub const Window = struct {
     pub fn geometry(self: Window) !Geometry {
         try self.checkOpen();
         if (supported) return self.state.backend.geometry();
+        return error.UnsupportedPlatform;
+    }
+
+    /// Report how this window's pages mark areas that move the host window.
+    pub fn dragRegion(self: Window) !DragRegion {
+        try self.checkOpen();
+        if (supported) return self.state.backend.dragRegion();
         return error.UnsupportedPlatform;
     }
 

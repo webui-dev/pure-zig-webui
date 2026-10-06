@@ -634,6 +634,10 @@ pub const Backend = struct {
             return error.NativeOperationFailed;
         if (SetWindowPos(hwnd, null, 0, 0, 0, 0, 0x37) == 0) return error.NativeOperationFailed;
     }
+    pub fn dragRegion(self: *const Backend) types.DragRegion {
+        return if (self.non_client_regions) .css_app_region else .none;
+    }
+
     pub fn setResizable(self: *Backend, value: bool) !void {
         _ = try self.window();
         const old = self.resizable;

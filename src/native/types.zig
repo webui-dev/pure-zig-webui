@@ -11,6 +11,18 @@ pub const Geometry = struct {
 };
 
 /// Borrowed native window, invalid after native close or owner destruction.
+/// How pages declare areas that move the host window.
+pub const DragRegion = enum {
+    /// Elements whose computed `--webui-app-region` is `drag` (WebKitGTK).
+    webui_property,
+    /// CSS `app-region: drag` or `-webkit-app-region: drag` (WebView2).
+    css_app_region,
+    /// No page regions; a frameless window moves by its background (Cocoa).
+    window_background,
+    /// This runtime offers no page drag regions (WebView2 before Settings9).
+    none,
+};
+
 pub const Handle = union(enum) {
     cocoa: *anyopaque,
     gtk: *anyopaque,
