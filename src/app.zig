@@ -712,6 +712,8 @@ const WindowState = struct {
 
     /// Whether registry updates should notify active browser peers.
     running: std.atomic.Value(bool) = .init(false),
+    /// This window's directory monitor, cancelled on stop.
+    monitor_task: std.Io.Group = .init,
     /// Set by backend `close` calls so `Running.wait()` skips the
     /// reconnect grace period. Cleared when a new client authenticates, so a
     /// close intent never outlives this window's reconnection.
@@ -754,6 +756,7 @@ const WindowState = struct {
         std.debug.assert(self.pending_replies == 0);
         std.debug.assert(self.pending_events == 0);
         std.debug.assert(self.event_tasks.token.load(.acquire) == null);
+        std.debug.assert(self.monitor_task.token.load(.acquire) == null);
         self.pending_evals.deinit(self.gpa);
         for (self.clients.items) |*connected| {
             if (connected.multi) |*multi| multi.deinit(self.gpa);
@@ -2506,7 +2509,6 @@ pub const App = struct {
     server: ?Linsang.Server = null,
     server_io: ?std.Io = null,
     tls_auth: ?Linsang.tls.CertKeyPair = null,
-    monitor_tasks: std.Io.Group = .init,
     managed_browsers: std.ArrayList(ManagedBrowser) = .empty,
     browser_mutex: std.Io.Mutex = .init,
     started: bool = false,
@@ -2662,7 +2664,6 @@ pub const App = struct {
         std.debug.assert(!self.started);
         std.debug.assert(self.server_io == null);
         std.debug.assert(self.tls_auth == null);
-        std.debug.assert(self.monitor_tasks.token.load(.acquire) == null);
         std.debug.assert(self.managed_browsers.items.len == 0);
         self.managed_browsers.deinit(self.gpa);
         std.debug.assert(self.upgrades.items.len == 0);
@@ -2793,6 +2794,15 @@ pub const App = struct {
         self.unauthenticated_connections.store(0, .release);
         for (self.windows.items) |window|
             window.beginServing(io, self.options.startup_timeout);
+        errdefer for (self.windows.items) |window| window.monitor_task.cancel(io);
+        if (self.options.folder_monitor_interval) |interval| {
+            for (self.windows.items) |window|
+                try window.monitor_task.concurrent(io, monitorDirectory, .{
+                    window,
+                    io,
+                    interval,
+                });
+        }
         self.server = Linsang.Server.init(self.gpa, .{
             .address = self.options.address,
             .port = self.options.port,
@@ -2814,14 +2824,6 @@ pub const App = struct {
             window.running.store(false, .release);
         const inner = try self.server.?.start(io);
         self.started = true;
-        if (self.options.folder_monitor_interval) |interval| {
-            for (self.windows.items) |window|
-                self.monitor_tasks.async(io, monitorDirectory, .{
-                    window,
-                    io,
-                    interval,
-                });
-        }
         return .{ .app = self, .inner = inner };
     }
 
@@ -2997,9 +2999,10 @@ pub const Running = struct {
     pub fn stop(self: *Running) !void {
         if (self.stopped) return;
         try self.inner.stop();
-        for (self.app.windows.items) |window|
+        for (self.app.windows.items) |window| {
             window.running.store(false, .release);
-        self.app.monitor_tasks.cancel(self.inner.io);
+            window.monitor_task.cancel(self.inner.io);
+        }
         for (self.app.windows.items) |window|
             window.cancelEvents(self.inner.io);
         self.app.stopBrowsers(self.inner.io);
@@ -6725,7 +6728,10 @@ test "directory monitor reloads changed window only" {
     try disconnectTestStream(second_stream, io);
     try running.stop();
     try std.testing.expect(
-        app.monitor_tasks.token.load(.acquire) == null,
+        first_window.state.monitor_task.token.load(.acquire) == null,
+    );
+    try std.testing.expect(
+        second_window.state.monitor_task.token.load(.acquire) == null,
     );
 }
 
