@@ -49,7 +49,6 @@ is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
 | Area | Remaining behavior, not covered by existing API mappings |
 |---|---|
-| Native interaction | Missing GTK custom drag/edge resize, Windows draggable-region setup and resizable frameless host behavior, and Cocoa frameless background movement. |
 | Native page integration | No GTK engine-level navigation-policy interception independent of a live bridge. |
 | Default presentation | F5/context-menu/DevTools policy differences are intentional UI-policy candidates, not proof of missing protocol support. |
 
@@ -65,6 +64,7 @@ Closed after the rescan, each with focused tests in the same change:
 | Firefox app mode | Firefox windows without a caller profile get a generated per-window profile; before each launch it receives upstream's `chrome/userChrome.css` toolbar suppression and a rewritten `user.js` (stylesheet support, no default-browser check, close warning, tabs in title bar, or first-run pages, and the `browser.display.document_color_use` high-contrast override). Snap Firefox profiles live under the snap's user directory from the passwd home. A caller profile is never modified, so it rejects `high_contrast = false`. Tests: `generated Firefox profiles receive WebUI app-mode settings`, `Firefox windows launch with a generated app-mode profile`, `Firefox launches reject profile combinations they cannot honour`, `passwd home lookup accepts only well-formed absolute entries`. |
 | Browser discovery | Windows tells Chrome from Chromium among `PATH` and `App Paths` `chrome.exe` candidates by Google's `initial_preferences`/`master_preferences` files, like upstream, so registered Chromium is found and never mistaken for Chrome. macOS adds `~/Applications` and a side-effect-free Spotlight bundle-identifier lookup in place of upstream's Finder-revealing `open -R -a`. Tests: `Windows Chrome and Chromium installs are told apart by Google's installer files`, `macOS bundles resolve from Spotlight output`. |
 | Native page titles | Like upstream, each non-empty page title replaces the host title: GTK `notify::title`, WKWebView `title` KVO (which, unlike upstream's `didFinishNavigation`, also reports later `document.title` changes), and WebView2 `DocumentTitleChanged`. `Options.title` is the initial title and `setTitle` applies at once until the next page title; an empty title keeps the host title, while WebView2 reports its own default for untitled documents. `follow_page_title = false` or `setFollowPageTitle(false)` keeps titles host-controlled; re-enabling applies the current page title. `title()` reads the host title. Test: native smoke titles step on all three platforms. |
+| Native interaction | `native.Window.dragRegion()` reports each backend's model. WebKitGTK mirrors upstream's `--webui-app-region` script on a dedicated message channel and starts a window-manager move only while the primary button is held; resizable frameless windows resize from upstream's 6 px edge band with resize cursors. WebView2 enables Settings9 non-client regions for CSS `app-region` (reporting `.none` without Settings9), and resizable frameless windows keep `WS_THICKFRAME`. Cocoa frameless windows are movable by background, also across style and kiosk changes. Tests: native smoke frameless step with real pointer input on Linux (xdotool) and Windows (`mouse_event`): drag moves the window, a right-edge drag widens it, and on GTK a forged request without a held button does not move it; macOS reads back `isMovableByWindowBackground` because input synthesis needs Accessibility permission. `frameless resize hit-testing prefers corners within the edge band`. |
 | Entry and custom routing | `Site.entry` redirects the root to a validated relative entry file, and handlers that decline a path (empty `404`) are probed for the entry name or `index.*` with `302` redirects, for both `.site` and `.custom`. Same tests as content composition. |
 
 Borrowed custom HTTP handlers can await work before returning through `std.Io`;
@@ -372,7 +372,7 @@ external-browser launch flags.
 | `webui_set_hide()` | `App.WindowOptions.hide` for headless external browsers; `native.Options.hidden` and `native.Window.setVisible()` for native windows. |
 | `webui_minimize()`, `webui_maximize()` | `native.Window.minimize()`, `maximize()`, and `restore()`. |
 | `webui_set_resizable()`, `webui_set_minimum_size()` | `native.Options` and `native.Window.setResizable()` / `setMinimumSize()`. |
-| `webui_set_frameless()`, `webui_set_transparent()` | Native options and setters. Windows transparency configures both host composition and WebView background; X11 requires RGBA/compositing. macOS transparency is explicitly unsupported, as upstream's native adapter does not implement it. |
+| `webui_set_frameless()`, `webui_set_transparent()` | Native options and setters; `native.Window.dragRegion()` reports how pages declare drag areas. Windows transparency configures both host composition and WebView background; X11 requires RGBA/compositing. macOS transparency is explicitly unsupported, as upstream's native adapter does not implement it. |
 | `webui_show_wv()`, `webui_set_close_handler_wv()` | `native.Window.open()` plus `setCloseHandler()`. User/JavaScript close can be vetoed before destroying the page; `native.Window.close()` force-closes. |
 | WebView page-title tracking (no public upstream function) | `native.Options.follow_page_title` (default `true`), `native.Window.setFollowPageTitle()`, `setTitle()`, and `title()`. |
 | `webui_get_hwnd()`, `webui_win32_get_hwnd()` | `native.Window.handle()` returns a borrowed tagged Cocoa/Gtk/Win32 handle, invalid after close/deinit. |
@@ -565,9 +565,9 @@ This completes `webui_set_runtime()`.
 This implements `webui_show_wv()`, `webui_set_close_handler_wv()`, and native
 handles. A separate ABI/ownership review was performed for every platform;
 the public API stays Zig-native, and runtime verification remains mandatory.
-Page titles drive the host title as upstream does. This does not yet cover
-upstream native drag/edge resize or GTK navigation-policy integration; see the
-reopened semantic gaps.
+Page titles drive the host title, and frameless windows drag and edge-resize,
+as upstream does. This does not yet cover GTK navigation-policy integration;
+see the reopened semantic gaps.
 
 ### Parity closure (reopened)
 

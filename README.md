@@ -10,7 +10,7 @@ compile or link the upstream WebUI C library or CivetWeb.
 support.
 
 The core rewrite is substantial, but full upstream behavioral parity is not
-complete. A fresh source audit found gaps in native drag/resize and
+complete. A fresh source audit found a remaining gap in GTK engine-level
 navigation integration. See the
 [open semantic gaps](docs/PURE_ZIG_REFACTOR.md#open-semantic-gaps)
 and the [source comparison](docs/UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
@@ -567,6 +567,27 @@ geometry requests: `setSize`, `setPosition`, `center`, `setMinimumSize`,
 logical coordinates: content size and outer-window position (Cocoa uses its
 native lower-left origin). `handle()` returns a borrowed tagged Cocoa,
 GTK, or Win32 handle, invalid after native close or deinit.
+Frameless windows move and resize as upstream's adapters do, and
+`dragRegion()` reports how pages mark drag areas on the current backend:
+- `.webui_property` (WebKitGTK): pressing an element whose nearest
+  `--webui-app-region` value is `drag` starts a window-manager move once the
+  primary button moves; `no-drag` opts descendants out. The host honors a
+  request only while the primary button is held. Resizable frameless windows
+  resize from a 6 px edge band and show matching resize cursors.
+- `.css_app_region` (WebView2): CSS `app-region: drag` or
+  `-webkit-app-region: drag` areas act as the caption through Settings9
+  non-client regions; runtimes without Settings9 report `.none`. Resizable
+  frameless windows keep a sizing border.
+- `.window_background` (Cocoa): no CSS regions; frameless windows are movable
+  by their background where WebKit treats the point as background.
+
+Pages that target every backend declare all three properties:
+
+```css
+.titlebar { --webui-app-region: drag; app-region: drag; -webkit-app-region: drag; }
+.titlebar button { --webui-app-region: no-drag; app-region: no-drag; -webkit-app-region: no-drag; }
+```
+
 
 Like upstream, each non-empty page title replaces the host window title,
 including later `document.title` changes. `Options.title` is the initial title
@@ -619,7 +640,9 @@ External-browser examples warn and shut down when no browser connects.
 
 `zig build fuzz --fuzz=100K` exercises bounded protocol parsers. CI installs
 Node, Deno, and Bun, runs the core and bridge suites, executes native smoke gates
-on Linux/macOS/Windows, and cross-builds all five ledger targets.
+on Linux/macOS/Windows (with xdotool or `mouse_event` pointer input for
+frameless drag and resize on Linux and Windows), and cross-builds all five
+ledger targets.
 
 The [capability ledger](docs/PURE_ZIG_REFACTOR.md) records implemented behavior,
 open semantic gaps, and dated cross-platform validation evidence. The earlier
