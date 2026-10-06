@@ -4132,7 +4132,7 @@ test "wait keeps per-window close intent and honours exit requests" {
         const reloaded = try connectTestWebSocket(running.inner.address, io, &second.state.capability);
         defer reloaded.close(io);
         try std.testing.expect(try authenticateTestClient(reloaded, io, gpa, second.state.token, &second.state.capability, &response_buffer));
-        try std.testing.expect(second.isShown(io));
+        try waitForShown(second, io);
 
         const started = std.Io.Clock.Timestamp.now(io, .awake);
         try disconnectTestStream(reloaded, io);
@@ -4866,6 +4866,16 @@ fn disconnectTestStream(stream: std.Io.net.Stream, io: std.Io) !void {
         error.SocketUnconnected => {},
         else => return err,
     };
+}
+
+/// The server answers CHECK_TOKEN before it registers the client, so a
+/// test that just authenticated must wait for the registration.
+fn waitForShown(window: Window, io: std.Io) !void {
+    for (0..2000) |_| {
+        if (window.isShown(io)) return;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return error.Timeout;
 }
 
 fn waitForFlag(io: std.Io, flag: *const std.atomic.Value(bool)) !void {
@@ -7707,7 +7717,7 @@ test "multi-client limits, targeting, and disconnect lifecycle" {
         &window.state.capability,
         &first_response,
     ));
-    try std.testing.expect(window.isShown(io));
+    try waitForShown(window, io);
 
     var packet: std.ArrayList(u8) = .empty;
     defer packet.deinit(gpa);
