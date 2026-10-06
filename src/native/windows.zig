@@ -193,51 +193,67 @@ const ScriptCompletion = struct {
     }
 };
 
-const CloseCallback = struct {
-    vtable: *const Vtable = &vtable_value,
-    refs: std.atomic.Value(u32) = .init(1),
-    owner: ?*Backend,
-    const Vtable = extern struct {
-        query: *const fn (*CloseCallback, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
-        add_ref: *const fn (*CloseCallback) callconv(.winapi) u32,
-        release: *const fn (*CloseCallback) callconv(.winapi) u32,
-        invoke: *const fn (*CloseCallback, ?*Com, ?*Com) callconv(.winapi) HRESULT,
-    };
-    const vtable_value: Vtable = .{ .query = query, .add_ref = addRef, .release = release, .invoke = invoke };
-    fn query(self: *CloseCallback, iid: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT {
-        out.* = null;
-        if (!std.mem.eql(u8, std.mem.asBytes(iid), std.mem.asBytes(&iid_close_callback)) and
-            !std.mem.eql(u8, std.mem.asBytes(iid), std.mem.asBytes(&iid_unknown)))
-            return @bitCast(@as(u32, 0x80004002));
-        out.* = self;
-        _ = addRef(self);
-        return 0;
-    }
-    fn addRef(self: *CloseCallback) callconv(.winapi) u32 {
-        return self.refs.fetchAdd(1, .monotonic) + 1;
-    }
-    fn release(self: *CloseCallback) callconv(.winapi) u32 {
-        const remaining = self.refs.fetchSub(1, .acq_rel) - 1;
-        if (remaining == 0) std.heap.page_allocator.destroy(self);
-        return remaining;
-    }
-    fn invoke(self: *CloseCallback, _: ?*Com, args: ?*Com) callconv(.winapi) HRESULT {
-        const owner = self.owner orelse return 0;
-        if (owner.closed) return 0;
-        const message_args = args orelse return 0;
-        var text: ?[*:0]u16 = null;
-        const status = message_args.method(5, *const fn (*Com, *?[*:0]u16) callconv(.winapi) HRESULT)(message_args, &text);
-        defer if (text) |value| CoTaskMemFree(value);
-        if (status < 0) return 0; // Other application messages need not be strings.
-        const value = text orelse return 0;
-        // Fixed command only, with bounded comparison and no URL/code evaluation.
-        for (close_message, 0..) |character, index| {
-            if (value[index] != character) return 0;
+// ICoreWebView2 event handlers. Each is retained by the runtime per COM rules
+// and outlives Backend: releaseWebView clears `owner` before removal.
+fn EventCallback(comptime iid: GUID, comptime handle: fn (*Backend, ?*Com) void) type {
+    return struct {
+        const Self = @This();
+        vtable: *const Vtable = &vtable_value,
+        refs: std.atomic.Value(u32) = .init(1),
+        owner: ?*Backend,
+        const Vtable = extern struct {
+            query: *const fn (*Self, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+            add_ref: *const fn (*Self) callconv(.winapi) u32,
+            release: *const fn (*Self) callconv(.winapi) u32,
+            invoke: *const fn (*Self, ?*Com, ?*Com) callconv(.winapi) HRESULT,
+        };
+        const vtable_value: Vtable = .{ .query = query, .add_ref = addRef, .release = release, .invoke = invoke };
+        fn create(owner: *Backend) !*Self {
+            const self = try std.heap.page_allocator.create(Self);
+            self.* = .{ .owner = owner };
+            return self;
         }
-        if (value[close_message.len] == 0) owner.close_requested = true;
-        return 0;
+        fn query(self: *Self, requested: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT {
+            out.* = null;
+            if (!std.mem.eql(u8, std.mem.asBytes(requested), std.mem.asBytes(&iid)) and
+                !std.mem.eql(u8, std.mem.asBytes(requested), std.mem.asBytes(&iid_unknown)))
+                return @bitCast(@as(u32, 0x80004002));
+            out.* = self;
+            _ = addRef(self);
+            return 0;
+        }
+        fn addRef(self: *Self) callconv(.winapi) u32 {
+            return self.refs.fetchAdd(1, .monotonic) + 1;
+        }
+        fn release(self: *Self) callconv(.winapi) u32 {
+            const remaining = self.refs.fetchSub(1, .acq_rel) - 1;
+            if (remaining == 0) std.heap.page_allocator.destroy(self);
+            return remaining;
+        }
+        fn invoke(self: *Self, _: ?*Com, args: ?*Com) callconv(.winapi) HRESULT {
+            const owner = self.owner orelse return 0;
+            if (owner.closed) return 0;
+            handle(owner, args);
+            return 0;
+        }
+    };
+}
+
+const CloseCallback = EventCallback(iid_close_callback, closeMessage);
+
+fn closeMessage(owner: *Backend, args: ?*Com) void {
+    const message_args = args orelse return;
+    var text: ?[*:0]u16 = null;
+    const status = message_args.method(5, *const fn (*Com, *?[*:0]u16) callconv(.winapi) HRESULT)(message_args, &text);
+    defer if (text) |value| CoTaskMemFree(value);
+    if (status < 0) return; // Other application messages need not be strings.
+    const value = text orelse return;
+    // Fixed command only, with bounded comparison and no URL/code evaluation.
+    for (close_message, 0..) |character, index| {
+        if (value[index] != character) return;
     }
-};
+    if (value[close_message.len] == 0) owner.close_requested = true;
+}
 
 pub const Backend = struct {
     gpa: std.mem.Allocator,
@@ -339,8 +355,7 @@ pub const Backend = struct {
         defer script_settings.release();
         try check(script_settings.method(4, *const fn (*Com, i32) callconv(.winapi) HRESULT)(script_settings, 1));
         try check(script_settings.method(6, *const fn (*Com, i32) callconv(.winapi) HRESULT)(script_settings, 1));
-        self.close_callback = try std.heap.page_allocator.create(CloseCallback);
-        self.close_callback.?.* = .{ .owner = self };
+        self.close_callback = try CloseCallback.create(self);
         var token: Token = .{};
         try check(webview.method(34, *const fn (*Com, *CloseCallback, *Token) callconv(.winapi) HRESULT)(webview, self.close_callback.?, &token));
         self.close_token = token;
