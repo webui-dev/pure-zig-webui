@@ -41,9 +41,13 @@ pub const Limits = struct {
     max_script_size: usize = 256 << 10,
     /// Maximum output captured from a `Runtime` interpreter per request.
     max_runtime_output: usize = 16 << 20,
+    /// Maximum `Cookie` header retained per connection for callbacks.
+    /// Larger WebSocket upgrades are answered with 431.
+    max_cookie_size: usize = 8 << 10,
 
     fn validate(self: Limits) !void {
-        if (self.max_runtime_output == 0) return error.InvalidLimits;
+        if (self.max_runtime_output == 0 or self.max_cookie_size == 0)
+            return error.InvalidLimits;
         const max_payload = self.max_ws_message_size -| protocol.header_len;
         if (self.max_connections == 0 or
             self.max_unauthenticated_connections == 0 or
@@ -128,7 +132,39 @@ pub const Event = struct {
     /// Element ID for clicks, URL for navigation, and empty for lifecycle
     /// events. The slice is only valid for the duration of the handler.
     data: []const u8 = "",
+    /// Raw `Cookie` header the client sent with its WebSocket upgrade, like
+    /// upstream `webui_event_t.cookies`. Valid for the handler duration.
+    cookies: []const u8 = "",
+
+    /// Value of one cookie from `cookies`, or null when absent.
+    pub fn cookie(self: *const Event, name: []const u8) ?[]const u8 {
+        return cookieValue(self.cookies, name);
+    }
 };
+
+/// How a binding handler was reached.
+pub const CallOrigin = enum {
+    /// An explicit JavaScript call, such as `webui.call(name, ...)`.
+    call,
+    /// A DOM click on an element whose ID is the binding name.
+    click,
+};
+
+/// Parse one cookie from a raw `Cookie` header value.
+fn cookieValue(header: []const u8, name: []const u8) ?[]const u8 {
+    var pairs = std.mem.splitScalar(u8, header, ';');
+    while (pairs.next()) |pair| {
+        const trimmed = std.mem.trim(u8, pair, " \t");
+        const separator = std.mem.indexOfScalar(u8, trimmed, '=') orelse
+            continue;
+        if (std.mem.eql(
+            u8,
+            std.mem.trim(u8, trimmed[0..separator], " \t"),
+            name,
+        )) return std.mem.trim(u8, trimmed[separator + 1 ..], " \t");
+    }
+    return null;
+}
 
 pub const ResourceHandler = *const fn (
     path: []const u8,
@@ -616,6 +652,8 @@ const WindowState = struct {
         next: ?*HandlerTask = null,
         target: Client,
         data: []u8,
+        /// Owned snapshot of the connection's `Cookie` header.
+        cookies: []u8,
         call: ?struct { header: protocol.Header, binding: Binding } = null,
         kind: EventKind = .click,
         click_binding: ?Binding = null,
@@ -1160,10 +1198,14 @@ const WindowState = struct {
         header: protocol.Header,
         binding_value: Binding,
         arguments: []const []const u8,
+        cookies: []const u8,
     ) void {
         var call: Call = .{
             .gpa = self.gpa,
             .client = target,
+            .name = binding_value.name,
+            .origin = .call,
+            .cookies = cookies,
             .arguments = arguments,
             .io = io,
             .reply_header = header,
@@ -1181,18 +1223,20 @@ const WindowState = struct {
         try io.checkCancel();
         if (task.call) |call| {
             const decoded = protocol.decodeCall(task.data) catch return;
-            self.invokeCall(io, task.target, call.header, call.binding, decoded.slice());
+            self.invokeCall(io, task.target, call.header, call.binding, decoded.slice(), task.cookies);
         } else {
             self.invokeEvent(io, .{
                 .kind = task.kind,
                 .client = task.target,
                 .data = task.data,
+                .cookies = task.cookies,
             }, task.click_binding, task.registered);
         }
     }
 
     fn destroyHandler(self: *WindowState, io: std.Io, task: *HandlerTask) void {
         self.gpa.free(task.data);
+        self.gpa.free(task.cookies);
         self.gpa.destroy(task);
         self.releaseEvent(io);
     }
@@ -1235,18 +1279,22 @@ const WindowState = struct {
         binding_value: Binding,
         decoded: *const protocol.CallPayload,
         payload: []const u8,
+        cookies: []const u8,
     ) !void {
         _ = decoded;
         try self.reserveEvent(io);
         errdefer self.releaseEvent(io);
         const task = try self.gpa.create(HandlerTask);
         errdefer self.gpa.destroy(task);
+        const data = try self.gpa.dupe(u8, payload);
+        errdefer self.gpa.free(data);
         task.* = .{
             .target = target,
-            .data = try self.gpa.dupe(u8, payload),
+            .data = data,
+            .cookies = try self.gpa.dupe(u8, cookies),
             .call = .{ .header = header, .binding = binding_value },
         };
-        errdefer self.gpa.free(task.data);
+        errdefer self.gpa.free(task.cookies);
         try self.scheduleHandler(io, task);
     }
 
@@ -1269,6 +1317,9 @@ const WindowState = struct {
             var call: Call = .{
                 .gpa = self.gpa,
                 .client = event.client,
+                .name = binding_value.name,
+                .origin = .click,
+                .cookies = event.cookies,
                 .io = io,
                 .arguments = &.{},
             };
@@ -1291,14 +1342,17 @@ const WindowState = struct {
         errdefer self.releaseEvent(io);
         const task = try self.gpa.create(HandlerTask);
         errdefer self.gpa.destroy(task);
+        const data = try self.gpa.dupe(u8, event.data);
+        errdefer self.gpa.free(data);
         task.* = .{
             .target = event.client,
-            .data = try self.gpa.dupe(u8, event.data),
+            .data = data,
+            .cookies = try self.gpa.dupe(u8, event.cookies),
             .kind = event.kind,
             .click_binding = click_binding,
             .registered = registered,
         };
-        errdefer self.gpa.free(task.data);
+        errdefer self.gpa.free(task.cookies);
         try self.scheduleHandler(io, task);
     }
 
@@ -1646,6 +1700,13 @@ pub const PendingReply = struct {
 pub const Call = struct {
     gpa: std.mem.Allocator,
     client: Client,
+    /// Binding name that selected this handler; for clicks, the element ID.
+    /// Valid for the handler duration.
+    name: []const u8 = "",
+    origin: CallOrigin = .call,
+    /// Raw `Cookie` header from the client's WebSocket upgrade, bounded by
+    /// `Limits.max_cookie_size`. Valid for the handler duration.
+    cookies: []const u8 = "",
     arguments: []const []const u8,
     response: std.ArrayList(u8) = .empty,
     io: ?std.Io = null,
@@ -1655,6 +1716,11 @@ pub const Call = struct {
 
     fn deinit(self: *Call) void {
         self.response.deinit(self.gpa);
+    }
+
+    /// Value of one cookie from `cookies`, or null when absent.
+    pub fn cookie(self: *const Call, name: []const u8) ?[]const u8 {
+        return cookieValue(self.cookies, name);
     }
 
     pub fn bytes(self: *const Call, index: usize) ![]const u8 {
@@ -2353,17 +2419,43 @@ pub const App = struct {
         key: usize,
         window: *WindowState,
         authenticated: bool = false,
+        /// Owned copy of the upgrade request's `Cookie` header.
+        cookies: []u8,
     };
 
-    fn admitUpgrade(self: *App, io: std.Io, key: usize, window: *WindowState) !void {
+    fn admitUpgrade(
+        self: *App,
+        io: std.Io,
+        key: usize,
+        window: *WindowState,
+        cookies: []const u8,
+    ) !void {
+        if (cookies.len > self.options.limits.max_cookie_size)
+            return error.CookieTooLarge;
+        const owned = try self.gpa.dupe(u8, cookies);
+        errdefer self.gpa.free(owned);
         self.upgrade_mutex.lockUncancelable(io);
         defer self.upgrade_mutex.unlock(io);
         if (self.upgrades.items.len >= self.options.limits.max_connections or
             self.unauthenticated_connections.load(.acquire) >=
                 self.options.limits.max_unauthenticated_connections)
             return error.ClientLimitReached;
-        try self.upgrades.append(self.gpa, .{ .key = key, .window = window });
+        try self.upgrades.append(self.gpa, .{
+            .key = key,
+            .window = window,
+            .cookies = owned,
+        });
         _ = self.unauthenticated_connections.fetchAdd(1, .acq_rel);
+    }
+
+    /// Cookies of one upgraded connection. Only that connection's callbacks
+    /// remove its record, so the slice stays valid for the calling callback.
+    fn upgradeCookies(self: *App, io: std.Io, key: usize) []const u8 {
+        self.upgrade_mutex.lockUncancelable(io);
+        defer self.upgrade_mutex.unlock(io);
+        for (self.upgrades.items) |upgrade|
+            if (upgrade.key == key) return upgrade.cookies;
+        return "";
     }
 
     fn authorizedWindow(self: *App, io: std.Io, key: usize) ?*WindowState {
@@ -2386,7 +2478,8 @@ pub const App = struct {
         }
     }
 
-    fn removeUpgrade(self: *App, io: std.Io, key: usize) ?*WindowState {
+    /// Remove one upgrade record; the caller frees its `cookies`.
+    fn removeUpgrade(self: *App, io: std.Io, key: usize) ?Upgrade {
         self.upgrade_mutex.lockUncancelable(io);
         defer self.upgrade_mutex.unlock(io);
         for (self.upgrades.items, 0..) |upgrade, index| {
@@ -2396,7 +2489,7 @@ pub const App = struct {
                 const previous = self.unauthenticated_connections.fetchSub(1, .acq_rel);
                 std.debug.assert(previous > 0);
             }
-            return upgrade.window;
+            return upgrade;
         }
         // Rejected opens, including allocation failure, never owned admission.
         return null;
@@ -2946,22 +3039,7 @@ fn originAllowed(
 }
 
 fn requestCookie(request: *const Linsang.Request, name: []const u8) ?[]const u8 {
-    var pairs = std.mem.splitScalar(
-        u8,
-        request.header("cookie") orelse return null,
-        ';',
-    );
-    while (pairs.next()) |pair| {
-        const trimmed = std.mem.trim(u8, pair, " \t");
-        const separator = std.mem.indexOfScalar(u8, trimmed, '=') orelse
-            continue;
-        if (std.mem.eql(
-            u8,
-            std.mem.trim(u8, trimmed[0..separator], " \t"),
-            name,
-        )) return std.mem.trim(u8, trimmed[separator + 1 ..], " \t");
-    }
-    return null;
+    return cookieValue(request.header("cookie") orelse return null, name);
 }
 
 fn cookieAllowed(
@@ -3292,6 +3370,12 @@ fn onRequest(
             response.status = .forbidden;
             return .respond;
         }
+        if (request.header("cookie")) |cookies| {
+            if (cookies.len > window.limits.max_cookie_size) {
+                response.status = @enumFromInt(431);
+                return .respond;
+            }
+        }
         return .upgrade;
     }
     const admitted = cookieAdmit(app, window, request, response) catch
@@ -3432,13 +3516,19 @@ fn onOpen(connection: *Linsang.Connection, user_data: ?*anyopaque) void {
         .raw = .fromSeconds(5),
     }));
     // Linsang guarantees req remains valid through this callback. Copy only
-    // stable identity: no request/header/path slice survives the callback.
+    // stable identity and a bounded cookie copy: no request/header/path slice
+    // survives the callback.
     const resolved = route(app, connection.req.path) orelse {
         connection.wsClose(.policy_violation, "");
         return;
     };
-    app.admitUpgrade(connection.io, @intFromPtr(connection), resolved.window) catch |err| {
-        connection.wsClose(if (err == error.ClientLimitReached) @enumFromInt(1013) else .internal_error, "");
+    const cookies = connection.req.header("cookie") orelse "";
+    app.admitUpgrade(connection.io, @intFromPtr(connection), resolved.window, cookies) catch |err| {
+        connection.wsClose(switch (err) {
+            error.ClientLimitReached => @enumFromInt(1013),
+            error.CookieTooLarge => .policy_violation,
+            else => .internal_error,
+        }, "");
     };
 }
 
@@ -3508,6 +3598,7 @@ fn onMessage(
             window.dispatchEvent(connection.io, .{
                 .kind = .connected,
                 .client = client,
+                .cookies = app.upgradeCookies(connection.io, @intFromPtr(connection)),
             }) catch |err|
                 window.log(.err, "WebUI event dispatch failed: {}", .{err});
         }
@@ -3583,6 +3674,7 @@ fn onMessage(
                 binding,
                 &decoded,
                 packet.payload,
+                app.upgradeCookies(connection.io, @intFromPtr(connection)),
             ) catch {
                 send(connection, app.gpa, packet.header, "") catch {};
             };
@@ -3614,6 +3706,7 @@ fn onMessage(
                     .navigation,
                 .client = client,
                 .data = data,
+                .cookies = app.upgradeCookies(connection.io, @intFromPtr(connection)),
             }) catch |err|
                 window.log(.err, "WebUI event dispatch failed: {}", .{err});
         },
@@ -3623,11 +3716,14 @@ fn onMessage(
 
 fn onClose(connection: *Linsang.Connection, user_data: ?*anyopaque) void {
     const app = appFrom(user_data);
-    const window = app.removeUpgrade(connection.io, @intFromPtr(connection)) orelse return;
+    const upgrade = app.removeUpgrade(connection.io, @intFromPtr(connection)) orelse return;
+    defer app.gpa.free(upgrade.cookies);
+    const window = upgrade.window;
     if (window.disconnected(connection)) |client| {
         window.dispatchEvent(connection.io, .{
             .kind = .disconnected,
             .client = client,
+            .cookies = upgrade.cookies,
         }) catch |err|
             window.log(.err, "WebUI event dispatch failed: {}", .{err});
     }
@@ -3816,6 +3912,138 @@ test "wait keeps per-window close intent and honours exit requests" {
         try std.testing.expect(started.untilNow(io).raw.toMilliseconds() < 1000);
         try running.wait();
     }
+}
+
+const MetadataCapture = struct {
+    name: [32]u8 = undefined,
+    name_len: usize = 0,
+    origin: CallOrigin = .call,
+    session: [32]u8 = undefined,
+    session_len: usize = 0,
+    calls: std.atomic.Value(u32) = .init(0),
+    connected_theme: std.atomic.Value(bool) = .init(false),
+    disconnected_theme: std.atomic.Value(bool) = .init(false),
+
+    fn handler(call: *Call, user_data: ?*anyopaque) !void {
+        const capture: *MetadataCapture = @ptrCast(@alignCast(user_data.?));
+        @memcpy(capture.name[0..call.name.len], call.name);
+        capture.name_len = call.name.len;
+        capture.origin = call.origin;
+        const session = call.cookie("session") orelse "";
+        @memcpy(capture.session[0..session.len], session);
+        capture.session_len = session.len;
+        if (call.origin == .call) try call.reply(call.name);
+        _ = capture.calls.fetchAdd(1, .release);
+    }
+
+    fn onEvent(event: *const Event, user_data: ?*anyopaque) !void {
+        const capture: *MetadataCapture = @ptrCast(@alignCast(user_data.?));
+        const dark = std.mem.eql(u8, event.cookie("theme") orelse "", "dark");
+        switch (event.kind) {
+            .connected => capture.connected_theme.store(dark, .release),
+            .disconnected => capture.disconnected_theme.store(dark, .release),
+            else => {},
+        }
+    }
+
+    fn expect(capture: *MetadataCapture, io: std.Io, calls: u32, name: []const u8, origin: CallOrigin) !void {
+        for (0..1000) |_| {
+            if (capture.calls.load(.acquire) >= calls) break;
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(calls, capture.calls.load(.acquire));
+        try std.testing.expectEqualStrings(name, capture.name[0..capture.name_len]);
+        try std.testing.expectEqual(origin, capture.origin);
+        try std.testing.expectEqualStrings("abc", capture.session[0..capture.session_len]);
+    }
+};
+
+test "calls and events expose binding name, origin, and bounded cookies" {
+    try requireSocketIntegration();
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var capture: MetadataCapture = .{};
+    var app = App.init(gpa, .{ .limits = .{ .max_cookie_size = 64 } });
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "metadata" } });
+    try window.bind(io, "explicit", MetadataCapture.handler, &capture);
+    try window.bind(io, "button", MetadataCapture.handler, &capture);
+    try window.onEvent(io, MetadataCapture.onEvent, &capture);
+    var running = try app.start(io);
+    defer running.stop() catch {};
+
+    // Oversized cookie headers are refused before the upgrade.
+    try std.testing.expectError(error.WebSocketUpgradeFailed, connectTestWebSocketHeaders(
+        running.inner.address,
+        io,
+        &window.state.capability,
+        "http://localhost",
+        "Cookie: session=" ++ "x" ** 64 ++ "\r\n",
+    ));
+
+    const stream = try connectTestWebSocketHeaders(
+        running.inner.address,
+        io,
+        &window.state.capability,
+        "http://localhost",
+        "Cookie: session=abc; theme=dark\r\n",
+    );
+    defer stream.close(io);
+    var wire: [256]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &wire));
+    for (0..1000) |_| {
+        if (capture.connected_theme.load(.acquire)) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(capture.connected_theme.load(.acquire));
+
+    var packet: std.ArrayList(u8) = .empty;
+    defer packet.deinit(gpa);
+    try protocol.append(&packet, gpa, .{
+        .token = window.state.token,
+        .id = 4,
+        .command = .call,
+    }, "explicit\x00\x00");
+    try sendClientFrame(stream, io, packet.items);
+    const reply = try protocol.decode(try readServerFrame(stream, io, &wire));
+    try std.testing.expectEqual(protocol.Command.call, reply.header.command);
+    try std.testing.expectEqualStrings("explicit", reply.payload);
+    try capture.expect(io, 1, "explicit", .call);
+
+    packet.clearRetainingCapacity();
+    try protocol.append(&packet, gpa, .{
+        .token = window.state.token,
+        .command = .click,
+    }, "button");
+    try sendClientFrame(stream, io, packet.items);
+    try capture.expect(io, 2, "button", .click);
+
+    try stream.shutdown(io, .both);
+    for (0..1000) |_| {
+        if (capture.disconnected_theme.load(.acquire)) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(capture.disconnected_theme.load(.acquire));
+}
+
+test "cookie values parse from raw headers" {
+    try std.testing.expectEqualStrings("abc", cookieValue("session=abc; theme=dark", "session").?);
+    try std.testing.expectEqualStrings("dark", cookieValue(" session = abc ;theme= dark ", "theme").?);
+    try std.testing.expectEqualStrings("", cookieValue("empty=; other=1", "empty").?);
+    try std.testing.expect(cookieValue("sessionid=1; flag", "session") == null);
+    try std.testing.expect(cookieValue("", "session") == null);
+    const call: Call = .{
+        .gpa = std.testing.allocator,
+        .client = undefined,
+        .arguments = &.{},
+        .cookies = "a=1; b=2",
+    };
+    try std.testing.expectEqualStrings("2", call.cookie("b").?);
+    try std.testing.expectEqual(CallOrigin.call, call.origin);
+    const event: Event = .{ .kind = .click, .client = undefined, .cookies = "a=1" };
+    try std.testing.expectEqualStrings("1", event.cookie("a").?);
 }
 
 test "application logger receives level, message, and user data" {
@@ -4570,9 +4798,6 @@ fn connectTestWebSocketOriginCookie(
     origin: []const u8,
     cookie: ?[]const u8,
 ) !std.Io.net.Stream {
-    const stream = try address.connect(io, .{ .mode = .stream });
-    errdefer stream.close(io);
-    var request: [512]u8 = undefined;
     var cookie_buffer: [cookie_name.len + cookie_len + 12]u8 = undefined;
     const cookie_header = if (cookie) |value|
         try std.fmt.bufPrint(
@@ -4582,6 +4807,19 @@ fn connectTestWebSocketOriginCookie(
         )
     else
         "";
+    return connectTestWebSocketHeaders(address, io, capability, origin, cookie_header);
+}
+/// Upgrade with caller-provided extra header lines, each ending in CRLF.
+fn connectTestWebSocketHeaders(
+    address: std.Io.net.IpAddress,
+    io: std.Io,
+    capability: []const u8,
+    origin: []const u8,
+    cookie_header: []const u8,
+) !std.Io.net.Stream {
+    const stream = try address.connect(io, .{ .mode = .stream });
+    errdefer stream.close(io);
+    var request: [1024]u8 = undefined;
     try writeAll(
         stream,
         io,
@@ -7686,17 +7924,28 @@ test "upgrade admission owns only accepted connections and removes every state" 
     defer app.deinit();
     const first = try app.createWindow(.{ .content = .{ .html = "first" } });
     const second = try app.createWindow(.{ .content = .{ .html = "second" } });
-    try app.admitUpgrade(io, 1, first.state);
-    try std.testing.expectError(error.ClientLimitReached, app.admitUpgrade(io, 2, second.state));
-    try std.testing.expect(app.removeUpgrade(io, 2) == null);
+    const removedWindow = struct {
+        fn take(owner: *App, key: usize) ?*WindowState {
+            const upgrade = owner.removeUpgrade(std.testing.io, key) orelse return null;
+            owner.gpa.free(upgrade.cookies);
+            return upgrade.window;
+        }
+    }.take;
+    try app.admitUpgrade(io, 1, first.state, "session=one; theme=dark");
+    try std.testing.expectError(error.ClientLimitReached, app.admitUpgrade(io, 2, second.state, ""));
+    try std.testing.expect(removedWindow(&app, 2) == null);
     try std.testing.expect(app.authorizedWindow(io, 1) == first.state);
+    try std.testing.expectEqualStrings("session=one; theme=dark", app.upgradeCookies(io, 1));
+    try std.testing.expectEqualStrings("", app.upgradeCookies(io, 2));
     app.authenticatedUpgrade(io, 1);
     app.authenticatedUpgrade(io, 1);
-    try app.admitUpgrade(io, 2, second.state);
-    try std.testing.expect(app.removeUpgrade(io, 1) == first.state);
-    try std.testing.expect(app.removeUpgrade(io, 2) == second.state);
-    try app.admitUpgrade(io, 3, first.state);
-    _ = app.removeUpgrade(io, 3);
+    try app.admitUpgrade(io, 2, second.state, "");
+    try std.testing.expect(removedWindow(&app, 1) == first.state);
+    try std.testing.expect(removedWindow(&app, 2) == second.state);
+    const oversized = [_]u8{'a'} ** ((Limits{}).max_cookie_size + 1);
+    try std.testing.expectError(error.CookieTooLarge, app.admitUpgrade(io, 3, first.state, &oversized));
+    try app.admitUpgrade(io, 3, first.state, oversized[0 .. oversized.len - 1]);
+    _ = removedWindow(&app, 3);
     try std.testing.expectEqual(@as(usize, 0), app.unauthenticated_connections.load(.acquire));
 }
 
@@ -7823,8 +8072,8 @@ fn upgradeAllocationFailures(gpa: std.mem.Allocator) !void {
     var app = App.init(gpa, .{});
     defer app.deinit();
     const window = try app.createWindow(.{ .content = .{ .html = "admission allocation" } });
-    try app.admitUpgrade(std.testing.io, 1, window.state);
-    defer _ = app.removeUpgrade(std.testing.io, 1);
+    try app.admitUpgrade(std.testing.io, 1, window.state, "session=allocation");
+    defer if (app.removeUpgrade(std.testing.io, 1)) |upgrade| gpa.free(upgrade.cookies);
 }
 
 test "upgrade allocation failures do not retain admission ownership" {

@@ -7,6 +7,7 @@ pub const Window = @import("app.zig").Window;
 pub const Client = @import("app.zig").Client;
 pub const Running = @import("app.zig").Running;
 pub const Call = @import("app.zig").Call;
+pub const CallOrigin = @import("app.zig").CallOrigin;
 pub const PendingReply = @import("app.zig").PendingReply;
 pub const Handler = @import("app.zig").Handler;
 pub const Logger = @import("app.zig").Logger;

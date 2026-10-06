@@ -52,7 +52,6 @@ is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 | Content composition | Embedded HTML plus disk assets and a custom override/fallthrough handler cannot be composed; resource-only replacement currently replaces page content and navigates. |
 | Entry and custom routing | No configured local entry file; custom handlers lack virtual-directory index probing. Physical directory index precedence and 302 redirects are fixed in this rescan. |
 | Live window lifecycle | `createWindow` rejects after start; no independent destroy/unregister/reclaim while other windows run. `close` is not a replacement for `destroy`. |
-| Callback metadata | Named `Call` does not expose its binding name or click-vs-explicit-call origin; callbacks cannot access a bounded snapshot of the connection's cookies. |
 | Firefox app mode | No generated Firefox app profile/userChrome.css or managed preference setup. Existing caller-profile support and explicit high-contrast error do not implement those capabilities. |
 | Browser discovery | Registered Windows Chromium using `chrome.exe` and macOS bundles outside the fixed application directories lack upstream discovery paths. |
 | Native interaction | Missing GTK custom drag/edge resize, Windows draggable-region setup and resizable frameless host behavior, and Cocoa frameless background movement. |
@@ -64,6 +63,7 @@ Closed after the rescan, each with focused tests in the same change:
 | Area | Resolution |
 |---|---|
 | Wait lifecycle | Close intent, reconnect grace, and first-connection waiting are per window; `startup_timeout` and `Running.requestExit()` give the initial wait upstream's timeout and `webui_exit` completion. Tests: `wait state tracks startup, activity, reconnect grace, and close per window`, `wait keeps per-window close intent and honours exit requests`. |
+| Callback metadata | `Call.name`, `Call.origin` (`.call` or `.click`), and `Call.cookies`/`Event.cookies` with `cookie(name)` expose the binding name, call origin, and the upgrade's `Cookie` header, copied per connection under `Limits.max_cookie_size` (oversized upgrades answer `431`). Tests: `calls and events expose binding name, origin, and bounded cookies`, `cookie values parse from raw headers`, `upgrade admission owns only accepted connections and removes every state`. |
 
 Borrowed custom HTTP handlers can await work before returning through `std.Io`;
 there is no owned post-return HTTP reply handle. This is an explicit Zig task
@@ -335,6 +335,7 @@ protocol input never panics.
 | `window.show(content)` | Set initial content and call `window.open()`; use `window.setContent()` while running. |
 | `window.bind()` / `binding()` | `window.bind(io, name, handler, user_data)` |
 | `Event.get*At()` | `Call.string/int/float/bool/bytes(index)` |
+| `Event.element`, `Event.event_type`, `Event.cookies` | `Call.name`, `Call.origin`, `Call.cookies`/`Call.cookie(name)`; `Event.data`, `Event.kind`, `Event.cookies` for event handlers. |
 | `Event.return*()` | `Call.reply*()` |
 | `window.run()` | `Window.eval()` |
 | `Event.runClient()` | `Call.client.eval()` |

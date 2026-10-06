@@ -329,6 +329,16 @@ Non-conflicting binding names also expose `webui.<name>(...)`; core and inherite
 properties are never overwritten, and `webui.call(name, ...)` always remains
 available.
 
+Inside a binding handler, `Call.name` is the binding name that matched and
+`Call.origin` is `.call` for an explicit JavaScript call or `.click` for a DOM
+click on the element with that ID; click handlers have no arguments and their
+reply is not sent. `Call.cookies` and `Event.cookies` hold the raw `Cookie`
+header the client sent with its WebSocket upgrade, like upstream
+`webui_event_t.cookies`; `Call.cookie(name)` and `Event.cookie(name)` return one
+value. These slices are valid only for the handler duration. Upgrades whose
+`Cookie` header exceeds `Limits.max_cookie_size` (8 KiB by default) are
+answered with `431` instead of being truncated.
+
 For a click, the general event handler runs before the named binding, using the
 same registration snapshot and scheduled task in both event modes.
 
