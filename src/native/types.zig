@@ -10,6 +10,18 @@ pub const Geometry = struct {
     size: Size,
 };
 
+/// How pages declare areas that move the host window.
+pub const DragRegion = enum {
+    /// Elements whose computed `--webui-app-region` is `drag` (WebKitGTK).
+    webui_property,
+    /// CSS `app-region: drag` or `-webkit-app-region: drag` (WebView2).
+    css_app_region,
+    /// No page regions; a frameless window moves by its background (Cocoa).
+    window_background,
+    /// This runtime offers no page drag regions (WebView2 before Settings9).
+    none,
+};
+
 /// Borrowed native window, invalid after native close or owner destruction.
 pub const Handle = union(enum) {
     cocoa: *anyopaque,
@@ -21,8 +33,37 @@ pub const Handle = union(enum) {
 /// Programmatic Window.close() bypasses this veto.
 pub const CloseHandler = *const fn (?*anyopaque) bool;
 
+/// What started a page navigation, as far as the engine reports it.
+/// WebView2 distinguishes only `reload`, `back_forward`, and `other`.
+pub const NavigationKind = enum {
+    link,
+    form_submission,
+    back_forward,
+    reload,
+    form_resubmission,
+    other,
+};
+
+/// A page-initiated navigation awaiting a decision.
+pub const NavigationRequest = struct {
+    /// Target URL as reported by the engine, borrowed for the handler call.
+    url: []const u8,
+    kind: NavigationKind,
+};
+
+/// Called on the UI thread before a page or frame navigates. Return true to
+/// let it proceed, false to cancel it and keep the current page. The host's
+/// own requests (the initial load and `Window.navigate`) are not reported.
+/// Every server redirect hop is reported as its own request, so a handler
+/// can also stop a redirect to another origin.
+pub const NavigationHandler = *const fn (?*anyopaque, NavigationRequest) bool;
+
 pub const Options = struct {
+    /// Initial host title, shown until the page reports a non-empty title.
     title: []const u8 = "WebUI",
+    /// Mirror each non-empty page title into the host window title, like
+    /// upstream. It replaces any earlier `title` or `setTitle` value.
+    follow_page_title: bool = true,
     size: Size = .{ .width = 800, .height = 600 },
     position: ?Position = null,
     minimum_size: ?Size = null,
@@ -35,6 +76,10 @@ pub const Options = struct {
     profile_directory: ?[]const u8 = null,
     webview2_loader: ?[]const u8 = null,
     close_handler: ?CloseHandler = null,
+    /// Engine-level navigation interception, like upstream's WebKitGTK
+    /// policy handler; it also sees navigations the browser bridge cannot.
+    navigation_handler: ?NavigationHandler = null,
+    /// Passed to both `close_handler` and `navigation_handler`.
     user_data: ?*anyopaque = null,
     max_pending_tasks: usize = 64,
 
@@ -69,6 +114,8 @@ pub fn validateSize(value: Size) !void {
 }
 
 test "native options reject unsafe sizes and contradictory placement" {
+    // Page titles drive the host title by default, matching upstream.
+    try std.testing.expect((Options{}).follow_page_title);
     try (Options{ .position = .{ .x = -100, .y = 0 } }).validate();
     try std.testing.expectError(error.InvalidWindowSize, (Options{ .size = .{ .width = 0, .height = 1 } }).validate());
     try std.testing.expectError(error.InvalidWindowSize, validateSize(.{ .width = std.math.maxInt(u32), .height = 1 }));

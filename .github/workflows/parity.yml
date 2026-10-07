@@ -61,7 +61,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-0 libwebkit2gtk-4.1-0 xvfb xauth dbus-x11 openbox xcompmgr
+          sudo apt-get install -y libgtk-3-0 libwebkit2gtk-4.1-0 xvfb xauth dbus-x11 openbox xcompmgr xdotool
       - name: Core, bridge and example gates
         run: |
           zig version
@@ -79,7 +79,7 @@ jobs:
             xcompmgr -a & compositor=$!
             trap "kill $wm $compositor 2>/dev/null || true; wait || true" EXIT
             sleep 1
-            zig-out/bin/native --smoke
+            zig-out/bin/native --smoke --require-input
           '
           env -u DISPLAY -u WAYLAND_DISPLAY zig-out/bin/native --expect-unavailable
       - name: macOS native WebView gate
@@ -91,7 +91,7 @@ jobs:
         timeout-minutes: 3
         shell: pwsh
         run: |
-          & zig-out/bin/native.exe --smoke --loader "$env:WEBUI_WEBVIEW2_LOADER"
+          & zig-out/bin/native.exe --smoke --require-input --loader "$env:WEBUI_WEBVIEW2_LOADER"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & zig-out/bin/native.exe --expect-unavailable --loader "$env:RUNNER_TEMP/nonexistent-WebView2Loader.dll"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

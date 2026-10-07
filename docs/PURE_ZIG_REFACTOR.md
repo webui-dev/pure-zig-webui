@@ -49,16 +49,23 @@ is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
 | Area | Remaining behavior, not covered by existing API mappings |
 |---|---|
-| Content composition | Embedded HTML plus disk assets and a custom override/fallthrough handler cannot be composed; resource-only replacement currently replaces page content and navigates. |
-| Entry and custom routing | No configured local entry file; custom handlers lack virtual-directory index probing. Physical directory index precedence and 302 redirects are fixed in this rescan. |
-| Live window lifecycle | `createWindow` rejects after start; no independent destroy/unregister/reclaim while other windows run. `close` is not a replacement for `destroy`. |
-| Wait lifecycle | Sticky cross-window close intent can bypass an unrelated reconnect grace; initial no-client `wait` lacks startup/stop completion. These are source findings, not newly reproduced regressions. |
-| Callback metadata | Named `Call` does not expose its binding name or click-vs-explicit-call origin; callbacks cannot access a bounded snapshot of the connection's cookies. |
-| Firefox app mode | No generated Firefox app profile/userChrome.css or managed preference setup. Existing caller-profile support and explicit high-contrast error do not implement those capabilities. |
-| Browser discovery | Registered Windows Chromium using `chrome.exe` and macOS bundles outside the fixed application directories lack upstream discovery paths. |
-| Native interaction | Missing GTK custom drag/edge resize, Windows draggable-region setup and resizable frameless host behavior, and Cocoa frameless background movement. |
-| Native page integration | No upstream page-title-to-host synchronization; no GTK engine-level navigation-policy interception independent of a live bridge. |
-| Default presentation | No upstream default fallback favicon. F5/context-menu/DevTools policy differences are intentional UI-policy candidates, not proof of missing protocol support. |
+| Default presentation | F5/context-menu/DevTools policy differences are intentional UI-policy candidates, not proof of missing protocol support. |
+
+Closed after the rescan, each with focused tests in the same change:
+
+| Area | Resolution |
+|---|---|
+| Wait lifecycle | Close intent, reconnect grace, and first-connection waiting are per window; `startup_timeout` and `Running.requestExit()` give the initial wait upstream's timeout and `webui_exit` completion. Tests: `wait state tracks startup, activity, reconnect grace, and close per window`, `wait keeps per-window close intent and honours exit requests`. |
+| Callback metadata | `Call.name`, `Call.origin` (`.call` or `.click`), and `Call.cookies`/`Event.cookies` with `cookie(name)` expose the binding name, call origin, and the upgrade's `Cookie` header, copied per connection under `Limits.max_cookie_size` (oversized upgrades answer `431`). Tests: `calls and events expose binding name, origin, and bounded cookies`, `cookie values parse from raw headers`, `upgrade admission owns only accepted connections and removes every state`. |
+| Default favicon | `favicon.ico`/`favicon.svg` resolve custom icon, then a readable directory file, then upstream's default SVG (`.ico` answers `302` to `favicon.svg`), at both the capability root and the origin root. Test: `favicon falls back from custom icon to local file to the default`. |
+| Content composition | `Content.site` composes optional embedded HTML, a declinable handler, and a root folder in upstream resolution order; `Window.installContent` replaces resources without navigation. Tests: `site content resolves handler, virtual index, html, folder, and entry in upstream order`, `installed content changes resources without navigating clients`. |
+| Live window lifecycle | `App.createWindow` serves windows created while running with fresh credentials, folder, and monitor. `App.destroyWindow` unregisters at once (`404` routing, backend close, `1001` on later messages), then cancels the window's handlers, monitor, and managed browser in the background, and frees it after its last connection, request, and deferred reply. This works from the window's own handlers via `Client.window()`, and `Running.stop` finishes pending cleanup. Tests: `windows are created and destroyed while the app runs`, `destroying a window before start frees it at once`, `upgrade admission owns only accepted connections and removes every state`. |
+| Firefox app mode | Firefox windows without a caller profile get a generated per-window profile; before each launch it receives upstream's `chrome/userChrome.css` toolbar suppression and a rewritten `user.js` (stylesheet support, no default-browser check, close warning, tabs in title bar, or first-run pages, and the `browser.display.document_color_use` high-contrast override). Snap Firefox profiles live under the snap's user directory from the passwd home. A caller profile is never modified, so it rejects `high_contrast = false`. Tests: `generated Firefox profiles receive WebUI app-mode settings`, `Firefox windows launch with a generated app-mode profile`, `Firefox launches reject profile combinations they cannot honour`, `passwd home lookup accepts only well-formed absolute entries`. |
+| Browser discovery | Windows tells Chrome from Chromium among `PATH` and `App Paths` `chrome.exe` candidates by Google's `initial_preferences`/`master_preferences` files, like upstream, so registered Chromium is found and never mistaken for Chrome. macOS adds `~/Applications` and a side-effect-free Spotlight bundle-identifier lookup in place of upstream's Finder-revealing `open -R -a`. Tests: `Windows Chrome and Chromium installs are told apart by Google's installer files`, `macOS bundles resolve from Spotlight output`. |
+| Native page titles | Like upstream, each non-empty page title replaces the host title: GTK `notify::title`, WKWebView `title` KVO (which, unlike upstream's `didFinishNavigation`, also reports later `document.title` changes), and WebView2 `DocumentTitleChanged`. `Options.title` is the initial title and `setTitle` applies at once until the next page title; an empty title keeps the host title, while WebView2 reports its own default for untitled documents. `follow_page_title = false` or `setFollowPageTitle(false)` keeps titles host-controlled; re-enabling applies the current page title. `title()` reads the host title. Test: native smoke titles step on all three platforms. |
+| Native interaction | `native.Window.dragRegion()` reports each backend's model. WebKitGTK mirrors upstream's `--webui-app-region` script on a dedicated message channel and starts a window-manager move only while the primary button is held; resizable frameless windows resize from upstream's 6 px edge band with resize cursors. WebView2 enables Settings9 non-client regions for CSS `app-region` (reporting `.none` without Settings9), and resizable frameless windows keep `WS_THICKFRAME`. Cocoa frameless windows are movable by background, also across style and kiosk changes. Tests: native smoke frameless step with real pointer input on Linux (xdotool) and Windows (`mouse_event`): drag moves the window, a right-edge drag widens it, and on GTK a forged request without a held button does not move it; macOS reads back `isMovableByWindowBackground` because input synthesis needs Accessibility permission. `frameless resize hit-testing prefers corners within the edge band`. |
+| Native navigation policy | `native.Options.navigation_handler` / `Window.setNavigationHandler` decide page and frame navigations in the engine, like upstream's WebKitGTK `decide-policy` handler but on every backend: GTK `decide-policy`, WKWebView `decidePolicyForNavigationAction`, WebView2 `NavigationStarting` and `FrameNavigationStarting`. The host's own initial load and `navigate()` are not reported. Each server redirect hop is reported, because WKWebView has no public redirect flag. A URL that cannot be read cancels the navigation. The native smoke blocks a script navigation and a link click, keeping the page alive. It checks that an allowed `favicon.ico` navigation reports its `302` hop to `favicon.svg`, and that a host navigation back is not reported. Removing the host exemption or the cancel, or (on GTK) ignoring redirects, makes the smoke fail. Tests: `navigation requests reach the handler with its own user data inside a callback scope` and per-backend kind mappings. |
+| Entry and custom routing | `Site.entry` redirects the root to a validated relative entry file, and handlers that decline a path (empty `404`) are probed for the entry name or `index.*` with `302` redirects, for both `.site` and `.custom`. Same tests as content composition. |
 
 Borrowed custom HTTP handlers can await work before returning through `std.Io`;
 there is no owned post-return HTTP reply handle. This is an explicit Zig task
@@ -330,6 +337,8 @@ protocol input never panics.
 | `window.show(content)` | Set initial content and call `window.open()`; use `window.setContent()` while running. |
 | `window.bind()` / `binding()` | `window.bind(io, name, handler, user_data)` |
 | `Event.get*At()` | `Call.string/int/float/bool/bytes(index)` |
+| `Event.element`, `Event.event_type`, `Event.cookies` | `Call.name`, `Call.origin`, `Call.cookies`/`Call.cookie(name)`; `Event.data`, `Event.kind`, `Event.cookies` for event handlers. |
+| `Event.window` | `Call.client.window()` and `Event.client.window()`. |
 | `Event.return*()` | `Call.reply*()` |
 | `window.run()` | `Window.eval()` |
 | `Event.runClient()` | `Call.client.eval()` |
@@ -363,8 +372,10 @@ external-browser launch flags.
 | `webui_set_hide()` | `App.WindowOptions.hide` for headless external browsers; `native.Options.hidden` and `native.Window.setVisible()` for native windows. |
 | `webui_minimize()`, `webui_maximize()` | `native.Window.minimize()`, `maximize()`, and `restore()`. |
 | `webui_set_resizable()`, `webui_set_minimum_size()` | `native.Options` and `native.Window.setResizable()` / `setMinimumSize()`. |
-| `webui_set_frameless()`, `webui_set_transparent()` | Native options and setters. Windows transparency configures both host composition and WebView background; X11 requires RGBA/compositing. macOS transparency is explicitly unsupported, as upstream's native adapter does not implement it. |
+| `webui_set_frameless()`, `webui_set_transparent()` | Native options and setters; `native.Window.dragRegion()` reports how pages declare drag areas. Windows transparency configures both host composition and WebView background; X11 requires RGBA/compositing. macOS transparency is explicitly unsupported, as upstream's native adapter does not implement it. |
 | `webui_show_wv()`, `webui_set_close_handler_wv()` | `native.Window.open()` plus `setCloseHandler()`. User/JavaScript close can be vetoed before destroying the page; `native.Window.close()` force-closes. |
+| WebKitGTK `WEBUI_EVENT_NAVIGATION` (`decide-policy`) | `native.Options.navigation_handler` or `native.Window.setNavigationHandler()`, on every backend. Returning `false` cancels like upstream's ignored policy decision. The host's own loads are exempt, as with upstream's first navigation after show. Bridge-level navigation events stay `Event.kind == .navigation`. |
+| WebView page-title tracking (no public upstream function) | `native.Options.follow_page_title` (default `true`), `native.Window.setFollowPageTitle()`, `setTitle()`, and `title()`. |
 | `webui_get_hwnd()`, `webui_win32_get_hwnd()` | `native.Window.handle()` returns a borrowed tagged Cocoa/Gtk/Win32 handle, invalid after close/deinit. |
 
 ### Browser Bridge APIs
@@ -408,17 +419,17 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 
 | Upstream API | Zig replacement |
 |---|---|
-| `webui_new_window()`, `webui_new_window_id()`, `webui_get_new_window_id()` | `App.createWindow()` and application-owned IDs. Partial: runtime creation remains unsupported. |
-| `webui_show()`, `webui_start_server()`, `webui_get_url()` | Initial `Content`, runtime `Window.setContent()`, `App.start()`, `Window.open()`, and `Window.url()`. `Window.open()` launches the best installed browser in app mode and falls back to the OS URL handler, matching upstream `webui_show()` with `AnyBrowser`. |
+| `webui_new_window()`, `webui_new_window_id()`, `webui_get_new_window_id()` | `App.createWindow()`, before or after `start`, and application-owned IDs. |
+| `webui_show()`, `webui_start_server()`, `webui_get_url()` | Initial `Content`, runtime `Window.setContent()`, `App.start()`, `Window.open()`, and `Window.url()`. Upstream's string sniffing becomes explicit variants: HTML `.html`, URL `.external_url`, folder `.directory`, and file `.site` with `entry`. `Window.open()` launches the best installed browser in app mode and falls back to the OS URL handler, matching upstream `webui_show()` with `AnyBrowser`. |
 | `webui_show_client()` | `Client.show()` replaces the window content and navigates only the selected client. |
 | `webui_is_shown()` | `Window.isShown()` reports whether the window has at least one connected browser client. |
 | `webui_set_center()` | `App.WindowOptions.center` and `Window.setCenter()` centre the window on the primary display. Upstream reads the monitor geometry natively, which needs GDK on Linux; the browser computes the coordinates instead, so centring applies once a client connects rather than at launch. Centring and an explicit position clear each other. |
 | `webui_focus()` | `Window.focus()` restores and focuses the visible top-level window belonging to the retained browser child on Windows. Missing children, invalid process handles, unavailable windows, and rejected foreground requests return explicit errors; Linux and macOS return `error.UnsupportedPlatform` instead of silently doing nothing. |
 | `webui_delete_profile()`, `webui_delete_all_profiles()` | `Window.deleteProfile()`, `deleteManagedProfile()`, and `deleteAllManagedProfiles()` remove generated profile directories only. A window configured with `.profile_directory` returns `error.CallerManagedProfile`; caller-owned directories are never deleted. |
 | `webui_set_size()`, `webui_set_position()` | `App.WindowOptions.size` and `.position` set initial geometry. `Window.setSize()` and `Window.setPosition()` persist updates, notify connected clients, replay the latest geometry to later clients, and affect subsequent explicit browser launches. |
-| `webui_set_high_contrast()`, `webui_is_high_contrast()` | `App.WindowOptions.high_contrast` controls Chromium forced-color support with explicit unsupported-browser errors. Browser-side `webui.isHighContrast()` uses native forced-color and contrast media queries without external programs. |
+| `webui_set_high_contrast()`, `webui_is_high_contrast()` | `App.WindowOptions.high_contrast` controls Chromium forced-color support and the generated Firefox profile's `browser.display.document_color_use` preference, with explicit errors for Safari and caller-managed Firefox profiles. Browser-side `webui.isHighContrast()` uses native forced-color and contrast media queries without external programs. |
 | `webui_open_url()` | `openUrl()` safely passes a non-empty URL as one argument to the platform default opener. |
-| `webui_get_best_browser()`, `webui_browser_exist()` | `bestBrowser()` and `browserExists()` discover registered or executable browser candidates through the public `Browser` enum. |
+| `webui_get_best_browser()`, `webui_browser_exist()` | `bestBrowser()` and `browserExists()` discover registered or executable browser candidates through the public `Browser` enum, including registered Windows Chromium and macOS bundles found by bundle identifier. |
 | `webui_show_browser()`, `webui_set_browser_folder()`, `webui_set_custom_parameters()` | `Window.openWithBrowser()` accepts a `BrowserLaunchOptions` value with an explicit browser, optional full executable path, and additional argv. An empty argv applies the Chromium default arguments; a non-empty argv replaces them, matching upstream `custom_parameters`. |
 | `webui_get_child_process_id()` | `Window.openWithBrowser()` returns the retained direct child's `BrowserProcessId`; `Window.browserProcessId()` retrieves it later. |
 | `webui_get_parent_process_id()` | Root-level `parentProcessId()` returns the current Zig backend's numeric process ID without a redundant window argument. Unsupported process targets return an explicit error. |
@@ -426,10 +437,10 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_set_runtime()` | `App.WindowOptions.runtime` selects Deno, Node.js, or Bun for `.js`/`.ts`. Physical directories first redirect to the first `index.html`, `index.htm`, `index.ts`, or `index.js`; only a selected script is interpreted. Executables receive argv without a shell. Failures deliberately answer `503`/`504`/`502`, never partial stdout or diagnostics. |
 | `webui_set_config(folder_monitor)` | `App.Options.folder_monitor_interval` enables portable recursive directory polling and reloads the affected window's connected clients. |
 | `webui_set_icon()`, `webui_set_icon_file()` | `Window.setIcon()` copies inline data and MIME type; `Window.setIconFile()` loads a supported image file as the window favicon. |
-| `webui_set_profile()` | Caller-managed profiles and isolated owned Chromium profile leaves are supported. Partial: Firefox managed app profiles, chrome suppression and preference setup remain absent. |
+| `webui_set_profile()` | Caller-managed profiles and isolated owned Chromium and Firefox profile leaves are supported; generated Firefox profiles receive upstream's userChrome.css and app-mode preferences, under the snap user directory for Snap Firefox. |
 | `webui_set_proxy()` | `App.WindowOptions.proxy_server` is copied and passed as one Chromium-family `--proxy-server` argument. Unsupported browsers return an explicit error. |
-| `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. A 1.5-second reconnect grace is implemented, but sticky cross-window close intent and initial no-client wait completion remain known lifecycle gaps. |
-| `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `Running.stop()`, and `App.deinit()`. Partial: there is no independent running-window destroy/reclaim. |
+| `webui_wait()`, `webui_wait_async()` | `Running.wait()` used directly or through `std.Io` concurrency. Each window is evaluated independently: a backend close ends only that window, other disconnects get a 1.5-second grace from the latest disconnect, and a new client clears that window's close intent. Never-connected windows wait for the startup timeout. A second concurrent waiter returns `error.AlreadyWaiting`. |
+| `webui_close()`, `webui_destroy()`, `webui_exit()`, `webui_clean()` | `Window.close()`, `App.destroyWindow()`, `Running.requestExit()`, `Running.stop()`, and `App.deinit()`. `destroyWindow()` reclaims one window while others run; `requestExit()` closes every page and ends the active wait from any thread. |
 | `webui_set_context()`, `webui_get_context()` | Binding and event-handler `user_data`. |
 | `webui_bind()` | `Window.bind(io, name, handler, user_data)` supports explicit calls, DOM clicks, and runtime replacement. `Window.onEvent(io, handler, user_data)` updates event handling. `CMD_ADD_ID` pushes new registrations and authentication replays current state; in-flight work keeps its handler snapshot. |
 | `webui_get_count()`, `webui_get_size()`, `webui_get_size_at()` | `Call.arguments.len` and `Call.bytes(index).len`. |
@@ -437,7 +448,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_return_string()`, `webui_return_int()`, `webui_return_float()`, `webui_return_bool()` | `Call.reply()`, `Call.replyInt()`, `Call.replyFloat()`, and `Call.replyBool()`. |
 | `webui_set_config(asynchronous_response)` | `Call.deferReply()` transfers the response to a bounded, owned, one-shot `PendingReply`. |
 | `webui_set_config(ui_event_blocking)`, `webui_set_event_blocking()` | `WindowOptions.event_mode` and `Window.setEventMode()` select serial or bounded concurrent binding and event execution. |
-| `webui_set_config(show_wait_connection)`, `webui_set_timeout()` | `Window.open()` remains non-blocking; callers explicitly compose it with `Window.waitForConnection(io, timeout)`. |
+| `webui_set_config(show_wait_connection)`, `webui_set_timeout()` | `App.Options.startup_timeout` (15 seconds by default, null for no limit) bounds first-connection waiting in `Running.wait()`, restarted by `Window.open()`/`openWithBrowser()` and extended five seconds per page or bridge request, like upstream. `Window.open()` stays non-blocking; compose it with `Window.waitForConnection(io, timeout)` for an explicit blocking show. |
 | `webui_run()`, `webui_script()` | `Window.run()` and `Window.eval()`. |
 | `webui_run_client()`, `webui_script_client()` | `Client.run()` and `Client.eval()`. |
 | `webui_close_client()`, `webui_navigate_client()`, `webui_send_raw_client()` | `Client.close()`, `Client.navigate()`, and `Client.sendRaw()`. |
@@ -448,7 +459,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_set_public()` | `App.Options.public` permits non-loopback listening only with TLS; Origin and explicit connection and protocol limits are enforced. |
 | `webui_set_tls_certificate()` | `App.Options.tls` accepts caller-provided PEM certificate and private-key bytes. |
 | `webui_set_port()`, `webui_get_port()`, `webui_get_free_port()` | `App.Options.port`, including `0` for automatic selection, and the running window URL. |
-| `webui_set_root_folder()`, `webui_set_file_handler()`, `webui_set_file_handler_window()`, `webui_return_http()` | Initial/runtime `.directory` or `.custom` content and borrowed `Response`. Partial: modes are exclusive; no HTML-plus-assets/custom fallthrough or resource-only replacement. HTTP work may await before callback return, but there is no owned delayed HTTP reply. |
+| `webui_set_root_folder()`, `webui_set_file_handler()`, `webui_set_file_handler_window()`, `webui_return_http()` | `.directory`, `.custom`, or composed `.site` content with a borrowed `Response`; an empty `404` declines a path for virtual-index probing and folder fallthrough. `Window.installContent()` swaps resources without navigation. HTTP work may await before callback return, but there is no owned delayed HTTP reply. |
 | `webui_get_mime_type()` | Linsang resource handling. |
 | `webui_encode()`, `webui_decode()`, `webui_malloc()`, `webui_free()`, `webui_memcpy()` | Zig standard library and allocators. |
 | `webui_get_last_error_number()`, `webui_get_last_error_message()` | Zig error unions. |
@@ -500,8 +511,8 @@ Browser discovery, default URL opening, explicit browser selection, custom
 executable paths and argv, the process-wide backend identifier, per-window
 direct child identifiers, replacement, and shutdown cleanup are implemented.
 
-Discovery, profile and app-presentation behavior still has the Firefox,
-Windows Chromium and macOS resolver gaps listed above.
+Discovery covers registered Windows Chromium and macOS bundles outside the
+standard application directories.
 
 ### Browser window controls
 
@@ -511,8 +522,11 @@ Windows Chromium and macOS resolver gaps listed above.
 - Profile directories and proxy rules are copied into window state and passed
   as individual browser argv entries. Chromium-family browsers support both;
   Firefox supports profiles; Safari supports neither.
-- Chromium can explicitly disable forced-color support; the browser bridge
-  detects active high-contrast media preferences.
+- Chromium can explicitly disable forced-color support, and generated Firefox
+  profiles disable it through a preference; the browser bridge detects active
+  high-contrast media preferences.
+- Generated Firefox profiles receive upstream's toolbar-hiding
+  `userChrome.css` and app-mode `user.js` before every launch.
 - Windows external-browser focus enumerates visible top-level windows owned by
   the retained browser child, restores a minimized match, and requests the
   foreground. Other platforms return `error.UnsupportedPlatform`.
@@ -552,8 +566,9 @@ This completes `webui_set_runtime()`.
 This implements `webui_show_wv()`, `webui_set_close_handler_wv()`, and native
 handles. A separate ABI/ownership review was performed for every platform;
 the public API stays Zig-native, and runtime verification remains mandatory.
-This does not yet cover upstream native drag/edge resize, page-title tracking
-or GTK navigation-policy integration; see the reopened semantic gaps.
+Page titles drive the host title, frameless windows drag and edge-resize, and
+an optional engine-level navigation handler decides page navigations, as
+upstream does.
 
 ### Parity closure (reopened)
 

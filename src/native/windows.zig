@@ -16,8 +16,16 @@ const iid_unknown = GUID.parse("{00000000-0000-0000-c000-000000000046}");
 const iid_environment_callback = GUID.parse("{4e8a3389-c9d8-4bd2-b6b5-124fee6cc14d}");
 const iid_controller_callback = GUID.parse("{6c4819f3-c9b7-4260-8127-c9f5bde7f68c}");
 const iid_close_callback = GUID.parse("{57213f19-00e6-49fa-8e07-898ea01ecbd2}"); // WebMessageReceived
+const iid_title_callback = GUID.parse("{f5f2b923-953e-4042-9f95-f3a118e1afd4}"); // DocumentTitleChanged
+const iid_navigation_callback = GUID.parse("{9adbe429-f36d-432b-9ddc-f8881fbd76e3}"); // (Frame)NavigationStarting
+const iid_navigation_args3 = GUID.parse("{ddffe494-4942-4bd2-ab73-35b8ff40e19f}"); // NavigationKind
+// Upper bound for environment, controller, and document-script creation.
+// Cold starts spawn the browser processes and user data folder; CI runners
+// take about 7 s for two windows and occasionally exceed 15 s.
+const initialization_timeout_ms = 60_000;
 const iid_script_callback = GUID.parse("{b99369f3-9b11-47b5-bc6f-8e7895fcea17}");
 const iid_controller2 = GUID.parse("{c979903e-d4ca-4228-92eb-47ee3fa96eab}");
+const iid_settings9 = GUID.parse("{0528a73b-e92d-49f4-927a-e547dddaa37d}");
 
 const close_message = "pure-zig-webui:close-request";
 const close_script = blk: {
@@ -38,7 +46,8 @@ const Com = extern struct {
     vtable: [*]const *const anyopaque,
 
     fn method(self: *Com, comptime slot: usize, comptime F: type) F {
-        return @ptrCast(self.vtable[slot]);
+        // Function pointers are aligned on targets such as aarch64.
+        return @ptrCast(@alignCast(self.vtable[slot]));
     }
     fn retain(self: *Com) void {
         _ = self.method(1, *const fn (*Com) callconv(.winapi) u32)(self);
@@ -192,51 +201,91 @@ const ScriptCompletion = struct {
     }
 };
 
-const CloseCallback = struct {
-    vtable: *const Vtable = &vtable_value,
-    refs: std.atomic.Value(u32) = .init(1),
-    owner: ?*Backend,
-    const Vtable = extern struct {
-        query: *const fn (*CloseCallback, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
-        add_ref: *const fn (*CloseCallback) callconv(.winapi) u32,
-        release: *const fn (*CloseCallback) callconv(.winapi) u32,
-        invoke: *const fn (*CloseCallback, ?*Com, ?*Com) callconv(.winapi) HRESULT,
-    };
-    const vtable_value: Vtable = .{ .query = query, .add_ref = addRef, .release = release, .invoke = invoke };
-    fn query(self: *CloseCallback, iid: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT {
-        out.* = null;
-        if (!std.mem.eql(u8, std.mem.asBytes(iid), std.mem.asBytes(&iid_close_callback)) and
-            !std.mem.eql(u8, std.mem.asBytes(iid), std.mem.asBytes(&iid_unknown)))
-            return @bitCast(@as(u32, 0x80004002));
-        out.* = self;
-        _ = addRef(self);
-        return 0;
-    }
-    fn addRef(self: *CloseCallback) callconv(.winapi) u32 {
-        return self.refs.fetchAdd(1, .monotonic) + 1;
-    }
-    fn release(self: *CloseCallback) callconv(.winapi) u32 {
-        const remaining = self.refs.fetchSub(1, .acq_rel) - 1;
-        if (remaining == 0) std.heap.page_allocator.destroy(self);
-        return remaining;
-    }
-    fn invoke(self: *CloseCallback, _: ?*Com, args: ?*Com) callconv(.winapi) HRESULT {
-        const owner = self.owner orelse return 0;
-        if (owner.closed) return 0;
-        const message_args = args orelse return 0;
-        var text: ?[*:0]u16 = null;
-        const status = message_args.method(5, *const fn (*Com, *?[*:0]u16) callconv(.winapi) HRESULT)(message_args, &text);
-        defer if (text) |value| CoTaskMemFree(value);
-        if (status < 0) return 0; // Other application messages need not be strings.
-        const value = text orelse return 0;
-        // Fixed command only, with bounded comparison and no URL/code evaluation.
-        for (close_message, 0..) |character, index| {
-            if (value[index] != character) return 0;
+// ICoreWebView2 event handlers. Each is retained by the runtime per COM rules
+// and outlives Backend: releaseWebView clears `owner` before removal.
+fn EventCallback(comptime iid: GUID, comptime handle: fn (*Backend, ?*Com) void) type {
+    return struct {
+        const Self = @This();
+        vtable: *const Vtable = &vtable_value,
+        refs: std.atomic.Value(u32) = .init(1),
+        owner: ?*Backend,
+        const Vtable = extern struct {
+            query: *const fn (*Self, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+            add_ref: *const fn (*Self) callconv(.winapi) u32,
+            release: *const fn (*Self) callconv(.winapi) u32,
+            invoke: *const fn (*Self, ?*Com, ?*Com) callconv(.winapi) HRESULT,
+        };
+        const vtable_value: Vtable = .{ .query = query, .add_ref = addRef, .release = release, .invoke = invoke };
+        fn create(owner: *Backend) !*Self {
+            const self = try std.heap.page_allocator.create(Self);
+            self.* = .{ .owner = owner };
+            return self;
         }
-        if (value[close_message.len] == 0) owner.close_requested = true;
-        return 0;
+        fn query(self: *Self, requested: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT {
+            out.* = null;
+            if (!std.mem.eql(u8, std.mem.asBytes(requested), std.mem.asBytes(&iid)) and
+                !std.mem.eql(u8, std.mem.asBytes(requested), std.mem.asBytes(&iid_unknown)))
+                return @bitCast(@as(u32, 0x80004002));
+            out.* = self;
+            _ = addRef(self);
+            return 0;
+        }
+        fn addRef(self: *Self) callconv(.winapi) u32 {
+            return self.refs.fetchAdd(1, .monotonic) + 1;
+        }
+        fn release(self: *Self) callconv(.winapi) u32 {
+            const remaining = self.refs.fetchSub(1, .acq_rel) - 1;
+            if (remaining == 0) std.heap.page_allocator.destroy(self);
+            return remaining;
+        }
+        fn invoke(self: *Self, _: ?*Com, args: ?*Com) callconv(.winapi) HRESULT {
+            const owner = self.owner orelse return 0;
+            if (owner.closed) return 0;
+            handle(owner, args);
+            return 0;
+        }
+    };
+}
+
+const CloseCallback = EventCallback(iid_close_callback, closeMessage);
+const TitleCallback = EventCallback(iid_title_callback, titleChanged);
+const NavigationCallback = EventCallback(iid_navigation_callback, navigationStarting);
+const FrameNavigationCallback = EventCallback(iid_navigation_callback, frameNavigationStarting);
+
+fn closeMessage(owner: *Backend, args: ?*Com) void {
+    const message_args = args orelse return;
+    var text: ?[*:0]u16 = null;
+    const status = message_args.method(5, *const fn (*Com, *?[*:0]u16) callconv(.winapi) HRESULT)(message_args, &text);
+    defer if (text) |value| CoTaskMemFree(value);
+    if (status < 0) return; // Other application messages need not be strings.
+    const value = text orelse return;
+    // Fixed command only, with bounded comparison and no URL/code evaluation.
+    for (close_message, 0..) |character, index| {
+        if (value[index] != character) return;
     }
-};
+    if (value[close_message.len] == 0) owner.close_requested = true;
+}
+
+fn titleChanged(owner: *Backend, _: ?*Com) void {
+    owner.applyPageTitle();
+}
+
+fn navigationStarting(owner: *Backend, args: ?*Com) void {
+    owner.decideNavigation(args, true);
+}
+
+fn frameNavigationStarting(owner: *Backend, args: ?*Com) void {
+    owner.decideNavigation(args, false);
+}
+
+/// COREWEBVIEW2_NAVIGATION_KIND to the portable kind.
+fn navigationKind(value: i32) types.NavigationKind {
+    return switch (value) {
+        0 => .reload,
+        1 => .back_forward,
+        else => .other, // NEW_DOCUMENT: links, forms, and scripts alike
+    };
+}
 
 pub const Backend = struct {
     gpa: std.mem.Allocator,
@@ -250,8 +299,18 @@ pub const Backend = struct {
     webview: ?*Com = null,
     close_callback: ?*CloseCallback = null,
     close_token: ?Token = null,
+    title_callback: ?*TitleCallback = null,
+    title_token: ?Token = null,
+    navigation_callback: ?*NavigationCallback = null,
+    navigation_token: ?Token = null,
+    frame_navigation_callback: ?*FrameNavigationCallback = null,
+    frame_navigation_token: ?Token = null,
+    follow_page_title: bool,
     close_handler: ?types.CloseHandler,
+    navigation_handler: ?types.NavigationHandler,
     user_data: ?*anyopaque,
+    // Set before each host Navigate so its own NavigationStarting is not reported.
+    host_navigation: bool = false,
     close_requested: bool = false,
     closed: bool = false,
     event_error: ?anyerror = null,
@@ -259,6 +318,7 @@ pub const Backend = struct {
     resizable: bool,
     frameless: bool,
     kiosk: bool = false,
+    non_client_regions: bool = false,
     transparent: bool = false,
     placement: WINDOWPLACEMENT = .{},
     previous: ?*Backend = null,
@@ -270,11 +330,13 @@ pub const Backend = struct {
         self.* = .{
             .gpa = gpa,
             .close_handler = options.close_handler,
+            .navigation_handler = options.navigation_handler,
             .user_data = options.user_data,
             .minimum = options.minimum_size,
             .resizable = options.resizable,
             .frameless = options.frameless,
             .transparent = options.transparent,
+            .follow_page_title = options.follow_page_title,
         };
         errdefer self.destroy();
         self.next = live_windows;
@@ -295,7 +357,7 @@ pub const Backend = struct {
         loader.* = .{ .module = module };
         self.loader = loader;
         const create_environment: *const fn (?[*:0]const u16, ?[*:0]const u16, ?*Com, *Completion) callconv(.winapi) HRESULT =
-            @ptrCast(GetProcAddress(module, "CreateCoreWebView2EnvironmentWithOptions") orelse return error.NativeRuntimeNotFound);
+            @ptrCast(@alignCast(GetProcAddress(module, "CreateCoreWebView2EnvironmentWithOptions") orelse return error.NativeRuntimeNotFound));
         self.instance = GetModuleHandleW(null) orelse return error.NativeInitializationFailed;
         var class_buffer: [64]u8 = undefined;
         const class_name = try std.fmt.bufPrint(&class_buffer, "PureZigWebUI-{x}", .{@intFromPtr(self)});
@@ -310,13 +372,13 @@ pub const Backend = struct {
         };
         self.class_atom = RegisterClassExW(&wc);
         if (self.class_atom == 0) return error.NativeInitializationFailed;
-        const title = try std.unicode.utf8ToUtf16LeAllocZ(gpa, options.title);
-        defer gpa.free(title);
+        const initial_title = try std.unicode.utf8ToUtf16LeAllocZ(gpa, options.title);
+        defer gpa.free(initial_title);
         const outer = try self.outerSize(options.size);
         const initial = options.position orelse types.Position{ .x = std.math.minInt(i32), .y = std.math.minInt(i32) };
         // Redirection surfaces cannot be toggled after HWND creation. Reserve
         // the composition host up front; WebView2's background controls opacity.
-        self.hwnd = CreateWindowExW(0x00200000, class_wide.ptr, title.ptr, self.style(), initial.x, initial.y, outer.x, outer.y, null, null, self.instance, self) orelse return error.NativeWindowCreationFailed;
+        self.hwnd = CreateWindowExW(0x00200000, class_wide.ptr, initial_title.ptr, self.style(), initial.x, initial.y, outer.x, outer.y, null, null, self.instance, self) orelse return error.NativeWindowCreationFailed;
         const profile = if (options.profile_directory) |path| try std.unicode.utf8ToUtf16LeAllocZ(gpa, path) else null;
         defer if (profile) |path| gpa.free(path);
         const start = std.Io.Clock.awake.now(io);
@@ -338,11 +400,32 @@ pub const Backend = struct {
         defer script_settings.release();
         try check(script_settings.method(4, *const fn (*Com, i32) callconv(.winapi) HRESULT)(script_settings, 1));
         try check(script_settings.method(6, *const fn (*Com, i32) callconv(.winapi) HRESULT)(script_settings, 1));
-        self.close_callback = try std.heap.page_allocator.create(CloseCallback);
-        self.close_callback.?.* = .{ .owner = self };
+        // Settings9 makes CSS app-region drag areas act as the host caption
+        // (upstream WebUI PR #718). Older runtimes report `.none` instead.
+        var settings9: ?*Com = null;
+        if (script_settings.method(0, *const fn (*Com, *const GUID, *?*Com) callconv(.winapi) HRESULT)(script_settings, &iid_settings9, &settings9) >= 0) {
+            if (settings9) |value| {
+                defer value.release();
+                try check(value.method(38, *const fn (*Com, i32) callconv(.winapi) HRESULT)(value, 1));
+                self.non_client_regions = true;
+            }
+        }
+        self.close_callback = try CloseCallback.create(self);
         var token: Token = .{};
         try check(webview.method(34, *const fn (*Com, *CloseCallback, *Token) callconv(.winapi) HRESULT)(webview, self.close_callback.?, &token));
         self.close_token = token;
+        self.title_callback = try TitleCallback.create(self);
+        var title_token: Token = .{};
+        try check(webview.method(46, *const fn (*Com, *TitleCallback, *Token) callconv(.winapi) HRESULT)(webview, self.title_callback.?, &title_token));
+        self.title_token = title_token;
+        self.navigation_callback = try NavigationCallback.create(self);
+        var navigation_token: Token = .{};
+        try check(webview.method(7, *const fn (*Com, *NavigationCallback, *Token) callconv(.winapi) HRESULT)(webview, self.navigation_callback.?, &navigation_token));
+        self.navigation_token = navigation_token;
+        self.frame_navigation_callback = try FrameNavigationCallback.create(self);
+        var frame_navigation_token: Token = .{};
+        try check(webview.method(17, *const fn (*Com, *FrameNavigationCallback, *Token) callconv(.winapi) HRESULT)(webview, self.frame_navigation_callback.?, &frame_navigation_token));
+        self.frame_navigation_token = frame_navigation_token;
         // WindowCloseRequested is too late to guarantee veto or repeat requests;
         // Chromium can also refuse native window.close after history navigation.
         // Replace it before page scripts run, without marking the page closed.
@@ -353,7 +436,7 @@ pub const Backend = struct {
         try check(webview.method(27, *const fn (*Com, [*:0]const u16, *ScriptCompletion) callconv(.winapi) HRESULT)(webview, close_script, script_completion));
         while (!script_completion.done) {
             if (!(try self.pump())) return error.NativeWindowClosed;
-            if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= 15_000)
+            if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= initialization_timeout_ms)
                 return error.NativeInitializationTimeout;
             if (!script_completion.done) try std.Io.sleep(io, .fromMilliseconds(1), .awake);
         }
@@ -370,7 +453,7 @@ pub const Backend = struct {
     fn awaitCompletion(self: *Backend, io: std.Io, start: std.Io.Timestamp, completion: *Completion) !*Com {
         while (!completion.done) {
             if (!(try self.pump())) return error.NativeWindowClosed;
-            if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= 15_000)
+            if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= initialization_timeout_ms)
                 return error.NativeInitializationTimeout;
             if (!completion.done) try std.Io.sleep(io, .fromMilliseconds(1), .awake);
         }
@@ -405,10 +488,25 @@ pub const Backend = struct {
 
     fn releaseWebView(self: *Backend) void {
         if (self.close_callback) |callback| callback.owner = null;
+        if (self.title_callback) |callback| callback.owner = null;
+        if (self.navigation_callback) |callback| callback.owner = null;
+        if (self.frame_navigation_callback) |callback| callback.owner = null;
         if (self.webview) |webview| {
             if (self.close_token) |token| {
                 _ = webview.method(35, *const fn (*Com, Token) callconv(.winapi) HRESULT)(webview, token);
                 self.close_token = null;
+            }
+            if (self.title_token) |token| {
+                _ = webview.method(47, *const fn (*Com, Token) callconv(.winapi) HRESULT)(webview, token);
+                self.title_token = null;
+            }
+            if (self.navigation_token) |token| {
+                _ = webview.method(8, *const fn (*Com, Token) callconv(.winapi) HRESULT)(webview, token);
+                self.navigation_token = null;
+            }
+            if (self.frame_navigation_token) |token| {
+                _ = webview.method(18, *const fn (*Com, Token) callconv(.winapi) HRESULT)(webview, token);
+                self.frame_navigation_token = null;
             }
         }
         if (self.controller) |controller| _ = controller.closeController();
@@ -418,6 +516,12 @@ pub const Backend = struct {
         self.controller = null;
         if (self.close_callback) |callback| _ = CloseCallback.release(callback);
         self.close_callback = null;
+        if (self.title_callback) |callback| _ = TitleCallback.release(callback);
+        self.title_callback = null;
+        if (self.navigation_callback) |callback| _ = NavigationCallback.release(callback);
+        self.navigation_callback = null;
+        if (self.frame_navigation_callback) |callback| _ = FrameNavigationCallback.release(callback);
+        self.frame_navigation_callback = null;
     }
 
     pub fn pump(self: *Backend) !bool {
@@ -468,7 +572,10 @@ pub const Backend = struct {
         return self.hwnd orelse error.NativeWindowClosed;
     }
     fn style(self: *const Backend) u32 {
-        if (self.kiosk or self.frameless) return 0x80000000 | 0x02000000 | 0x04000000; // POPUP, CLIPCHILDREN, CLIPSIBLINGS
+        if (self.kiosk) return 0x80000000 | 0x02000000 | 0x04000000; // POPUP, CLIPCHILDREN, CLIPSIBLINGS
+        // Upstream keeps a sizing frame on resizable frameless windows.
+        if (self.frameless) return 0x80000000 | 0x02000000 | 0x04000000 |
+            @as(u32, if (self.resizable) 0x00040000 else 0); // THICKFRAME
         return 0x00c80000 | 0x00020000 | 0x02000000 | 0x04000000 |
             @as(u32, if (self.resizable) 0x00050000 else 0); // caption, system menu, minimize, size/maximize
     }
@@ -486,18 +593,80 @@ pub const Backend = struct {
         if (GetClientRect(try self.window(), &rect) == 0) return error.NativeOperationFailed;
         try check(controller.method(6, *const fn (*Com, RECT) callconv(.winapi) HRESULT)(controller, rect));
     }
-    pub fn setTitle(self: *Backend, title: [:0]const u8) !void {
+    pub fn setTitle(self: *Backend, value: [:0]const u8) !void {
         const hwnd = try self.window();
-        const text = try std.unicode.utf8ToUtf16LeAllocZ(self.gpa, title);
+        const text = try std.unicode.utf8ToUtf16LeAllocZ(self.gpa, value);
         defer self.gpa.free(text);
         if (SetWindowTextW(hwnd, text.ptr) == 0) return error.NativeOperationFailed;
+    }
+    pub fn title(self: *Backend, gpa: std.mem.Allocator) ![]u8 {
+        const hwnd = try self.window();
+        const length = GetWindowTextLengthW(hwnd);
+        if (length <= 0) return gpa.dupe(u8, "");
+        const buffer = try gpa.alloc(u16, @as(usize, @intCast(length)) + 1);
+        defer gpa.free(buffer);
+        const copied = GetWindowTextW(hwnd, buffer.ptr, @intCast(buffer.len));
+        if (copied < 0) return error.NativeOperationFailed;
+        return std.unicode.utf16LeToUtf8Alloc(gpa, buffer[0..@intCast(copied)]) catch error.InvalidNativeText;
+    }
+    pub fn setFollowPageTitle(self: *Backend, value: bool) !void {
+        _ = try self.window();
+        self.follow_page_title = value;
+        if (value) self.applyPageTitle();
+    }
+    fn applyPageTitle(self: *Backend) void {
+        if (!self.follow_page_title or self.closed) return;
+        const hwnd = self.hwnd orelse return;
+        const webview = self.webview orelse return;
+        var text: ?[*:0]u16 = null;
+        const status = webview.method(48, *const fn (*Com, *?[*:0]u16) callconv(.winapi) HRESULT)(webview, &text);
+        defer if (text) |value| CoTaskMemFree(value);
+        if (status < 0) return;
+        const value = text orelse return;
+        // An empty document title keeps the current host title.
+        if (value[0] == 0) return;
+        _ = SetWindowTextW(hwnd, value);
     }
     pub fn navigate(self: *Backend, url: [:0]const u8) !void {
         _ = try self.window();
         const webview = self.webview orelse return error.NativeWindowClosed;
         const text = try std.unicode.utf8ToUtf16LeAllocZ(self.gpa, url);
         defer self.gpa.free(text);
+        self.host_navigation = true;
+        errdefer self.host_navigation = false;
         try check(webview.method(5, *const fn (*Com, [*:0]const u16) callconv(.winapi) HRESULT)(webview, text.ptr));
+    }
+    /// Like upstream's WebKitGTK policy handler, decide page and frame
+    /// navigations in the engine, independent of any bridge connection.
+    fn decideNavigation(self: *Backend, args: ?*Com, top_level: bool) void {
+        const event = args orelse return;
+        // Only the top-level navigation can be the host's own request.
+        if (top_level and self.host_navigation) {
+            self.host_navigation = false;
+            return;
+        }
+        const handler = self.navigation_handler orelse return;
+        if (self.close_requested) return;
+        // A navigation the handler cannot be asked about is cancelled.
+        if (!self.askNavigation(event, handler))
+            _ = event.method(8, *const fn (*Com, i32) callconv(.winapi) HRESULT)(event, 1); // put_Cancel
+    }
+    fn askNavigation(self: *Backend, event: *Com, handler: types.NavigationHandler) bool {
+        var uri: ?[*:0]u16 = null;
+        if (event.method(3, *const fn (*Com, *?[*:0]u16) callconv(.winapi) HRESULT)(event, &uri) < 0) return false;
+        const wide = uri orelse return false;
+        defer CoTaskMemFree(wide);
+        const url = std.unicode.utf16LeToUtf8Alloc(self.gpa, std.mem.sliceTo(wide, 0)) catch return false;
+        defer self.gpa.free(url);
+        var kind: i32 = 2; // NEW_DOCUMENT when Args3 is unavailable
+        var args3: ?*Com = null;
+        if (event.method(0, *const fn (*Com, *const GUID, *?*Com) callconv(.winapi) HRESULT)(event, &iid_navigation_args3, &args3) >= 0) {
+            if (args3) |value| {
+                defer value.release();
+                if (value.method(12, *const fn (*Com, *i32) callconv(.winapi) HRESULT)(value, &kind) < 0) kind = 2;
+            }
+        }
+        return handler(self.user_data, .{ .url = url, .kind = navigationKind(kind) });
     }
     pub fn setSize(self: *Backend, value: types.Size) !void {
         const hwnd = try self.window();
@@ -550,6 +719,10 @@ pub const Backend = struct {
             return error.NativeOperationFailed;
         if (SetWindowPos(hwnd, null, 0, 0, 0, 0, 0x37) == 0) return error.NativeOperationFailed;
     }
+    pub fn dragRegion(self: *const Backend) types.DragRegion {
+        return if (self.non_client_regions) .css_app_region else .none;
+    }
+
     pub fn setResizable(self: *Backend, value: bool) !void {
         _ = try self.window();
         const old = self.resizable;
@@ -788,6 +961,8 @@ extern "user32" fn PeekMessageW(*MSG, ?HWND, u32, u32, u32) callconv(.winapi) i3
 extern "user32" fn TranslateMessage(*const MSG) callconv(.winapi) i32;
 extern "user32" fn DispatchMessageW(*const MSG) callconv(.winapi) isize;
 extern "user32" fn AdjustWindowRectEx(*RECT, u32, i32, u32) callconv(.winapi) i32;
+extern "user32" fn GetWindowTextLengthW(HWND) callconv(.winapi) i32;
+extern "user32" fn GetWindowTextW(HWND, [*]u16, i32) callconv(.winapi) i32;
 extern "user32" fn GetClientRect(HWND, *RECT) callconv(.winapi) i32;
 extern "user32" fn GetWindowRect(HWND, *RECT) callconv(.winapi) i32;
 extern "user32" fn SetWindowPos(HWND, ?HWND, i32, i32, i32, i32, u32) callconv(.winapi) i32;
@@ -801,3 +976,10 @@ extern "user32" fn SetForegroundWindow(HWND) callconv(.winapi) i32;
 extern "user32" fn SetFocus(HWND) callconv(.winapi) ?HWND;
 extern "user32" fn InvalidateRect(HWND, ?*const RECT, i32) callconv(.winapi) i32;
 extern "user32" fn FillRect(*anyopaque, *const RECT, *anyopaque) callconv(.winapi) i32;
+
+test "WebView2 navigation kinds map to portable kinds" {
+    try std.testing.expectEqual(types.NavigationKind.reload, navigationKind(0));
+    try std.testing.expectEqual(types.NavigationKind.back_forward, navigationKind(1));
+    try std.testing.expectEqual(types.NavigationKind.other, navigationKind(2));
+    try std.testing.expectEqual(types.NavigationKind.other, navigationKind(-1));
+}

@@ -127,7 +127,9 @@ fn registerClasses() !void {
             !truth(class_addMethod(class, sel_registerName("windowShouldClose:"), @ptrCast(&windowShouldClose), if (ObjcBool == bool) "B@:@" else "c@:@")) or
             !truth(class_addMethod(class, sel_registerName("windowWillClose:"), @ptrCast(&windowWillClose), "v@:@")) or
             !truth(class_addMethod(class, sel_registerName("webViewDidClose:"), @ptrCast(&webViewDidClose), "v@:@")) or
-            !truth(class_addMethod(class, sel_registerName("userContentController:didReceiveScriptMessage:"), @ptrCast(&didReceiveScriptMessage), "v@:@@")))
+            !truth(class_addMethod(class, sel_registerName("userContentController:didReceiveScriptMessage:"), @ptrCast(&didReceiveScriptMessage), "v@:@@")) or
+            !truth(class_addMethod(class, sel_registerName("observeValueForKeyPath:ofObject:change:context:"), @ptrCast(&observeValue), "v@:@@@^v")) or
+            !truth(class_addMethod(class, sel_registerName("webView:decidePolicyForNavigationAction:decisionHandler:"), @ptrCast(&decidePolicy), "v@:@@@?")))
             return error.NativeInitializationFailed;
         objc_registerClassPair(class);
         delegate_class = class;
@@ -169,6 +171,12 @@ fn webViewDidClose(delegate: Id, _: Sel, webview: Id) callconv(.c) void {
     // The document-start override below handles ordinary JS close requests.
     self.pending_close = true;
 }
+fn observeValue(delegate: Id, _: Sel, _: Id, object: Id, _: Id, _: ?*anyopaque) callconv(.c) void {
+    // Only the WKWebView `title` key path is registered with this observer.
+    const self = context(delegate) orelse return;
+    if (object != self.webview) return;
+    self.applyPageTitle();
+}
 fn didReceiveScriptMessage(delegate: Id, _: Sel, controller: Id, message: Id) callconv(.c) void {
     const self = context(delegate) orelse return;
     if (self.closed or self.pending_close or controller != self.content_controller or
@@ -187,6 +195,35 @@ fn didReceiveScriptMessage(delegate: Id, _: Sel, controller: Id, message: Id) ca
     if (self.allowUserClose()) self.pending_close = true;
     // No native teardown while WebKit is invoking this delegate. The wrapper's
     // per-State callback-depth guard also rejects deinit from the user handler.
+}
+
+/// Leading fields of the Clang block ABI; WebKit passes a stack or heap
+/// block that is only invoked, never copied or retained here.
+const DecisionBlock = extern struct {
+    isa: ?*anyopaque,
+    flags: c_int,
+    reserved: c_int,
+    invoke: *const fn (*DecisionBlock, isize) callconv(.c) void,
+};
+fn decidePolicy(delegate: Id, _: Sel, webview: Id, action: Id, decision: *DecisionBlock) callconv(.c) void {
+    // WebKit requires exactly one decision per request, on every path.
+    const allow = if (context(delegate)) |self| self.allowNavigation(webview, action) else true;
+    decision.invoke(decision, @intFromBool(allow)); // WKNavigationActionPolicyCancel = 0, Allow = 1
+}
+fn isMainFrame(action: Id) bool {
+    const frame = send0(Id, action, "targetFrame") orelse return false;
+    return truth(send0(ObjcBool, frame, "isMainFrame"));
+}
+/// WKNavigationType to the portable kind.
+fn navigationKind(value: isize) types.NavigationKind {
+    return switch (value) {
+        0 => .link,
+        1 => .form_submission,
+        2 => .back_forward,
+        3 => .reload,
+        4 => .form_resubmission,
+        else => .other,
+    };
 }
 
 pub const Backend = struct {
@@ -208,13 +245,21 @@ pub const Backend = struct {
     closed: bool = false,
     in_close_handler: bool = false,
     close_handler: ?types.CloseHandler,
+    navigation_handler: ?types.NavigationHandler,
     user_data: ?*anyopaque,
+    // Set before each host load so its own policy decision is not reported.
+    host_navigation: bool = false,
     resizable: bool,
     frameless: bool,
     kiosk: bool = false,
     kiosk_frame: Rect = undefined,
     kiosk_level: isize = 0,
     minimum_size: types.Size = .{ .width = 1, .height = 1 },
+    follow_page_title: bool,
+    // +1 key path. KVO does not retain the observer; destroy removes it once
+    // with this retained key, so teardown never allocates.
+    title_key: Id = null,
+    title_observed: bool = false,
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, url: [:0]const u8, options: types.Options) !*Backend {
         _ = io; // No asynchronous initialization or waiting: loadRequest starts navigation.
@@ -243,9 +288,11 @@ pub const Backend = struct {
             .gpa = gpa,
             .app = app,
             .close_handler = options.close_handler,
+            .navigation_handler = options.navigation_handler,
             .user_data = options.user_data,
             .resizable = options.resizable,
             .frameless = options.frameless,
+            .follow_page_title = options.follow_page_title,
         };
         errdefer self.destroy();
         self.delegate = send0(Id, send0(Id, delegate_class, "alloc"), "init") orelse return error.NativeInitializationFailed;
@@ -256,6 +303,7 @@ pub const Backend = struct {
         // A close removes this window, but must not release our owning ref.
         send1(void, self.window, "setReleasedWhenClosed:", ObjcBool, yes(false));
         send1(void, self.window, "setDelegate:", Id, self.delegate);
+        self.applyMovable();
         // Suppress AppKit automatic tab grouping across independent WebUI windows.
         if (truth(send1(ObjcBool, self.window, "respondsToSelector:", Sel, sel_registerName("setTabbingMode:"))))
             send1(void, self.window, "setTabbingMode:", isize, 2);
@@ -279,11 +327,17 @@ pub const Backend = struct {
         send1(void, configuration, "setUserContentController:", Id, self.content_controller);
         self.webview = send2(Id, send0(Id, objc_getClass("WKWebView"), "alloc"), "initWithFrame:configuration:", Rect, frame, Id, configuration) orelse return error.NativeInitializationFailed;
         send1(void, self.webview, "setUIDelegate:", Id, self.delegate);
+        send1(void, self.webview, "setNavigationDelegate:", Id, self.delegate);
         send1(void, self.webview, "setAutoresizingMask:", usize, 2 | 16);
         send1(void, self.window, "setContentView:", Id, self.webview);
-        const title = try string(options.title);
-        defer release(title);
-        send1(void, self.window, "setTitle:", Id, title);
+        // WKWebView's title is KVO-compliant and also reports document.title
+        // changes after load, which upstream's didFinishNavigation misses.
+        self.title_key = try string("title");
+        send4(void, self.webview, "addObserver:forKeyPath:options:context:", Id, self.delegate, Id, self.title_key, usize, 1, ?*anyopaque, null);
+        self.title_observed = true;
+        const initial_title = try string(options.title);
+        defer release(initial_title);
+        send1(void, self.window, "setTitle:", Id, initial_title);
         if (options.minimum_size) |minimum| try self.setMinimumSize(minimum);
         if (options.position) |position| try self.setPosition(position);
         if (options.center) try self.center();
@@ -310,11 +364,16 @@ pub const Backend = struct {
         // reference before releasing the controller/webview and our owning refs.
         if (self.delegate != null)
             _ = object_setInstanceVariable(self.delegate, context_ivar, null);
+        if (self.title_observed) {
+            send2(void, self.webview, "removeObserver:forKeyPath:", Id, self.delegate, Id, self.title_key);
+            self.title_observed = false;
+        }
         if (self.message_name != null)
             send1(void, self.content_controller, "removeScriptMessageHandlerForName:", Id, self.message_name);
         send0(void, self.content_controller, "removeAllUserScripts");
         send1(void, self.window, "setDelegate:", Id, null);
         send1(void, self.webview, "setUIDelegate:", Id, null);
+        send1(void, self.webview, "setNavigationDelegate:", Id, null);
         send0(void, self.webview, "stopLoading");
         if (self.window != null and !self.closed) send0(void, self.window, "close");
         send1(void, self.window, "setContentView:", Id, null);
@@ -322,6 +381,7 @@ pub const Backend = struct {
         release(self.content_controller);
         release(self.message_body);
         release(self.message_name);
+        release(self.title_key);
         release(self.window);
         release(self.delegate);
         self.gpa.destroy(self);
@@ -372,6 +432,15 @@ pub const Backend = struct {
         send1(void, self.window, "setContentView:", Id, self.webview);
         send1(void, self.window, "setContentSize:", Size, content.size);
         send1(void, self.window, "setFrameOrigin:", Point, frame.origin);
+        self.applyMovable();
+    }
+    fn applyMovable(self: *Backend) void {
+        // Upstream WebUI: frameless windows move by dragging their background.
+        // WebKit decides which page points count as background.
+        send1(void, self.window, "setMovableByWindowBackground:", ObjcBool, yes(self.frameless and !self.kiosk));
+    }
+    pub fn dragRegion(_: *const Backend) types.DragRegion {
+        return .window_background;
     }
 
     pub fn close(self: *Backend) !void {
@@ -383,13 +452,36 @@ pub const Backend = struct {
         self.closed = true;
         self.pending_close = false;
     }
-    pub fn setTitle(self: *Backend, title: [:0]const u8) !void {
+    pub fn setTitle(self: *Backend, value: [:0]const u8) !void {
         try self.requireOpen();
         const autorelease_pool = pool();
         defer drain(autorelease_pool);
-        const text = try string(title);
+        const text = try string(value);
         defer release(text);
         send1(void, self.window, "setTitle:", Id, text);
+    }
+    pub fn title(self: *Backend, gpa: std.mem.Allocator) ![]u8 {
+        try self.requireOpen();
+        const autorelease_pool = pool();
+        defer drain(autorelease_pool);
+        const value = send0(Id, self.window, "title") orelse return gpa.dupe(u8, "");
+        // UTF8String is autoreleased; copy it before draining the pool.
+        const bytes = send0(?[*:0]const u8, value, "UTF8String") orelse return error.InvalidNativeText;
+        return gpa.dupe(u8, std.mem.sliceTo(bytes, 0));
+    }
+    pub fn setFollowPageTitle(self: *Backend, value: bool) !void {
+        try self.requireOpen();
+        self.follow_page_title = value;
+        if (value) self.applyPageTitle();
+    }
+    fn applyPageTitle(self: *Backend) void {
+        if (!self.follow_page_title or self.closed) return;
+        const autorelease_pool = pool();
+        defer drain(autorelease_pool);
+        // nil before a document title exists; empty keeps the host title.
+        const value = send0(Id, self.webview, "title") orelse return;
+        if (send0(usize, value, "length") == 0) return;
+        send1(void, self.window, "setTitle:", Id, value);
     }
     pub fn navigate(self: *Backend, url: [:0]const u8) !void {
         try self.requireOpen();
@@ -399,7 +491,31 @@ pub const Backend = struct {
         defer release(text);
         const address = send1(Id, objc_getClass("NSURL"), "URLWithString:", Id, text) orelse return error.InvalidNativeUrl;
         const request = send1(Id, objc_getClass("NSURLRequest"), "requestWithURL:", Id, address) orelse return error.InvalidNativeUrl;
+        self.host_navigation = true;
+        errdefer self.host_navigation = false;
         _ = send1(Id, self.webview, "loadRequest:", Id, request) orelse return error.NativeNavigationFailed;
+    }
+    /// Like upstream's WebKitGTK policy handler, decide page and frame
+    /// navigations in the engine, independent of any bridge connection.
+    fn allowNavigation(self: *Backend, webview: Id, action: Id) bool {
+        if (self.closed or webview != self.webview) return true;
+        // Only a main-frame navigation can be the host's own request.
+        if (self.host_navigation and isMainFrame(action)) {
+            self.host_navigation = false;
+            return true;
+        }
+        const handler = self.navigation_handler orelse return true;
+        const autorelease_pool = pool();
+        defer drain(autorelease_pool);
+        // A navigation the handler cannot be asked about is cancelled.
+        const request = send0(Id, action, "request") orelse return false;
+        const address = send0(Id, request, "URL") orelse return false;
+        const text = send0(Id, address, "absoluteString") orelse return false;
+        const bytes = send0(?[*:0]const u8, text, "UTF8String") orelse return false;
+        return handler(self.user_data, .{
+            .url = std.mem.sliceTo(bytes, 0),
+            .kind = navigationKind(send0(isize, action, "navigationType")),
+        });
     }
     pub fn setSize(self: *Backend, value: types.Size) !void {
         try self.requireOpen();
@@ -488,6 +604,7 @@ pub const Backend = struct {
             self.kiosk_level = send0(isize, self.window, "level");
             self.kiosk = true;
             send1(void, self.window, "setStyleMask:", usize, self.style());
+            self.applyMovable();
             // NSMainMenuWindowLevel + 1, from NSWindow.h/CGWindowLevel.h.
             // Per-window presentation: no app-wide menu/Dock changes or quit.
             send1(void, self.window, "setLevel:", isize, 25);
@@ -496,6 +613,7 @@ pub const Backend = struct {
             self.kiosk = false;
             send1(void, self.window, "setLevel:", isize, self.kiosk_level);
             send1(void, self.window, "setStyleMask:", usize, self.style());
+            self.applyMovable();
             send2(void, self.window, "setFrame:display:", Rect, self.kiosk_frame, ObjcBool, yes(true));
         }
     }
@@ -571,4 +689,11 @@ fn dimension(value: f64) !u32 {
     if (!std.math.isFinite(rounded) or rounded < 1 or rounded > 2147483647.0)
         return error.NativeGeometryOutOfRange;
     return @intFromFloat(rounded);
+}
+
+test "WKNavigationType values map to portable kinds" {
+    const expected = [_]types.NavigationKind{ .link, .form_submission, .back_forward, .reload, .form_resubmission };
+    for (expected, 0..) |kind, value| try std.testing.expectEqual(kind, navigationKind(@intCast(value)));
+    try std.testing.expectEqual(types.NavigationKind.other, navigationKind(-1));
+    try std.testing.expectEqual(types.NavigationKind.other, navigationKind(42));
 }

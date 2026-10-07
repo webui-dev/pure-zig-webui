@@ -79,7 +79,9 @@ pub const WindowControls = struct {
             .firefox => {
                 if (self.proxy_server != null)
                     return error.UnsupportedBrowserProxy;
-                if (!self.high_contrast)
+                // Firefox has no flag for it: the override is a preference
+                // that only a WebUI-generated profile may receive.
+                if (!self.high_contrast and self.profile_directory != null)
                     return error.UnsupportedBrowserHighContrast;
                 if (self.position != null)
                     return error.UnsupportedBrowserControl;
@@ -258,17 +260,27 @@ pub fn bestBrowser(
     return null;
 }
 
+/// Launch a browser window. `managed_profile` is a WebUI-generated profile
+/// used when `controls.profile_directory` is null; Firefox receives WebUI's
+/// app-mode settings in it. A caller profile is never modified.
 pub fn launch(
     gpa: std.mem.Allocator,
     io: std.Io,
     url: []const u8,
     options: LaunchOptions,
     controls: WindowControls,
+    managed_profile: ?[]const u8,
 ) !std.process.Child {
     if (url.len == 0) return error.InvalidUrl;
     if (options.executable) |executable|
         if (executable.len == 0) return error.InvalidBrowserExecutable;
     try controls.validateFor(options.browser);
+    if (managed_profile) |directory| {
+        if (controls.profile_directory != null) return error.InvalidBrowserProfile;
+        try (WindowControls{ .profile_directory = directory }).validate();
+    }
+    if (options.browser == .firefox and !controls.high_contrast and managed_profile == null)
+        return error.UnsupportedBrowserHighContrast;
 
     const discovered = if (options.executable == null)
         try resolveExecutable(gpa, io, options.browser) orelse
@@ -285,9 +297,12 @@ pub fn launch(
 
     // The owner supplies its retained per-window profile. Never fall back to
     // the shared family root: Chromium would hand the URL to another process.
-    if (isChromium(options.browser) and controls.profile_directory == null)
+    const profile = controls.profile_directory orelse managed_profile;
+    if (isChromium(options.browser) and profile == null)
         return error.ManagedBrowserProfileRequired;
-    const profile = controls.profile_directory;
+    if (options.browser == .firefox)
+        if (managed_profile) |directory|
+            try prepareFirefoxProfile(io, directory, controls.high_contrast);
     const profile_argument = if (profile) |directory|
         switch (options.browser) {
             .firefox, .safari => null,
@@ -435,19 +450,26 @@ fn managedProfileName(selected: Browser) ?[]const u8 {
         .yandex => "WebUIYandexProfile",
         .opera => "WebUIOperaProfile",
         .chromium => "WebUIChromiumProfile",
-        // Firefox profiles live in profiles.ini rather than a directory
-        // argument, and Safari has no profile support at all.
-        .firefox, .safari => null,
+        .firefox => "WebUIFirefoxProfile",
+        // Safari has no profile support at all.
+        .safari => null,
     };
 }
 
 /// Root of the generated per-window profiles for one browser family. Returns
-/// null when no managed profile applies. Caller owns the returned memory.
+/// null when no managed profile applies. On Linux with Snap Firefox
+/// installed, Firefox profiles live in the snap's own user directory,
+/// because a snap cannot see the host `/tmp`; it returns
+/// `error.HomeDirectoryUnavailable` when that directory is unknown.
+/// Caller owns the returned memory.
 pub fn managedProfileDirectory(
     gpa: std.mem.Allocator,
+    io: std.Io,
     selected: Browser,
 ) !?[]u8 {
     const name = managedProfileName(selected) orelse return null;
+    if (selected == .firefox)
+        if (try snapFirefoxProfileRoot(gpa, io)) |root| return root;
     return switch (builtin.os.tag) {
         .windows => blk: {
             const temp = (std.process.Environ{ .block = .global })
@@ -472,10 +494,11 @@ pub fn managedProfileDirectory(
 /// by App.start, not a caller-supplied filesystem path.
 pub fn managedWindowProfileDirectory(
     gpa: std.mem.Allocator,
+    io: std.Io,
     selected: Browser,
     identity: []const u8,
 ) !?[]u8 {
-    const root = try managedProfileDirectory(gpa, selected) orelse return null;
+    const root = try managedProfileDirectory(gpa, io, selected) orelse return null;
     defer gpa.free(root);
     return try std.fs.path.join(gpa, &.{ root, identity });
 }
@@ -488,9 +511,93 @@ pub fn deleteManagedProfile(
     io: std.Io,
     selected: Browser,
 ) !bool {
-    const path = try managedProfileDirectory(gpa, selected) orelse return false;
+    const path = try managedProfileDirectory(gpa, io, selected) orelse return false;
     defer gpa.free(path);
     return deleteProfilePath(io, path);
+}
+
+/// Preferences written to every generated Firefox profile, like upstream:
+/// userChrome.css support, no default-browser check, close warning, or tabs
+/// in the title bar. The first-run pages are also suppressed, matching
+/// Chromium's `--no-first-run`.
+const firefox_user_js =
+    \\user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
+    \\user_pref("browser.shell.checkDefaultBrowser", false);
+    \\user_pref("browser.tabs.warnOnClose", false);
+    \\user_pref("browser.tabs.inTitlebar", 0);
+    \\user_pref("browser.startup.homepage_override.mstone", "ignore");
+    \\user_pref("startup.homepage_welcome_url", "");
+    \\user_pref("startup.homepage_welcome_url.additional", "");
+    \\user_pref("browser.aboutwelcome.enabled", false);
+    \\user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
+    \\
+;
+/// Upstream's userChrome.css: hide the toolbars so the page fills the window.
+const firefox_user_chrome =
+    "#navigator-toolbox,#TabsToolbar,#nav-bar,#PersonalToolbar,#sidebar-box{" ++
+    "visibility:collapse!important;height:0!important;margin:0!important;padding:0!important;}" ++
+    "#titlebar{visibility:visible!important;display:flex!important;}#browser{" ++
+    "margin-top:0!important;padding-top:0!important;}";
+
+/// Write WebUI's app-mode settings into a generated Firefox profile. Firefox
+/// applies `user.js` at every start, so it is rewritten on each launch and a
+/// changed high-contrast setting takes effect; 0 restores Firefox's default
+/// after an earlier launch stored 1 in prefs.js.
+fn prepareFirefoxProfile(io: std.Io, directory: []const u8, high_contrast: bool) !void {
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, directory);
+    var profile = try cwd.openDir(io, directory, .{});
+    defer profile.close(io);
+    try profile.writeFile(io, .{
+        .sub_path = "user.js",
+        .data = if (high_contrast)
+            firefox_user_js ++ "user_pref(\"browser.display.document_color_use\", 0);\n"
+        else
+            firefox_user_js ++ "user_pref(\"browser.display.document_color_use\", 1);\n",
+    });
+    try profile.createDirPath(io, "chrome");
+    try profile.writeFile(io, .{ .sub_path = "chrome/userChrome.css", .data = firefox_user_chrome });
+}
+
+/// The managed Firefox root inside Snap Firefox's user directory, or null
+/// when Snap Firefox is not installed. Upstream uses the same location.
+fn snapFirefoxProfileRoot(gpa: std.mem.Allocator, io: std.Io) !?[]u8 {
+    if (builtin.os.tag != .linux) return null;
+    std.Io.Dir.accessAbsolute(io, "/snap/bin/firefox", .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    // snapd derives a snap's user directories from the account's passwd
+    // home, which is also the only home known without a process environment.
+    const passwd = std.Io.Dir.cwd().readFileAlloc(io, "/etc/passwd", gpa, .limited(4 << 20)) catch |err|
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.HomeDirectoryUnavailable,
+        };
+    defer gpa.free(passwd);
+    const home = passwdHome(passwd, std.os.linux.getuid()) orelse
+        return error.HomeDirectoryUnavailable;
+    return try std.fs.path.join(gpa, &.{ home, "snap/firefox/common/.mozilla/firefox/.WebUI/WebUIFirefoxProfile" });
+}
+
+/// The absolute home directory of `uid` in passwd(5) text, if listed.
+fn passwdHome(passwd: []const u8, uid: u32) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, passwd, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ':');
+        _ = fields.next() orelse continue; // name
+        _ = fields.next() orelse continue; // password
+        const uid_text = fields.next() orelse continue;
+        _ = fields.next() orelse continue; // group
+        _ = fields.next() orelse continue; // comment
+        const home = fields.next() orelse continue;
+        if (fields.next() == null) continue; // shell
+        const entry_uid = std.fmt.parseInt(u32, uid_text, 10) catch continue;
+        if (entry_uid != uid) continue;
+        if (home.len < 2 or home[0] != '/') return null;
+        return home;
+    }
+    return null;
 }
 
 /// Internal ownership helper; only call with a generated root or retained leaf.
@@ -561,10 +668,17 @@ fn resolveWindowsExecutable(
     selected: Browser,
 ) !?[]u8 {
     const executable = windowsExecutable(selected);
-    if (try commandValue(gpa, io, &.{ "where.exe", executable }, null)) |path| return path;
-    // ponytail: Chrome and Chromium share chrome.exe on Windows; inspect
-    // installation metadata if standalone Chromium detection becomes needed.
-    if (selected == .chromium) return null;
+    if (try commandValue(gpa, io, &.{ "where.exe", executable }, null)) |path| {
+        if (try windowsChromeMatches(io, selected, path)) return path;
+        gpa.free(path);
+    }
+    // Chromium builds also install and register `chrome.exe`.
+    const registered = if (selected == .chromium) windowsExecutable(.chrome) else executable;
+    if (selected == .chromium)
+        if (try commandValue(gpa, io, &.{ "where.exe", registered }, null)) |path| {
+            if (try windowsChromeMatches(io, selected, path)) return path;
+            gpa.free(path);
+        };
 
     var key_buffer: [160]u8 = undefined;
     for ([_][]const u8{ "HKCU", "HKLM" }) |root| {
@@ -572,16 +686,46 @@ fn resolveWindowsExecutable(
             &key_buffer,
             "{s}\\Software\\Microsoft\\Windows\\CurrentVersion\\" ++
                 "App Paths\\{s}",
-            .{ root, executable },
+            .{ root, registered },
         );
-        if (try commandValue(gpa, io, &.{
+        const path = try commandValue(gpa, io, &.{
             "reg.exe",
             "query",
             key,
             "/ve",
-        }, "REG_SZ")) |path| return path;
+        }, "REG_SZ") orelse continue;
+        if (try windowsChromeMatches(io, selected, path)) return path;
+        gpa.free(path);
     }
     return null;
+}
+
+/// Chrome and Chromium share `chrome.exe`. Like upstream, a Google Chrome
+/// install is recognised by the `initial_preferences` or legacy
+/// `master_preferences` file Google's installer leaves beside it. Other
+/// browsers and a `chromium.exe` always match.
+fn windowsChromeMatches(io: std.Io, selected: Browser, executable_path: []const u8) !bool {
+    const shared = std.ascii.eqlIgnoreCase(std.fs.path.basenameWindows(executable_path), "chrome.exe");
+    return switch (selected) {
+        .chrome => try isGoogleChromeInstall(io, executable_path),
+        .chromium => !shared or !try isGoogleChromeInstall(io, executable_path),
+        else => true,
+    };
+}
+
+fn isGoogleChromeInstall(io: std.Io, executable_path: []const u8) !bool {
+    const folder = std.fs.path.dirnameWindows(executable_path) orelse return false;
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "initial_preferences", "master_preferences" }) |name| {
+        const path = std.fmt.bufPrint(&path_buffer, "{s}{c}{s}", .{ folder, std.fs.path.sep, name }) catch
+            return false;
+        std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied => continue,
+            else => return err,
+        };
+        return true;
+    }
+    return false;
 }
 
 fn resolveMacosExecutable(
@@ -589,28 +733,91 @@ fn resolveMacosExecutable(
     io: std.Io,
     selected: Browser,
 ) !?[]u8 {
-    for ([_][]const u8{ "/Applications", "/System/Applications" }) |root| {
-        const path = try std.fmt.allocPrint(
-            gpa,
-            "{s}/{s}.app/Contents/MacOS/{s}",
-            .{
-                root,
-                macosApplication(selected),
-                macosExecutable(selected),
-            },
-        );
-        std.Io.Dir.accessAbsolute(io, path, .{ .execute = true }) catch |err| {
-            gpa.free(path);
-            switch (err) {
-                error.FileNotFound,
-                error.AccessDenied,
-                error.PermissionDenied,
-                => continue,
-                else => return err,
-            }
-        };
-        return path;
+    const home: ?[]const u8 = if (builtin.link_libc)
+        if (std.c.getenv("HOME")) |value| std.mem.sliceTo(value, 0) else null
+    else
+        null;
+    const user_applications: ?[]u8 = if (home) |directory|
+        try std.fmt.allocPrint(gpa, "{s}/Applications", .{directory})
+    else
+        null;
+    defer if (user_applications) |path| gpa.free(path);
+    for ([_]?[]const u8{ "/Applications", "/System/Applications", user_applications }) |candidate| {
+        const root = candidate orelse continue;
+        if (!std.fs.path.isAbsolutePosix(root)) continue;
+        const bundle = try std.fmt.allocPrint(gpa, "{s}/{s}.app", .{ root, macosApplication(selected) });
+        defer gpa.free(bundle);
+        if (try macosBundleExecutable(gpa, io, bundle, selected)) |path| return path;
     }
+    // Bundles anywhere else, like upstream's LaunchServices lookup, through
+    // Spotlight's bundle-identifier index. `open -R -a` is not used: it
+    // reveals the application in Finder.
+    var query_buffer: [96]u8 = undefined;
+    const query = try std.fmt.bufPrint(
+        &query_buffer,
+        "kMDItemCFBundleIdentifier == '{s}'",
+        .{macosBundleIdentifier(selected)},
+    );
+    const output = try commandOutput(gpa, io, &.{ "mdfind", query }) orelse return null;
+    defer gpa.free(output);
+    return spotlightBundleExecutable(gpa, io, output, selected);
+}
+
+/// The first executable browser in `mdfind` output: one absolute `.app`
+/// path per line. Unexpected lines are skipped.
+fn spotlightBundleExecutable(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    output: []const u8,
+    selected: Browser,
+) !?[]u8 {
+    var lines = std.mem.tokenizeAny(u8, output, "\r\n");
+    while (lines.next()) |bundle| {
+        if (!std.fs.path.isAbsolutePosix(bundle) or !std.mem.endsWith(u8, bundle, ".app"))
+            continue;
+        if (try macosBundleExecutable(gpa, io, bundle, selected)) |path| return path;
+    }
+    return null;
+}
+
+fn macosBundleExecutable(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    bundle: []const u8,
+    selected: Browser,
+) !?[]u8 {
+    const path = try std.fmt.allocPrint(gpa, "{s}/Contents/MacOS/{s}", .{ bundle, macosExecutable(selected) });
+    std.Io.Dir.accessAbsolute(io, path, .{ .execute = true }) catch |err| {
+        gpa.free(path);
+        return switch (err) {
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied => null,
+            else => err,
+        };
+    };
+    return path;
+}
+
+/// Complete stdout of a successful command, or null when the program is
+/// missing or fails. Caller owns the returned memory.
+fn commandOutput(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) !?[]u8 {
+    const result = std.process.run(gpa, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(64 << 10),
+        .stderr_limit = .limited(64 << 10),
+    }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.InvalidExe => return null,
+        else => return err,
+    };
+    gpa.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return result.stdout,
+        else => {},
+    }
+    gpa.free(result.stdout);
     return null;
 }
 
@@ -685,6 +892,20 @@ fn macosApplication(selected: Browser) []const u8 {
     };
 }
 
+fn macosBundleIdentifier(selected: Browser) []const u8 {
+    return switch (selected) {
+        .chrome => "com.google.Chrome",
+        .firefox => "org.mozilla.firefox",
+        .edge => "com.microsoft.edgemac",
+        .safari => "com.apple.Safari",
+        .chromium => "org.chromium.Chromium",
+        .opera => "com.operasoftware.Opera",
+        .brave => "com.brave.Browser",
+        .vivaldi => "com.vivaldi.Vivaldi",
+        .epic => "com.hiddenreflex.Epic",
+        .yandex => "ru.yandex.desktop.yandex-browser",
+    };
+}
 fn macosExecutable(selected: Browser) []const u8 {
     return switch (selected) {
         .firefox => "firefox",
@@ -791,9 +1012,12 @@ test "window controls validate browser support" {
         (WindowControls{ .proxy_server = "http://127.0.0.1:8080" })
             .validateFor(.safari),
     );
+    // Firefox gets the override only through a WebUI-generated profile.
+    try (WindowControls{ .high_contrast = false }).validateFor(.firefox);
     try std.testing.expectError(
         error.UnsupportedBrowserHighContrast,
-        (WindowControls{ .high_contrast = false }).validateFor(.firefox),
+        (WindowControls{ .high_contrast = false, .profile_directory = "profiles/firefox" })
+            .validateFor(.firefox),
     );
     try std.testing.expectError(
         error.UnsupportedBrowserHighContrast,
@@ -830,12 +1054,17 @@ test "window controls validate browser support" {
 test "managed profiles and default arguments cover the chromium family" {
     const gpa = std.testing.allocator;
     for (std.enums.values(Browser)) |selected| {
-        const directory = try managedProfileDirectory(gpa, selected);
+        const directory = try managedProfileDirectory(gpa, std.testing.io, selected);
         defer if (directory) |value| gpa.free(value);
         switch (selected) {
-            .firefox, .safari => {
+            .safari => {
                 try std.testing.expect(!isChromium(selected));
                 try std.testing.expectEqual(@as(?[]u8, null), directory);
+            },
+            .firefox => {
+                try std.testing.expect(!isChromium(selected));
+                // /tmp, or the snap's user directory when Snap Firefox exists.
+                try std.testing.expectStringEndsWith(directory.?, "WebUIFirefoxProfile");
             },
             else => {
                 try std.testing.expect(isChromium(selected));
@@ -873,6 +1102,93 @@ test "managed profiles and default arguments cover the chromium family" {
         try std.testing.expectStringStartsWith(argument, "--");
 }
 
+test "generated Firefox profiles receive WebUI app-mode settings" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/firefox/window",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(directory);
+    var buffer: [2048]u8 = undefined;
+    try prepareFirefoxProfile(io, directory, false);
+    var user_js = try tmp.dir.readFile(io, "firefox/window/user.js", &buffer);
+    try std.testing.expect(std.mem.startsWith(u8, user_js, firefox_user_js));
+    try std.testing.expect(std.mem.endsWith(u8, user_js, "user_pref(\"browser.display.document_color_use\", 1);\n"));
+    try std.testing.expectEqualStrings(
+        firefox_user_chrome,
+        try tmp.dir.readFile(io, "firefox/window/chrome/userChrome.css", &buffer),
+    );
+    // Relaunching rewrites rather than appends, and restores the default.
+    try prepareFirefoxProfile(io, directory, true);
+    user_js = try tmp.dir.readFile(io, "firefox/window/user.js", &buffer);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, user_js, "legacyUserProfileCustomizations"));
+    try std.testing.expect(std.mem.endsWith(u8, user_js, "user_pref(\"browser.display.document_color_use\", 0);\n"));
+    try std.testing.expectEqualStrings(
+        firefox_user_chrome,
+        try tmp.dir.readFile(io, "firefox/window/chrome/userChrome.css", &buffer),
+    );
+    // A file where the profile should be is reported, not replaced.
+    try tmp.dir.writeFile(io, .{ .sub_path = "occupied", .data = "" });
+    const occupied = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/occupied", .{tmp.sub_path});
+    defer std.testing.allocator.free(occupied);
+    try std.testing.expectError(error.NotDir, prepareFirefoxProfile(io, occupied, true));
+}
+
+test "passwd home lookup accepts only well-formed absolute entries" {
+    const passwd =
+        \\# comment line
+        \\root:x:0:0:root:/root:/bin/bash
+        \\short:x:1000
+        \\badid:x:10x0:1000::/home/bad:/bin/sh
+        \\relative:x:1001:1001::home/relative:/bin/sh
+        \\nohome:x:1002:1002:::/bin/sh
+        \\jin:x:1000:1000:Jin,,,:/home/jin:/bin/zsh
+        \\noshell:x:1003:1003::/home/noshell
+    ;
+    try std.testing.expectEqualStrings("/root", passwdHome(passwd, 0).?);
+    try std.testing.expectEqualStrings("/home/jin", passwdHome(passwd, 1000).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdHome(passwd, 1001));
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdHome(passwd, 1002));
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdHome(passwd, 1003));
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdHome(passwd, 4242));
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdHome("", 0));
+    try std.testing.expectEqual(@as(?[]const u8, null), passwdHome("root:x:0:0:root:/:/bin/sh", 0));
+}
+
+test "Firefox launches reject profile combinations they cannot honour" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // No generated profile means no place for the high-contrast override.
+    try std.testing.expectError(error.UnsupportedBrowserHighContrast, launch(
+        gpa,
+        io,
+        "http://127.0.0.1:1/",
+        .{ .browser = .firefox, .executable = "missing-firefox" },
+        .{ .high_contrast = false },
+        null,
+    ));
+    // A generated profile never replaces a caller profile.
+    try std.testing.expectError(error.InvalidBrowserProfile, launch(
+        gpa,
+        io,
+        "http://127.0.0.1:1/",
+        .{ .browser = .firefox, .executable = "missing-firefox" },
+        .{ .profile_directory = "caller" },
+        "generated",
+    ));
+    try std.testing.expectError(error.InvalidBrowserProfile, launch(
+        gpa,
+        io,
+        "http://127.0.0.1:1/",
+        .{ .browser = .firefox, .executable = "missing-firefox" },
+        .{},
+        "",
+    ));
+}
+
 test "parent process ID identifies the backend process" {
     const actual = try parentProcessId();
     try std.testing.expect(actual != 0);
@@ -894,6 +1210,75 @@ test "browser focus has an explicit platform contract" {
             error.UnsupportedPlatform,
             focusProcess(@as(ProcessId, 1)),
         );
+    }
+}
+
+test "Windows Chrome and Chromium installs are told apart by Google's installer files" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "google/chrome.exe", "google/initial_preferences", "legacy/CHROME.EXE", "legacy/master_preferences", "chromium/chrome.exe", "renamed/chromium.exe" }) |sub_path| {
+        try tmp.dir.createDirPath(io, std.fs.path.dirname(sub_path).?);
+        try tmp.dir.writeFile(io, .{ .sub_path = sub_path, .data = "" });
+    }
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const Case = struct { path: []const u8, chrome: bool, chromium: bool };
+    for ([_]Case{
+        .{ .path = "google/chrome.exe", .chrome = true, .chromium = false },
+        .{ .path = "legacy/CHROME.EXE", .chrome = true, .chromium = false },
+        .{ .path = "chromium/chrome.exe", .chrome = false, .chromium = true },
+        // A dedicated executable name needs no installer evidence.
+        .{ .path = "renamed/chromium.exe", .chrome = false, .chromium = true },
+        // A registered path whose folder vanished is never Google Chrome.
+        .{ .path = "missing/chrome.exe", .chrome = false, .chromium = true },
+    }) |case| {
+        const path = try std.fmt.bufPrint(&buffer, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, case.path });
+        try std.testing.expectEqual(case.chrome, try windowsChromeMatches(io, .chrome, path));
+        try std.testing.expectEqual(case.chromium, try windowsChromeMatches(io, .chromium, path));
+        try std.testing.expect(try windowsChromeMatches(io, .edge, path));
+    }
+    try std.testing.expect(!try windowsChromeMatches(io, .chrome, "chrome.exe"));
+}
+
+test "macOS bundles resolve from Spotlight output" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "Custom/Google Chrome.app/Contents/MacOS");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "Custom/Google Chrome.app/Contents/MacOS/Google Chrome",
+        .data = "",
+        .flags = .{ .permissions = .executable_file },
+    });
+    try tmp.dir.createDirPath(io, "Plain/Google Chrome.app/Contents/MacOS");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Plain/Google Chrome.app/Contents/MacOS/Google Chrome", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const output = try std.fmt.allocPrint(
+        gpa,
+        "relative/Google Chrome.app\n\n/not/a/bundle\n{0s}/Missing.app\n{0s}/Plain/Google Chrome.app\n{0s}/Custom/Google Chrome.app\r\n",
+        .{root},
+    );
+    defer gpa.free(output);
+    const found = (try spotlightBundleExecutable(gpa, io, output, .chrome)).?;
+    defer gpa.free(found);
+    const expected = try std.fmt.allocPrint(gpa, "{s}/Custom/Google Chrome.app/Contents/MacOS/Google Chrome", .{root});
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, found);
+    try std.testing.expectEqual(@as(?[]u8, null), try spotlightBundleExecutable(gpa, io, "", .chrome));
+    try std.testing.expectEqual(@as(?[]u8, null), try spotlightBundleExecutable(gpa, io, output, .firefox));
+    // A missing lookup program is an unavailable result, not an error.
+    try std.testing.expectEqual(@as(?[]u8, null), try commandOutput(gpa, io, &.{"webui-missing-lookup-program"}));
+
+    var identifiers: std.StringHashMapUnmanaged(void) = .empty;
+    defer identifiers.deinit(gpa);
+    for (std.enums.values(Browser)) |selected| {
+        const identifier = macosBundleIdentifier(selected);
+        try std.testing.expect(std.mem.indexOfScalar(u8, identifier, '.') != null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, identifier, '\'') == null);
+        try std.testing.expect(!(try identifiers.getOrPut(gpa, identifier)).found_existing);
     }
 }
 

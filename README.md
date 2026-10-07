@@ -9,10 +9,9 @@ compile or link the upstream WebUI C library or CivetWeb.
 [Linsang](https://github.com/jinzhongjia/Linsang) provides HTTP and WebSocket
 support.
 
-The core rewrite is substantial, but full upstream behavioral parity is not
-complete. A fresh source audit found gaps in content composition, live window
-creation/destruction, Firefox app profiles, and native drag/resize, title and
-navigation integration. See the
+The semantic gaps found by the latest upstream source audit are closed. The
+remaining listed difference is the default presentation policy (F5, context
+menu, DevTools), kept as an intentional UI choice. See the
 [open semantic gaps](docs/PURE_ZIG_REFACTOR.md#open-semantic-gaps)
 and the [source comparison](docs/UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
@@ -70,8 +69,9 @@ The current phase provides:
 - explicit browser launching with custom executable paths and argv;
 - per-window kiosk and headless modes plus persistent initial and runtime size
   and position;
-- per-window Chromium forced-color control and browser-native high-contrast
-  detection;
+- per-window Chromium and Firefox forced-color control and browser-native
+  high-contrast detection;
+- generated Firefox app profiles that hide the browser toolbars;
 - per-window browser profile directories with deletable managed profiles,
   and Chromium-family proxy rules;
 - per-window browser child identifiers and deterministic process cleanup;
@@ -138,15 +138,48 @@ should run `zig build test-bridge`, which fails when Node is unavailable.
 `Window.evalAll` returns owned results; call `deinit` on them after consuming
 every per-client outcome.
 
-`Running.wait()` normally returns once every client is gone. Backend close
-requests bypass its 1.5-second reconnect grace period; other disconnects should
-receive that grace so reloads and `Window.setContent()` can reconnect.
-Known limitation: close intent is currently sticky across windows, so closing
-one window can bypass a later unrelated window's reload grace. An initial wait
-with no clients also lacks a startup/stop completion condition; explicitly use
-`Window.waitForConnection()` with a timeout before waiting for client shutdown.
-Bridge retries do not extend this grace period or restart a stopped backend.
+`Running.wait()` evaluates every window independently and returns, then stops
+the application, once no window remains active. A connected window is active.
+After its last client leaves, a backend `Window.close()` finishes that window
+immediately, while any other disconnect gets a 1.5-second reconnect grace
+measured from the latest disconnect, so reloads and `Window.setContent()` can
+reconnect. A close intent belongs to its own window and is cleared when that
+window authenticates a new client, so closing one window never shortens another
+window's reload grace.
+
+Until any window connects, every window waits up to
+`App.Options.startup_timeout` (15 seconds by default, like upstream
+`webui_set_timeout`). After that, a never-connected window keeps the wait alive
+only if `Window.open()` or `Window.openWithBrowser()` was called for it, timed
+from that call like upstream `webui_show`. Each page or bridge request extends
+first-connection waiting by five seconds for slow pages. Set
+`startup_timeout = null` to wait indefinitely for the first client; zero and
+negative durations return `error.InvalidStartupTimeout` from `start`.
+`Running.requestExit()` sends a backend close to every page and makes the
+active wait return, like `webui_exit()`; it is safe from handlers and other
+threads. Only one `wait()` may run at a time; another returns
+`error.AlreadyWaiting`, and `wait()` after `stop()` returns immediately.
+Bridge retries do not extend the grace period or restart a stopped backend.
 Longer outages can recover only while the application keeps its server running.
+
+`App.createWindow()` also works while the app runs, from handlers or other
+threads: the window is served at once with its own fresh token, capability,
+and cookie, opens its folder, and starts its own folder monitor.
+`App.destroyWindow()` is upstream `webui_destroy()`. Before `start` it frees
+the window at once. While running it stops routing immediately, so the
+window's page, bridge script, and WebSocket upgrades answer `404`. Connected
+pages get a backend close, and any later message on their transport closes
+it with `1001`. In the background, queued and running handlers of that window
+are cancelled, the caller included, so a reply from a handler that destroys
+its own window is best effort. Its folder monitor and managed browser stop
+too, while the browser profile is kept. The window's memory is freed once its
+last connection, request, and deferred reply finish, and `Running.stop()`
+completes any cleanup still pending. `Client.window()` returns the window of a
+call or event, so a handler can destroy its own window. Other windows keep
+running. When no window remains, `Running.wait()` returns. Destroying
+an unknown or already destroyed window returns `error.UnknownWindow` without
+reading it. A destroyed `Window` handle and its `Client` handles must not be
+used again, or concurrently with the destroy call.
 
 `Window.open()` discovers the best installed browser and launches it as a
 standalone app window, exactly like `Window.openWithBrowser()` with that
@@ -160,9 +193,15 @@ total timeout for connection waiting and JavaScript execution.
 Call `openUrl(gpa, io, url)` to open any non-empty URL with the OS default
 handler. `browserExists(gpa, io, browser)` checks an explicit `Browser`, while
 `bestBrowser(gpa, io)` returns the first installed browser in the preferred
-platform order or `null`. Discovery probes Windows application registration,
-standard macOS application bundles, and executable candidates on other
-platforms without opening the selected browser.
+platform order or `null`. Discovery never opens the selected browser. On
+Windows it probes `PATH` and the `App Paths` registration. Chrome and Chromium
+both install `chrome.exe`, so, like upstream, a folder with Google's
+`initial_preferences` or `master_preferences` file is Google Chrome and any
+other `chrome.exe` is Chromium. On macOS it checks `/Applications`,
+`/System/Applications`, and `~/Applications`, then finds the bundle anywhere
+else by its bundle identifier through Spotlight's `mdfind`, which may return
+nothing when indexing is off. Other platforms run each executable candidate
+on `PATH` with `--version`, like upstream.
 
 `Window.openWithBrowser(&running, options)` launches a selected `Browser`
 with an optional full executable path and additional argv. Chromium-family
@@ -198,8 +237,11 @@ OS-handler fallback inside `Window.open()` cannot honour these controls, and it
 returns `error.ExplicitBrowserRequired` instead of ignoring them.
 
 Set `.high_contrast = false` in `App.WindowOptions` to disable Chromium's
-forced-color feature for that window. Firefox and Safari return
-`error.UnsupportedBrowserHighContrast` instead of ignoring this setting.
+forced-color feature for that window. Firefox has no flag for it, so the
+setting is written into the window's generated Firefox profile; with a
+caller-managed `.profile_directory`, which zig-webui never modifies, Firefox
+returns `error.UnsupportedBrowserHighContrast`. Safari always returns that
+error instead of ignoring this setting.
 The browser-side `webui.isHighContrast()` detects active forced colors or a
 stronger contrast preference through native media queries and requires no
 external OS program.
@@ -213,16 +255,28 @@ Firefox returns `error.UnsupportedBrowserProxy` for proxy configuration;
 Safari returns `error.UnsupportedBrowserProfile` or
 `error.UnsupportedBrowserProxy` instead of silently ignoring either option.
 
-Without `.profile_directory`, each Chromium-family window gets an independent
-managed profile leaf under its browser-family temporary root, for example
-`/tmp/.WebUI/WebUIChromeProfile/<window-capability>`. Different windows no
-longer hand their URL to the same browser process. Reopening a window stops and
-reaps its previous child before launching the replacement. A failed replacement
-leaves no stale child identifier.
+Without `.profile_directory`, each Chromium-family or Firefox window gets an
+independent managed profile leaf under its browser-family temporary root, for
+example `/tmp/.WebUI/WebUIChromeProfile/<window-capability>`. Different windows
+no longer hand their URL to the same browser process. Reopening a window stops
+and reaps its previous child before launching the replacement. A failed
+replacement leaves no stale child identifier.
+
+Before each launch, a generated Firefox profile receives upstream's app-mode
+setup: a `chrome/userChrome.css` that hides the tab strip, toolbars, and
+sidebar, and a `user.js` that enables it and turns off the default-browser
+check, the close warning, tabs in the title bar, and the first-run pages.
+`user.js` is rewritten each time, so a changed `.high_contrast` applies on the
+next launch. Snap Firefox cannot see the host `/tmp`, so when
+`/snap/bin/firefox` exists on Linux, Firefox profiles live in the snap's user
+directory, `<home>/snap/firefox/common/.mozilla/firefox/.WebUI/WebUIFirefoxProfile`,
+like upstream. The home directory comes from the current user's `/etc/passwd`
+entry, as snapd does; without one, the launch returns
+`error.HomeDirectoryUnavailable`.
 
 `Window.deleteProfile(&running)` stops the retained child and removes only that
-window's generated leaf. `managedProfileDirectory(gpa, browser)` returns the
-family root; `deleteManagedProfile` and `deleteAllManagedProfiles` remove roots
+window's generated leaf. `managedProfileDirectory(gpa, io, browser)` returns
+the family root; `deleteManagedProfile` and `deleteAllManagedProfiles` remove roots
 and all their leaves, so stop every associated browser before using them.
 Caller-provided profiles remain caller-owned; `Window.deleteProfile` returns
 `error.CallerManagedProfile`. Do not share a caller profile with other live
@@ -251,8 +305,40 @@ file in this order: `index.html`, `index.htm`, `index.ts`, `index.js`.
 The redirect preserves the encoded path and query string, so relative assets
 resolve under the selected directory. Index lookup does not follow symlinks.
 Custom resources receive borrowed `webui.Request` and `webui.Response` values;
-complete the response before the handler returns. Custom handlers do not have
-built-in directory-index probing or fallthrough to a disk directory.
+complete the response before the handler returns. A handler declines a path by
+answering `404` with an empty body, like an upstream file handler returning
+`NULL`; WebUI then asks it for `index.html`, `index.htm`, `index.ts`, and
+`index.js` below that path and redirects with `302` to the first one it
+answers, matching upstream virtual-directory probing.
+
+Use `.content = .{ .site = .{ ... } }` to compose upstream's embedded HTML,
+file handler, root folder, and entry file. Every field is optional, but at
+least one of `html`, `handler`, and `directory` is required:
+
+```zig
+.content = .{ .site = .{
+    .handler = .{ .handler = apiHandler, .user_data = &state },
+    .directory = "ui",
+    .entry = "pages/main.html",
+} },
+```
+
+Requests resolve in upstream order: the `handler`, then virtual-index probing
+through it, then `html` at the root, then files from `directory` with the usual
+directory-index redirects, then the default favicon or `404`. `entry`, like
+`webui_show(window, "pages/main.html")`, makes the root redirect to that file
+(served by the handler or present in the folder) and replaces the `index.*`
+candidates with its file name when probing handler paths. It must be a relative
+path without `..`, empty components, `<>?#"`, or reserved bridge names
+(`error.InvalidEntry`) and cannot be combined with `html`
+(`error.InvalidContent`).
+
+`Window.installContent(&running, content)` replaces content for later requests
+without navigating any client, like changing the root folder or file handler
+of a shown upstream window. `Window.setContent` replaces and navigates. Because
+an external URL changes the page origin, `installContent` returns
+`error.NavigationRequired` when either the current or the new content is
+`.external_url`.
 
 Set `.runtime = .deno`, `.node_js`, or `.bun` in `App.WindowOptions` to run
 served `.js` and `.ts` files through an external interpreter instead of
@@ -290,6 +376,12 @@ Use `Window.setIcon(io, data, mime_type)` for in-memory favicon data or
 files. Embedded HTML receives a relative favicon link automatically.
 Directory and custom pages can reference `favicon.ico` relative to the window
 capability root.
+Like upstream, `favicon.ico` and `favicon.svg` resolve to the custom icon, then
+a readable file of that name in directory content, then a built-in default:
+`favicon.ico` redirects with `302` to `favicon.svg`, which serves the default
+SVG. The origin-root `/favicon.ico` and `/favicon.svg` that browsers request for
+pages without an icon link also serve that default. Custom handlers keep full
+control of their own favicon paths.
 
 `Window.setContent(&running, content)` prepares and installs new content, then
 navigates every connected client to it and returns the number notified. An
@@ -314,6 +406,16 @@ snapshot; keep old `user_data` alive until those invocations have finished.
 Non-conflicting binding names also expose `webui.<name>(...)`; core and inherited
 properties are never overwritten, and `webui.call(name, ...)` always remains
 available.
+
+Inside a binding handler, `Call.name` is the binding name that matched and
+`Call.origin` is `.call` for an explicit JavaScript call or `.click` for a DOM
+click on the element with that ID; click handlers have no arguments and their
+reply is not sent. `Call.cookies` and `Event.cookies` hold the raw `Cookie`
+header the client sent with its WebSocket upgrade, like upstream
+`webui_event_t.cookies`; `Call.cookie(name)` and `Event.cookie(name)` return one
+value. These slices are valid only for the handler duration. Upgrades whose
+`Cookie` header exceeds `Limits.max_cookie_size` (8 KiB by default) are
+answered with `431` instead of being truncated.
 
 For a click, the general event handler runs before the named binding, using the
 same registration snapshot and scheduled task in both event modes.
@@ -465,6 +567,36 @@ geometry requests: `setSize`, `setPosition`, `center`, `setMinimumSize`,
 logical coordinates: content size and outer-window position (Cocoa uses its
 native lower-left origin). `handle()` returns a borrowed tagged Cocoa,
 GTK, or Win32 handle, invalid after native close or deinit.
+Frameless windows move and resize as upstream's adapters do, and
+`dragRegion()` reports how pages mark drag areas on the current backend:
+- `.webui_property` (WebKitGTK): pressing an element whose nearest
+  `--webui-app-region` value is `drag` starts a window-manager move once the
+  primary button moves; `no-drag` opts descendants out. The host honors a
+  request only while the primary button is held. Resizable frameless windows
+  resize from a 6 px edge band and show matching resize cursors.
+- `.css_app_region` (WebView2): CSS `app-region: drag` or
+  `-webkit-app-region: drag` areas act as the caption through Settings9
+  non-client regions; runtimes without Settings9 report `.none`. Resizable
+  frameless windows keep a sizing border.
+- `.window_background` (Cocoa): no CSS regions; frameless windows are movable
+  by their background where WebKit treats the point as background.
+
+Pages that target every backend declare all three properties:
+
+```css
+.titlebar { --webui-app-region: drag; app-region: drag; -webkit-app-region: drag; }
+.titlebar button { --webui-app-region: no-drag; app-region: no-drag; -webkit-app-region: no-drag; }
+```
+
+
+Like upstream, each non-empty page title replaces the host window title,
+including later `document.title` changes. `Options.title` is the initial title
+and `setTitle` applies at once until the page reports another title. An empty
+page title keeps the host title; WebView2 instead reports its own default title
+for untitled documents. Set `follow_page_title = false`, or call
+`setFollowPageTitle(false)`, to keep the title under host control; re-enabling
+applies the current page title. `title(gpa)` returns an owned copy of the host
+title.
 
 `setCloseHandler(handler, user_data)` handles OS and JavaScript close requests on
 the UI thread; return `false` to veto. Document-start native integration keeps a
@@ -472,6 +604,27 @@ vetoed page and its bridge alive, including after navigation history changes.
 `view.close()` force-closes without invoking that veto. Pumping one window also
 services native events and accepted close requests for other windows on its UI
 thread.
+
+`Options.navigation_handler` or `setNavigationHandler(handler, user_data)`
+decides page navigations in the engine, like upstream's WebKitGTK policy
+handler, so it also sees navigations the browser bridge cannot intercept or that
+happen without a live bridge. The handler runs on the UI thread with a borrowed
+`NavigationRequest { url, kind }` and returns `false` to cancel and keep the
+current page. Without a handler every navigation proceeds.
+
+- The host's own requests (the initial load and `navigate()`) are not reported.
+- Navigations in child frames are reported too.
+- Every server redirect hop is reported as its own request, so a handler can
+  stop a redirect to another origin. WKWebView has no public redirect flag, so
+  this is the only behavior that is consistent across engines.
+- WebKitGTK and WKWebView report `link`, `form_submission`, `back_forward`,
+  `reload`, `form_resubmission`, or `other`. WebView2 reports only `reload`,
+  `back_forward`, and `other`.
+- A navigation whose URL cannot be read is cancelled.
+
+With an `onEvent` handler installed, the bridge intercepts link clicks and
+script navigations before the engine sees them; call `webui.allowNavigation(true)`
+in the page to leave those decisions to the native handler.
 
 Platform prerequisites and explicit limits:
 
@@ -486,7 +639,7 @@ Platform prerequisites and explicit limits:
 - **Windows:** link `user32`, `gdi32`, `ole32`, `kernel32`, and `dwmapi`; install the
   WebView2 Runtime and provide the architecture-matching `WebView2Loader.dll`
   through `Options.webview2_loader` or normal DLL discovery. No runtime is
-  downloaded by the library. Initialization is bounded to 15 seconds; late COM
+  downloaded by the library. Initialization is bounded to 60 seconds; late COM
   callbacks retain safe independent ownership. Transparency requires DWM
   composition and the Controller2 interface.
 
@@ -508,7 +661,9 @@ External-browser examples warn and shut down when no browser connects.
 
 `zig build fuzz --fuzz=100K` exercises bounded protocol parsers. CI installs
 Node, Deno, and Bun, runs the core and bridge suites, executes native smoke gates
-on Linux/macOS/Windows, and cross-builds all five ledger targets.
+on Linux/macOS/Windows (with xdotool or `mouse_event` pointer input for
+frameless drag and resize on Linux and Windows), and cross-builds all five
+ledger targets.
 
 The [capability ledger](docs/PURE_ZIG_REFACTOR.md) records implemented behavior,
 open semantic gaps, and dated cross-platform validation evidence. The earlier

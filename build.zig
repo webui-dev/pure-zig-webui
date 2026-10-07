@@ -15,7 +15,12 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "Linsang", .module = linsang }},
     });
 
-    const tests = b.addTest(.{ .root_module = webui });
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Run only Zig tests whose names contain this text",
+    ) orelse &.{};
+    const tests = b.addTest(.{ .root_module = webui, .filters = test_filters });
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
