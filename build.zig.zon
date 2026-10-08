@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .linsang = .{
-            .hash = "Linsang-0.0.0-SZhixD3UBgBFXQLR91a5ugrVDqK9bXrOa5lE_K7OJV9x",
-            .url = "https://github.com/jinzhongjia/Linsang/archive/ae4c2f0396a97c89d1a0da0a39e697cbedbec5fa.tar.gz",
+            .hash = "Linsang-0.0.0-SZhixHv2BgB7_1UuS6SEKvRKgn9utUafV-as1ez8Y6hs",
+            .url = "https://github.com/jinzhongjia/Linsang/archive/f75ef283a7323665a4cd0a945d3e5fa36c838784.tar.gz",
         },
     },
     .paths = .{

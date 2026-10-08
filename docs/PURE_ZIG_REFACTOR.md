@@ -84,7 +84,7 @@ macOS transparency/profile and Wayland absolute-coordinate limits are unchanged.
 | Upstream WebUI | Its core is the roughly 14,500-line `src/webui.c`, mixing protocol, server, browser, WebView, and process management |
 | Browser bridge | About 1,006 lines of TypeScript using the 8-byte WebUI binary header |
 | Linsang | Zig 0.17 with HTTP/1.1, WebSocket, static files, TLS, and connection lifecycle support |
-| Linsang validation | At `ae4c2f0396a97c89d1a0da0a39e697cbedbec5fa` (Zig 0.17.0 port), 92 tests pass on macOS and the 15 Linux-only tests skip; [Linux CI](https://github.com/jinzhongjia/Linsang/actions/runs/37738013827) runs all of them, plus fuzzing and TLS interop |
+| Linsang validation | At `f75ef283a7323665a4cd0a945d3e5fa36c838784` (Zig 0.17.0, cancelation-independent stop), 95 tests pass on macOS and the 15 Linux-only tests skip; Linux CI runs all of them, plus fuzzing and TLS interop |
 
 [Linsang issue #1](https://github.com/jinzhongjia/Linsang/issues/1) added a
 reference-counted `WebSocketPeer`, immediate cross-task sends, safe send/close
@@ -635,7 +635,11 @@ zig build -Dtarget=aarch64-macos
    allocators unwind on every allocation, so a pending cancelation can vanish
    and a task that waits for cancelation runs forever. Long-lived loops must
    also stop on an explicit flag. The directory monitor does this with
-   `monitor_stopping`.
+   `monitor_stopping`. Linsang's `Running.stop` also shuts down active sockets
+   and wakes accept, so live WebSocket clients (the bridge pings every 20
+   seconds, under the 25-second idle timeout) cannot hold shutdown open.
+   Callbacks do not `recancel`: a `Canceled` they see may come from another
+   task, and `recancel` without a pending acknowledgment is illegal.
 
 ## Completion Evidence
 
@@ -664,7 +668,8 @@ This snapshot used Linsang `db11eb05e897e4dccdab701e110dc8a6948cb690`, from
 [PR #3](https://github.com/jinzhongjia/Linsang/pull/3) (authorization-context,
 deadline, canonical-path, immutable TLS-reader, and concurrency fixes). That PR
 has since been merged. Linsang is now pinned to
-`ae4c2f0396a97c89d1a0da0a39e697cbedbec5fa`, its Zig 0.17.0 port on `main`.
+`f75ef283a7323665a4cd0a945d3e5fa36c838784` on `main`: the Zig 0.17.0 port
+plus a stop that does not depend on cancelation.
 
 The permanent exclusions remain unchanged: no C ABI compatibility layer, no
 old-Zig compatibility code, and no automatic self-signed certificate. Platform
