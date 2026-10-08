@@ -469,6 +469,14 @@ pub const Backend = struct {
         const bytes = send0(?[*:0]const u8, value, "UTF8String") orelse return error.InvalidNativeText;
         return gpa.dupe(u8, std.mem.sliceTo(bytes, 0));
     }
+    pub fn devToolsEnabled(self: *Backend) !bool {
+        try self.requireOpen();
+        // `isInspectable` exists from macOS 13.3; Web Inspector is off by
+        // default either way, and upstream does not change it.
+        if (!truth(send1(ObjcBool, self.webview, "respondsToSelector:", Sel, sel_registerName("isInspectable"))))
+            return false;
+        return truth(send0(ObjcBool, self.webview, "isInspectable"));
+    }
     pub fn setFollowPageTitle(self: *Backend, value: bool) !void {
         try self.requireOpen();
         self.follow_page_title = value;

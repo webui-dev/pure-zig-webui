@@ -104,6 +104,7 @@ function isolatedCallBridge(options = {}) {
         __zigWebuiCapability: "test-capability",
         __zigWebuiToken: 7,
         __zigWebuiBindings: [...(options.events ? [""] : []), ...(options.bindings || [])],
+        __zigWebuiDebug: options.debug,
     };
     if (options.navigation) context.navigation = {
         addEventListener(type, listener) { addListener(navigationListeners, type, listener); },
@@ -233,6 +234,37 @@ test("click delegation preserves nested bound ancestors and skips empty or unbou
     await bridge.receive(0xf7, new Uint8Array());
     click({ target: inner });
     assert.deepEqual(received(), ["outer", "inner", "outer", "inner", "decoration", "outer"]);
+});
+
+test("presentation policy blocks F5 unless logging and context menus outside inputs", () => {
+    const keydown = (bridge, key) => {
+        let prevented = false;
+        bridge.domListeners.get("keydown")[0]({ key, preventDefault() { prevented = true; } });
+        return prevented;
+    };
+    const contextmenu = (bridge, target) => {
+        let prevented = false;
+        bridge.domListeners.get("contextmenu")[0]({ target, preventDefault() { prevented = true; } });
+        return prevented;
+    };
+    const release = isolatedCallBridge();
+    assert.equal(keydown(release, "F5"), true);
+    assert.equal(keydown(release, "r"), false);
+    release.webui.setLogging(true);
+    assert.equal(keydown(release, "F5"), false);
+    release.webui.setLogging(false);
+    assert.equal(keydown(release, "F5"), true);
+
+    const debug = isolatedCallBridge({ debug: true });
+    assert.equal(keydown(debug, "F5"), false);
+
+    const input = { closest(selector) { return selector === "input" ? this : null; } };
+    const text = { closest() { return null; } };
+    for (const bridge of [release, debug]) {
+        assert.equal(contextmenu(bridge, text), true);
+        assert.equal(contextmenu(bridge, null), true);
+        assert.equal(contextmenu(bridge, input), false);
+    }
 });
 
 test("bridge authenticates each replacement and isolates pending calls and stale async results", async () => {

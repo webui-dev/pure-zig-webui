@@ -6,6 +6,7 @@ declare var __zigWebuiToken: number;
 declare var __zigWebuiCapability: string;
 declare var __zigWebuiBindings: string[] | undefined;
 declare var __zigWebuiNativeClose: (() => void) | undefined;
+declare var __zigWebuiDebug: boolean | undefined;
 declare var webui: Record<string, unknown> & {
     call(name: string, ...args: unknown[]): Promise<string>;
 };
@@ -47,7 +48,8 @@ declare var webui: Record<string, unknown> & {
     });
     let nextId = 1;
     let connected = false;
-    let logging = false;
+    // Like upstream, Debug builds start with logging, which also allows F5.
+    let logging = globalThis.__zigWebuiDebug === true;
     let allowNavigation = true;
     let navigationOverridden = false;
     let eventCallback: ((kind: number) => void) | null = null;
@@ -231,6 +233,16 @@ declare var webui: Record<string, unknown> & {
             });
         }
     }
+
+    // Upstream presentation policy: F5 reloads only while logging, and the
+    // page context menu is suppressed everywhere except on input elements.
+    document.addEventListener("keydown", (event) => {
+        if (!logging && event.key === "F5") event.preventDefault();
+    });
+    document.addEventListener("contextmenu", (event) => {
+        const target = event.target as Element | null;
+        if (!target?.closest?.("input")) event.preventDefault();
+    });
 
     // Delegation is installed even on pages with no initial registrations.
     // State changes on ADD_ID; no repeated listeners or DOM scans are needed.

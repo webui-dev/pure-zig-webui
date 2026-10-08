@@ -31,7 +31,8 @@
     });
     let nextId = 1;
     let connected = false;
-    let logging = false;
+    // Like upstream, Debug builds start with logging, which also allows F5.
+    let logging = globalThis.__zigWebuiDebug === true;
     let allowNavigation = true;
     let navigationOverridden = false;
     let eventCallback = null;
@@ -222,6 +223,17 @@
             });
         }
     }
+    // Upstream presentation policy: F5 reloads only while logging, and the
+    // page context menu is suppressed everywhere except on input elements.
+    document.addEventListener("keydown", (event) => {
+        if (!logging && event.key === "F5")
+            event.preventDefault();
+    });
+    document.addEventListener("contextmenu", (event) => {
+        const target = event.target;
+        if (!target?.closest?.("input"))
+            event.preventDefault();
+    });
     // Delegation is installed even on pages with no initial registrations.
     // State changes on ADD_ID; no repeated listeners or DOM scans are needed.
     document.addEventListener("click", (event) => {

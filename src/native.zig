@@ -210,6 +210,15 @@ pub const Window = struct {
         return error.UnsupportedPlatform;
     }
 
+    /// Whether the engine's developer tools are enabled. Like upstream,
+    /// WebView2 enables them only in Debug builds, while WKWebView and
+    /// WebKitGTK keep their engine default (off).
+    pub fn devToolsEnabled(self: Window) !bool {
+        try self.checkOpen();
+        if (supported) return self.state.backend.devToolsEnabled();
+        return error.UnsupportedPlatform;
+    }
+
     /// Enable or disable page-title mirroring. Enabling applies the current
     /// non-empty page title at once; disabling keeps the current host title.
     pub fn setFollowPageTitle(self: Window, value: bool) !void {

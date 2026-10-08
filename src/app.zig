@@ -3798,6 +3798,11 @@ fn onRequest(
             "globalThis.__zigWebuiCapability=\"{s}\";\n",
             .{window.capability},
         ) catch return failResponse(response);
+        // Upstream's WEBUI_LOG build: bridge logging and F5 start enabled.
+        response.print(
+            "globalThis.__zigWebuiDebug={};\n",
+            .{@import("builtin").mode == .debug},
+        ) catch return failResponse(response);
         window.writeRegistrations(io, response) catch return failResponse(response);
         response.write(bridge) catch return failResponse(response);
         return .respond;
@@ -4750,6 +4755,11 @@ test "dev server windows open with the bridge URL in the fragment" {
 
     const bridge_url = try window.bridgeUrl(&running, gpa);
     defer gpa.free(bridge_url);
+    // The bridge learns the build mode, like upstream's WEBUI_LOG build.
+    try expectBody(running.inner.address, io, window, "webui.js", "HTTP/1.1 200", if (@import("builtin").mode == .debug)
+        "globalThis.__zigWebuiDebug=true;\n"
+    else
+        "globalThis.__zigWebuiDebug=false;\n");
     const page_url = try window.url(&running, gpa);
     defer gpa.free(page_url);
     const prefix = "http://localhost:5173/app?x=1#webui-bridge=";

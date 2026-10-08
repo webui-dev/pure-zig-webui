@@ -9,10 +9,9 @@ compile or link the upstream WebUI C library or CivetWeb.
 [Linsang](https://github.com/jinzhongjia/Linsang) provides HTTP and WebSocket
 support.
 
-The semantic gaps found by the latest upstream source audit are closed. The
-remaining listed difference is the default presentation policy (F5, context
-menu, DevTools), kept as an intentional UI choice. See the
-[open semantic gaps](docs/PURE_ZIG_REFACTOR.md#open-semantic-gaps)
+The semantic gaps found by the latest upstream source audit are closed,
+including upstream's default presentation policy (F5, context menu, DevTools).
+See the [open semantic gaps](docs/PURE_ZIG_REFACTOR.md#open-semantic-gaps)
 and the [source comparison](docs/UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
 The current phase provides:
@@ -22,6 +21,10 @@ The current phase provides:
 - embedded HTML, static directories, custom resources, external URLs, and a
   built-in JavaScript bridge written in TypeScript;
 - Vite development servers with hot reload through `Content.dev_server`;
+- upstream's presentation policy: F5 reloads only while bridge logging is on
+  (the default in Debug builds), page context menus are suppressed outside
+  `<input>` elements, and WebView2 DevTools are enabled only in Debug builds
+  (`native.Window.devToolsEnabled()` reports the engine state);
 - a TypeScript SDK with React, Vue, and Solid bindings, plus app templates
   (`sdk/`, `templates/`);
 - application-wide default static directories for windows without content;

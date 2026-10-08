@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types.zig");
 
 // ABI source: Microsoft's Microsoft.Web.WebView2 1.0.2903.40 NuGet package,
@@ -400,6 +401,8 @@ pub const Backend = struct {
         defer script_settings.release();
         try check(script_settings.method(4, *const fn (*Com, i32) callconv(.winapi) HRESULT)(script_settings, 1));
         try check(script_settings.method(6, *const fn (*Com, i32) callconv(.winapi) HRESULT)(script_settings, 1));
+        // Like upstream, DevTools follow the build: on in Debug, off otherwise.
+        try check(script_settings.method(12, *const fn (*Com, i32) callconv(.winapi) HRESULT)(script_settings, @intFromBool(builtin.mode == .debug)));
         // Settings9 makes CSS app-region drag areas act as the host caption
         // (upstream WebUI PR #718). Older runtimes report `.none` instead.
         var settings9: ?*Com = null;
@@ -608,6 +611,17 @@ pub const Backend = struct {
         const copied = GetWindowTextW(hwnd, buffer.ptr, @intCast(buffer.len));
         if (copied < 0) return error.NativeOperationFailed;
         return std.unicode.utf16LeToUtf8Alloc(gpa, buffer[0..@intCast(copied)]) catch error.InvalidNativeText;
+    }
+    pub fn devToolsEnabled(self: *Backend) !bool {
+        _ = try self.window();
+        const webview = self.webview orelse return error.NativeOperationFailed;
+        var settings: ?*Com = null;
+        try check(webview.method(3, *const fn (*Com, *?*Com) callconv(.winapi) HRESULT)(webview, &settings));
+        const value = settings orelse return error.NativeOperationFailed;
+        defer value.release();
+        var enabled: i32 = 0;
+        try check(value.method(11, *const fn (*Com, *i32) callconv(.winapi) HRESULT)(value, &enabled));
+        return enabled != 0;
     }
     pub fn setFollowPageTitle(self: *Backend, value: bool) !void {
         _ = try self.window();

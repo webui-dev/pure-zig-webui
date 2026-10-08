@@ -205,6 +205,7 @@ const Api = struct {
     webkit_web_view_new_with_context: *const fn (Object) callconv(.c) ?Object,
     webkit_web_view_get_settings: *const fn (Object) callconv(.c) ?Object,
     webkit_settings_set_enable_javascript: *const fn (Object, c_int) callconv(.c) void,
+    webkit_settings_get_enable_developer_extras: *const fn (Object) callconv(.c) c_int,
     webkit_web_view_load_uri: *const fn (Object, [*:0]const u8) callconv(.c) void,
     webkit_web_view_get_title: *const fn (Object) callconv(.c) ?[*:0]const u8,
     webkit_web_view_stop_loading: *const fn (Object) callconv(.c) void,
@@ -495,6 +496,13 @@ pub const Backend = struct {
     pub fn title(self: *Backend, gpa: std.mem.Allocator) ![]u8 {
         const value = self.api.gtk_window_get_title(try self.liveWindow()) orelse "";
         return gpa.dupe(u8, std.mem.sliceTo(value, 0));
+    }
+
+    pub fn devToolsEnabled(self: *Backend) !bool {
+        _ = try self.liveWindow();
+        const view = self.view orelse return error.NativeWindowClosed;
+        const settings = self.api.webkit_web_view_get_settings(view) orelse return error.NativeOperationFailed;
+        return self.api.webkit_settings_get_enable_developer_extras(settings) != 0;
     }
 
     pub fn setFollowPageTitle(self: *Backend, value: bool) !void {

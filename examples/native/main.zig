@@ -523,6 +523,22 @@ fn smoke(io: std.Io, first: *Page, second: *Page, url: []const u8, require_input
     try pumpUntil(io, a, first, null);
     try pumpUntil(io, a, second, null);
     try evaluate(io, a, first.window, "return await webui.call('ready')", "Connected to Zig");
+    // Upstream presentation: WebView2 DevTools only in Debug builds, while
+    // WKWebView and WebKitGTK keep them off; F5 is blocked unless logging
+    // (on in Debug), and context menus are blocked outside inputs.
+    if (try a.devToolsEnabled() != (builtin.os.tag == .windows and builtin.mode == .debug))
+        return error.NativeDevToolsPolicy;
+    try evaluate(io, a, first.window,
+        \\const f5 = new KeyboardEvent('keydown', { key: 'F5', bubbles: true, cancelable: true });
+        \\document.body.dispatchEvent(f5);
+        \\const menu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+        \\document.body.dispatchEvent(menu);
+        \\const input = document.body.appendChild(document.createElement('input'));
+        \\const inputMenu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+        \\input.dispatchEvent(inputMenu);
+        \\input.remove();
+        \\return [f5.defaultPrevented, menu.defaultPrevented, inputMenu.defaultPrevented].join(',');
+    , if (builtin.mode == .debug) "false,true,false" else "true,true,false");
     try first.window.bind(io, "late", runtimeBinding, first);
     try evaluate(io, a, first.window, "return await webui.late()", "runtime binding");
     try first.window.onEvent(io, runtimeEvent, first);
@@ -624,7 +640,7 @@ fn smoke(io: std.Io, first: *Page, second: *Page, url: []const u8, require_input
     const interaction = if (try frameless(io, a, first, require_input)) "frameless drag+resize input" else "frameless configuration";
     try a.close();
     if (try a.poll()) return error.NativeForceCloseFailed;
-    std.debug.print("NATIVE SMOKE PASS: bridge, geometry, controls, dispatch, titles, veto, history, navigation, {s}, multiwindow close\n", .{interaction});
+    std.debug.print("NATIVE SMOKE PASS: bridge, presentation, geometry, controls, dispatch, titles, veto, history, navigation, {s}, multiwindow close\n", .{interaction});
 }
 
 pub fn main(init: std.process.Init) !void {

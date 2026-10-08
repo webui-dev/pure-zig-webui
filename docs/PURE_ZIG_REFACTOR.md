@@ -34,7 +34,7 @@ deleted.
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, Deno/Node.js/Bun script interpretation, logging, and deterministic shutdown are implemented. |
 | Browser integration | Centring, app-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed and deletable managed profile directories, Chromium-family proxy rules, Windows external-browser focus, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
 | Native integration | Optional Zig-only WKWebView, GTK3/WebKitGTK 4.1 and Win32/WebView2 backends implement native controls, UI-thread dispatch, close veto/history-safe JavaScript close, multiwindow pumping, and borrowed handles. Actual runtime gates pass on all three platforms. |
-| Current validation | 2026-10-08 on Zig 0.17.0. Local macOS: 76/76 core tests with no skips, bridge 18/18, SDK 12/12 (also on Node 24), the five target cross-builds, and the actual native WebView smoke. Real headless Chromium runs scaffolded React, Vue, and Solid apps, both hosted from `web/dist` and through the Vite dev server. [CI for the Zig 0.17.0 port](https://github.com/webui-dev/pure-zig-webui/actions/runs/37738094109) passed on Ubuntu, macOS, Windows, and the cross-build job. The 2026-09-09 cross-platform evidence below is a dated snapshot, not fresh parity proof. |
+| Current validation | 2026-10-08 on Zig 0.17.0. Local macOS: 76/76 core tests with no skips, bridge 19/19, SDK 12/12 (also on Node 24), the five target cross-builds, and the actual native WebView smoke. Real headless Chromium runs scaffolded React, Vue, and Solid apps, both hosted from `web/dist` and through the Vite dev server. [CI for the Zig 0.17.0 port](https://github.com/webui-dev/pure-zig-webui/actions/runs/37738094109) passed on Ubuntu, macOS, Windows, and the cross-build job. The 2026-09-09 cross-platform evidence below is a dated snapshot, not fresh parity proof. |
 
 The earlier claim that every upstream capability was complete was too broad:
 API-name mappings did not cover all implementation semantics. Full behavioral
@@ -49,14 +49,13 @@ Fresh comparison: upstream HEAD
 also compared with the original pinned baseline. Detailed function/line evidence
 is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
-| Area | Remaining behavior, not covered by existing API mappings |
-|---|---|
-| Default presentation | F5/context-menu/DevTools policy differences are intentional UI-policy candidates, not proof of missing protocol support. |
+No semantic gaps remain open.
 
 Closed after the rescan, each with focused tests in the same change:
 
 | Area | Resolution |
 |---|---|
+| Default presentation | Matches upstream `bridge/webui.ts` and `win32_wv2.cpp`. The bridge blocks F5 unless logging is on. Logging starts on in Debug builds, which receive `__zigWebuiDebug`, like upstream's `WEBUI_LOG`, and `webui.setLogging()` toggles it. The bridge suppresses page context menus except on `<input>` elements, in every build. WebView2 enables DevTools only in Debug builds; WKWebView and WebKitGTK keep their default (off), as upstream does. `native.Window.devToolsEnabled()` reports the engine state. Tests: bridge `presentation policy blocks F5 unless logging and context menus outside inputs`, the build-mode check in `dev server windows open with the bridge URL in the fragment`, and the native smoke presentation step, which runs in Debug and release builds. |
 | Wait lifecycle | Close intent, reconnect grace, and first-connection waiting are per window; `startup_timeout` and `Running.requestExit()` give the initial wait upstream's timeout and `webui_exit` completion. Tests: `wait state tracks startup, activity, reconnect grace, and close per window`, `wait keeps per-window close intent and honours exit requests`. |
 | Callback metadata | `Call.name`, `Call.origin` (`.call` or `.click`), and `Call.cookies`/`Event.cookies` with `cookie(name)` expose the binding name, call origin, and the upgrade's `Cookie` header, copied per connection under `Limits.max_cookie_size` (oversized upgrades answer `431`). Tests: `calls and events expose binding name, origin, and bounded cookies`, `cookie values parse from raw headers`, `upgrade admission owns only accepted connections and removes every state`. |
 | Default favicon | `favicon.ico`/`favicon.svg` resolve custom icon, then a readable directory file, then upstream's default SVG (`.ico` answers `302` to `favicon.svg`), at both the capability root and the origin root. Test: `favicon falls back from custom icon to local file to the default`. |
@@ -382,6 +381,7 @@ external-browser launch flags.
 | WebKitGTK `WEBUI_EVENT_NAVIGATION` (`decide-policy`) | `native.Options.navigation_handler` or `native.Window.setNavigationHandler()`, on every backend. Returning `false` cancels like upstream's ignored policy decision. The host's own loads are exempt, as with upstream's first navigation after show. Bridge-level navigation events stay `Event.kind == .navigation`. |
 | WebView page-title tracking (no public upstream function) | `native.Options.follow_page_title` (default `true`), `native.Window.setFollowPageTitle()`, `setTitle()`, and `title()`. |
 | `webui_get_hwnd()`, `webui_win32_get_hwnd()` | `native.Window.handle()` returns a borrowed tagged Cocoa/Gtk/Win32 handle, invalid after close/deinit. |
+| WebView2 `put_AreDevToolsEnabled` (no public upstream function) | Set from the build mode like upstream's `WEBUI_LOG`; `native.Window.devToolsEnabled()` reads the engine state on every backend. |
 
 ### Browser Bridge APIs
 
