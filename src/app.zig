@@ -749,6 +749,9 @@ const WindowState = struct {
     retired: std.atomic.Value(bool) = .init(false),
     /// This window's directory monitor, cancelled on destroy or stop.
     monitor_task: std.Io.Group = .init,
+    /// Backs up cancelation of `monitor_task`, which Zig 0.17.0 can drop when
+    /// a debug allocator unwinds a stack under contention while it is pending.
+    monitor_stopping: std.atomic.Value(bool) = .init(false),
     /// Set by backend `close` calls so `Running.wait()` skips the
     /// reconnect grace period. Cleared when a new client authenticates, so a
     /// close intent never outlives this window's reconnection.
@@ -841,6 +844,20 @@ const WindowState = struct {
         self.content = replacement;
         self.content_revision +%= 1;
         previous.deinit(self.gpa);
+    }
+
+    fn startMonitor(
+        self: *WindowState,
+        io: std.Io,
+        interval: std.Io.Duration,
+    ) !void {
+        self.monitor_stopping.store(false, .release);
+        try self.monitor_task.concurrent(io, monitorDirectory, .{ self, io, interval });
+    }
+
+    fn stopMonitor(self: *WindowState, io: std.Io) void {
+        self.monitor_stopping.store(true, .release);
+        self.monitor_task.cancel(io);
     }
 
     fn monitoredDirectory(
@@ -2149,7 +2166,7 @@ fn assignWindowIdentity(
 /// Finish destroying a window that `App.destroyWindow` unregistered.
 fn reapWindow(app: *App, state: *WindowState, io: std.Io) std.Io.Cancelable!void {
     state.retireEvents(io);
-    state.monitor_task.cancel(io);
+    state.stopMonitor(io);
     app.removeBrowser(io, state);
     {
         app.windows_lock.lockUncancelable(io);
@@ -2169,7 +2186,7 @@ fn monitorDirectory(
     // large directory trees make that cost measurable.
     var revision: ?u64 = null;
     var previous: ?DirectorySnapshot = null;
-    while (true) {
+    while (!state.monitor_stopping.load(.acquire)) {
         if (state.monitoredDirectory(io)) |selected| {
             const snapshot = selected.directory.snapshot(io) catch |err| {
                 selected.directory.release();
@@ -2911,11 +2928,7 @@ pub const App = struct {
         state.running.store(true, .release);
         errdefer state.running.store(false, .release);
         if (self.options.folder_monitor_interval) |interval|
-            try state.monitor_task.concurrent(io, monitorDirectory, .{
-                state,
-                io,
-                interval,
-            });
+            try state.startMonitor(io, interval);
         self.windows.appendAssumeCapacity(state);
     }
 
@@ -3001,14 +3014,10 @@ pub const App = struct {
         self.unauthenticated_connections.store(0, .release);
         for (self.windows.items) |window|
             window.beginServing(io, self.options.startup_timeout);
-        errdefer for (self.windows.items) |window| window.monitor_task.cancel(io);
+        errdefer for (self.windows.items) |window| window.stopMonitor(io);
         if (self.options.folder_monitor_interval) |interval| {
             for (self.windows.items) |window|
-                try window.monitor_task.concurrent(io, monitorDirectory, .{
-                    window,
-                    io,
-                    interval,
-                });
+                try window.startMonitor(io, interval);
         }
         self.server = Linsang.Server.init(self.gpa, .{
             .address = self.options.address,
@@ -3251,7 +3260,7 @@ pub const Running = struct {
         self.app.closeRegistration(self.inner.io);
         for (self.app.windows.items) |window| {
             window.running.store(false, .release);
-            window.monitor_task.cancel(self.inner.io);
+            window.stopMonitor(self.inner.io);
         }
         for (self.app.windows.items) |window|
             window.cancelEvents(self.inner.io);
@@ -7015,6 +7024,30 @@ fn requireTestRuntime(
         @tagName(runtime), result.term,
     });
     return error.SkipZigTest;
+}
+
+test "directory monitor stops on its flag even if cancelation is lost" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(path);
+
+    var app = App.init(gpa, .{ .folder_monitor_interval = .fromMilliseconds(5) });
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .directory = path } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+
+    // Simulate the stop signal without a cancelation request: the task must
+    // still finish, or `Running.stop` would wait forever.
+    window.state.monitor_stopping.store(true, .release);
+    try window.state.monitor_task.await(io);
+    try std.testing.expect(window.state.monitor_task.token.load(.acquire) == null);
 }
 
 test "directory monitor reloads changed window only" {
