@@ -19,7 +19,8 @@ the Zig standard library and launching an installed browser remain in scope.
 
 ## Current Rewrite Status
 
-Status snapshot: 2026-09-12 (source rescan; parity reopened).
+Status snapshot: 2026-10-08 (Zig 0.17.0 and the TypeScript SDK). The latest
+upstream source rescan is from 2026-09-12.
 
 The external-browser core is now implemented in Zig on top of pinned Linsang.
 The legacy wrapper, C API, compatibility files, and examples have been
@@ -33,7 +34,7 @@ deleted.
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, Deno/Node.js/Bun script interpretation, logging, and deterministic shutdown are implemented. |
 | Browser integration | Centring, app-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed and deletable managed profile directories, Chromium-family proxy rules, Windows external-browser focus, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
 | Native integration | Optional Zig-only WKWebView, GTK3/WebKitGTK 4.1 and Win32/WebView2 backends implement native controls, UI-thread dispatch, close veto/history-safe JavaScript close, multiwindow pumping, and borrowed handles. Actual runtime gates pass on all three platforms. |
-| Current validation | 2026-09-12 local: 50/56 core tests pass, six existing platform-gated tests skip, bridge 18/18, and the package build passes. Real Chromium exercises authentication waiting, nested click ordering, directory redirects and relative assets. Earlier cross-platform CI evidence is retained below as a dated snapshot, not fresh parity proof. |
+| Current validation | 2026-10-08 on Zig 0.17.0. Local macOS: 76/76 core tests with no skips, bridge 18/18, SDK 12/12 (also on Node 24), the five target cross-builds, and the actual native WebView smoke. Real headless Chromium runs scaffolded React, Vue, and Solid apps, both hosted from `web/dist` and through the Vite dev server. [CI for the Zig 0.17.0 port](https://github.com/webui-dev/pure-zig-webui/actions/runs/37738094109) passed on Ubuntu, macOS, Windows, and the cross-build job. The 2026-09-09 cross-platform evidence below is a dated snapshot, not fresh parity proof. |
 
 The earlier claim that every upstream capability was complete was too broad:
 API-name mappings did not cover all implementation semantics. Full behavioral
@@ -83,7 +84,7 @@ macOS transparency/profile and Wayland absolute-coordinate limits are unchanged.
 | Upstream WebUI | Its core is the roughly 14,500-line `src/webui.c`, mixing protocol, server, browser, WebView, and process management |
 | Browser bridge | About 1,006 lines of TypeScript using the 8-byte WebUI binary header |
 | Linsang | Zig 0.17 with HTTP/1.1, WebSocket, static files, TLS, and connection lifecycle support |
-| Linsang validation | All 101 tests pass at `3b50417e3ddb7a0651a8dd8b7154f26c4d4e5608` |
+| Linsang validation | At `ae4c2f0396a97c89d1a0da0a39e697cbedbec5fa` (Zig 0.17.0 port), 92 tests pass on macOS and the 15 Linux-only tests skip; [Linux CI](https://github.com/jinzhongjia/Linsang/actions/runs/37738013827) runs all of them, plus fuzzing and TLS interop |
 
 [Linsang issue #1](https://github.com/jinzhongjia/Linsang/issues/1) added a
 reference-counted `WebSocketPeer`, immediate cross-task sends, safe send/close
@@ -629,6 +630,12 @@ zig build -Dtarget=aarch64-macos
    frameworks/runtimes. Missing support is an explicit result, not a browser
    fallback or successful no-op. Never close a validation gate with only a
    cross-build or a skipped test.
+5. **Lost cancelation in Zig 0.17.0:** `std.debug` stack unwinding takes a
+   cancelable lock and drops `error.Canceled` without `recancel`. Debug
+   allocators unwind on every allocation, so a pending cancelation can vanish
+   and a task that waits for cancelation runs forever. Long-lived loops must
+   also stop on an explicit flag. The directory monitor does this with
+   `monitor_stopping`.
 
 ## Completion Evidence
 
@@ -653,11 +660,11 @@ five-target cross-build matrix.
 | Ownership and isolation | Regression gates cover OOM cleanup, upgrade-bound authorization, server authentication expiry, handler cancellation, managed child/profile isolation, eval send deadlines and late-ID quarantine. Browser smoke also confirmed capacity recovery and clean reconnect shutdown. |
 | Pure-source boundary | No legacy `webui_new`/C-wrapper exports remain. Default builds have no GUI linkage; optional adapters use Zig declarations for installed system APIs only. |
 
-Linsang is pinned to `db11eb05e897e4dccdab701e110dc8a6948cb690`.
-[Upstream PR #3](https://github.com/jinzhongjia/Linsang/pull/3) contains the
-required authorization-context, deadline, canonical-path, immutable TLS-reader,
-and concurrency fixes. That exact revision is already consumed and verified;
-building this repository does not depend on the PR being merged first.
+This snapshot used Linsang `db11eb05e897e4dccdab701e110dc8a6948cb690`, from
+[PR #3](https://github.com/jinzhongjia/Linsang/pull/3) (authorization-context,
+deadline, canonical-path, immutable TLS-reader, and concurrency fixes). That PR
+has since been merged. Linsang is now pinned to
+`ae4c2f0396a97c89d1a0da0a39e697cbedbec5fa`, its Zig 0.17.0 port on `main`.
 
 The permanent exclusions remain unchanged: no C ABI compatibility layer, no
 old-Zig compatibility code, and no automatic self-signed certificate. Platform
