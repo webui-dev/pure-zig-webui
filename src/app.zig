@@ -210,9 +210,20 @@ pub const Content = union(enum) {
     custom: CustomResource,
     /// HTTP(S) page opened directly. The page must load `Window.bridgeUrl`.
     external_url: []const u8,
+    /// HTTP(S) development server page, such as Vite, served like
+    /// `external_url`. The browser opens it with the bridge URL in the
+    /// fragment `#webui-bridge=<percent-encoded Window.bridgeUrl>`, which the
+    /// TypeScript SDK loads, so the page needs no hard-coded script. The URL
+    /// must not already contain a fragment.
+    dev_server: []const u8,
     /// Upstream's composed window: embedded HTML, a file handler, a root
     /// folder, and an entry file, each optional.
     site: Site,
+
+    /// Whether the page lives on another origin rather than this server.
+    pub fn isExternal(content: Content) bool {
+        return content == .external_url or content == .dev_server;
+    }
 };
 
 /// Composed content resolved in upstream order: `handler` first, then
@@ -591,11 +602,17 @@ const DirectoryContent = struct {
     }
 };
 
+const ExternalPage = struct {
+    url: []u8,
+    /// Pass the bridge URL to the page in the opened URL's fragment.
+    bridge_fragment: bool,
+};
+
 const StoredContent = union(enum) {
     html: []u8,
     directory: *DirectoryContent,
     custom: CustomResource,
-    external_url: []u8,
+    external_url: ExternalPage,
     site: StoredSite,
 
     fn init(gpa: std.mem.Allocator, content: Content) !StoredContent {
@@ -607,7 +624,19 @@ const StoredContent = union(enum) {
             .custom => |custom| .{ .custom = custom },
             .external_url => |url| blk: {
                 try validateExternalUrl(url);
-                break :blk .{ .external_url = try gpa.dupe(u8, url) };
+                break :blk .{ .external_url = .{
+                    .url = try gpa.dupe(u8, url),
+                    .bridge_fragment = false,
+                } };
+            },
+            .dev_server => |url| blk: {
+                try validateExternalUrl(url);
+                const parsed = std.Uri.parse(url) catch unreachable;
+                if (parsed.fragment != null) return error.InvalidExternalUrl;
+                break :blk .{ .external_url = .{
+                    .url = try gpa.dupe(u8, url),
+                    .bridge_fragment = true,
+                } };
             },
             .site => |site| .{ .site = try StoredSite.init(gpa, site) },
         };
@@ -618,7 +647,7 @@ const StoredContent = union(enum) {
             .html => |html| gpa.free(html),
             .directory => |directory| directory.release(),
             .custom => {},
-            .external_url => |url| gpa.free(url),
+            .external_url => |external| gpa.free(external.url),
             .site => |*site| site.deinit(gpa),
         }
         self.* = undefined;
@@ -2000,7 +2029,7 @@ pub const Client = struct {
         if (running.stopped or !running.app.started)
             return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
-        if (running.app.options.use_cookies and content == .external_url)
+        if (running.app.options.use_cookies and content.isExternal())
             return error.ExternalUrlCookiesUnsupported;
         var peer = try self.retainPeer(running.inner.io);
         defer peer.deinit();
@@ -2261,7 +2290,7 @@ pub const Window = struct {
         if (running.stopped or !running.app.started)
             return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
-        if (running.app.options.use_cookies and content == .external_url)
+        if (running.app.options.use_cookies and content.isExternal())
             return error.ExternalUrlCookiesUnsupported;
         try self.state.replaceContent(running.inner.io, content, false);
         const target_url = try self.url(running, self.state.gpa);
@@ -2273,7 +2302,8 @@ pub const Window = struct {
     /// client, like upstream `webui_set_root_folder` or
     /// `webui_set_file_handler` on a shown window. Hosted pages keep running
     /// and load new resources from the replacement. External URLs change
-    /// the page origin, so neither side may be `.external_url`; use
+    /// the page origin, so neither side may be `.external_url` or
+    /// `.dev_server`; use
     /// `setContent` for those (`error.NavigationRequired`).
     pub fn installContent(
         self: Window,
@@ -2283,7 +2313,7 @@ pub const Window = struct {
         if (running.stopped or !running.app.started)
             return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
-        if (content == .external_url) return error.NavigationRequired;
+        if (content.isExternal()) return error.NavigationRequired;
         try self.state.replaceContent(running.inner.io, content, true);
     }
 
@@ -2446,7 +2476,16 @@ pub const Window = struct {
         self.state.content_mutex.lockSharedUncancelable(running.inner.io);
         defer self.state.content_mutex.unlockShared(running.inner.io);
         switch (self.state.content) {
-            .external_url => |external| return gpa.dupe(u8, external),
+            .external_url => |external| {
+                if (!external.bridge_fragment) return gpa.dupe(u8, external.url);
+                const bridge_url = try self.bridgeUrl(running, gpa);
+                defer gpa.free(bridge_url);
+                const component: std.Uri.Component = .{ .raw = bridge_url };
+                return std.fmt.allocPrint(gpa, "{s}#webui-bridge={f}", .{
+                    external.url,
+                    std.fmt.alt(component, .formatEscaped),
+                });
+            },
             else => {},
         }
         const scheme = if (running.app.options.tls == null) "http" else "https";
@@ -2817,7 +2856,7 @@ pub const App = struct {
                 .{ .directory = path }
             else
                 return error.MissingContent;
-        if (self.options.use_cookies and selected_content == .external_url)
+        if (self.options.use_cookies and selected_content.isExternal())
             return error.ExternalUrlCookiesUnsupported;
         const state = try self.gpa.create(WindowState);
         errdefer self.gpa.destroy(state);
@@ -3347,7 +3386,7 @@ fn originAllowed(
 ) bool {
     const origin = request.header("origin") orelse return false;
     return switch (window.content) {
-        .external_url => |external| sameOrigin(origin, external),
+        .external_url => |external| sameOrigin(origin, external.url),
         else => blk: {
             const host = request.header("host") orelse break :blk false;
             var target_buffer: [std.Io.net.HostName.max_len + 32]u8 = undefined;
@@ -4667,6 +4706,75 @@ test "site content resolves handler, virtual index, html, folder, and entry in u
     try expectRedirect(address, io, custom, "docs", "docs/index.htm");
     try expectBody(address, io, custom, "docs/index.htm", "HTTP/1.1 200", "custom docs");
     try expectBody(address, io, custom, "nothing", "HTTP/1.1 404", "\r\n\r\n");
+}
+
+test "dev server windows open with the bridge URL in the fragment" {
+    try requireSocketIntegration();
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var invalid_app = App.init(gpa, .{});
+    defer invalid_app.deinit();
+    try std.testing.expectError(
+        error.InvalidExternalUrl,
+        invalid_app.createWindow(.{ .content = .{ .dev_server = "http://localhost:5173/#/home" } }),
+    );
+    try std.testing.expectError(
+        error.InvalidExternalUrl,
+        invalid_app.createWindow(.{ .content = .{ .dev_server = "file:///tmp/index.html" } }),
+    );
+    var cookie_app = App.init(gpa, .{ .use_cookies = true });
+    defer cookie_app.deinit();
+    try std.testing.expectError(
+        error.ExternalUrlCookiesUnsupported,
+        cookie_app.createWindow(.{ .content = .{ .dev_server = "http://localhost:5173/" } }),
+    );
+
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .dev_server = "http://localhost:5173/app?x=1" } });
+    const hosted = try app.createWindow(.{ .content = .{ .html = "hosted" } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+
+    const bridge_url = try window.bridgeUrl(&running, gpa);
+    defer gpa.free(bridge_url);
+    const page_url = try window.url(&running, gpa);
+    defer gpa.free(page_url);
+    const prefix = "http://localhost:5173/app?x=1#webui-bridge=";
+    try std.testing.expect(std.mem.startsWith(u8, page_url, prefix));
+    const encoded = page_url[prefix.len..];
+    try std.testing.expect(std.mem.indexOfAny(u8, encoded, ":/[]#?&") == null);
+    const decoded = try gpa.dupe(u8, encoded);
+    defer gpa.free(decoded);
+    try std.testing.expectEqualStrings(bridge_url, std.Uri.percentDecodeInPlace(decoded));
+
+    // The development server's origin may connect; others may not.
+    try std.testing.expectError(error.WebSocketUpgradeFailed, connectTestWebSocketOrigin(
+        running.inner.address,
+        io,
+        &window.state.capability,
+        "http://localhost:5174",
+    ));
+    const stream = try connectTestWebSocketOrigin(
+        running.inner.address,
+        io,
+        &window.state.capability,
+        "http://localhost:5173",
+    );
+    defer stream.close(io);
+    var wire: [256]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &wire));
+
+    try std.testing.expectError(error.NavigationRequired, window.installContent(&running, .{ .html = "hosted" }));
+    try std.testing.expectError(error.NavigationRequired, hosted.installContent(&running, .{ .dev_server = "http://localhost:5173/" }));
+    // Plain external pages keep their URL unchanged.
+    _ = try hosted.setContent(&running, .{ .external_url = "http://localhost:5173/" });
+    const external_url = try hosted.url(&running, gpa);
+    defer gpa.free(external_url);
+    try std.testing.expectEqualStrings("http://localhost:5173/", external_url);
 }
 
 test "installed content changes resources without navigating clients" {

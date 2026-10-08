@@ -21,6 +21,7 @@ The current phase provides:
 - one `App`, multiple isolated windows, and automatic port selection;
 - embedded HTML, static directories, custom resources, external URLs, and a
   built-in JavaScript bridge;
+- Vite development servers with hot reload through `Content.dev_server`;
 - application-wide default static directories for windows without content;
 - optional recursive directory monitoring with per-window browser reloads;
 - inline and file-backed per-window favicons;
@@ -509,6 +510,12 @@ External pages use `.content = .{ .external_url = "http://..." }`.
 capability-scoped script URL that the caller-owned page must load. The bridge
 connects its WebSocket to the script's origin instead of the page's origin,
 and the server accepts the external page's Origin for that window.
+
+Development servers such as Vite use `.content = .{ .dev_server =
+"http://localhost:5173/" }`. They behave like `.external_url`, but the browser
+opens the page with `#webui-bridge=<percent-encoded bridge URL>`. The URL
+fragment never reaches the development server; the page loads that script.
+The URL must not already contain a fragment.
 
 Non-loopback listening requires both explicit public mode and TLS:
 
