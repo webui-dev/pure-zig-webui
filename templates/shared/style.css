@@ -1,0 +1,21 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color-scheme: light dark;
+}
+main {
+  max-width: 32rem;
+  margin: 4rem auto;
+  display: grid;
+  gap: 1rem;
+}
+.status {
+  margin: 0;
+  opacity: 0.7;
+}
+form {
+  display: flex;
+  gap: 0.5rem;
+}
+input {
+  flex: 1;
+}

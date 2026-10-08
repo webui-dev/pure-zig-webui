@@ -173,6 +173,14 @@ jobs:
         run: |
           npm run build:bridge
           git diff --exit-code -- ../src/bridge.js
+      - name: Scaffolded apps build
+        run: |
+          for template in react vue solid; do
+            app="$RUNNER_TEMP/app-$template"
+            node sdk/dist/create.js "$app" --template "$template"
+            (cd "$app/web" && npm install --no-audit --no-fund)
+            (cd "$app" && zig build web && zig build)
+          done
   cross:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

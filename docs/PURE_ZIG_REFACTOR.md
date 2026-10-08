@@ -29,7 +29,7 @@ deleted.
 |---|---|
 | Server and security | HTTP, WebSocket, TLS, loopback/public policy, capabilities, upgrade-bound Origin/cookie authorization, bounded authentication/liveness, and protocol limits are implemented. |
 | Browser bridge | Runtime bindings and events with `ADD_ID` replay, typed arguments/replies, bounded FIFO or concurrent handlers, deferred replies, total-deadline evaluation, raw data, navigation, high contrast, bounded `MULTI`, multiple clients, keepalive, reconnect, and status UI are implemented. The bridge source is TypeScript (`src/bridge.ts`); the generated JavaScript is committed. |
-| Frontend SDK | The `sdk/` package (not published) loads the bridge on hosted, `Content.dev_server`, and pre-included pages, and offers typed bindings, connection state, React hooks, Vue composables, and Solid signals. Tests: `sdk/test` (core with the real bridge, framework bindings) and `dev server windows open with the bridge URL in the fragment`. |
+| Frontend SDK | The `sdk/` package (not published) loads the bridge on hosted, `Content.dev_server`, and pre-included pages, and offers typed bindings, connection state, React hooks, Vue composables, and Solid signals. Its scaffolder creates Zig + Vite apps from `templates/` for React, Vue, and Solid. Tests: `sdk/test` (core with the real bridge, framework bindings, scaffolder) and `dev server windows open with the bridge URL in the fragment`. CI builds a scaffolded app per template. |
 | Content and lifecycle | HTML, directories, custom handlers, external URLs, runtime content replacement, default directories, favicons, directory monitoring, Deno/Node.js/Bun script interpretation, logging, and deterministic shutdown are implemented. |
 | Browser integration | Centring, app-mode window launching through browser discovery with managed per-browser profiles and Chromium default arguments, OS URL opening as the fallback, explicit browser selection, custom executables and argv, persistent initial/runtime size and position, kiosk and headless modes, Chromium forced-color control, caller-managed and deletable managed profile directories, Chromium-family proxy rules, Windows external-browser focus, backend and direct-child process IDs, replacement, and shutdown cleanup are implemented. |
 | Native integration | Optional Zig-only WKWebView, GTK3/WebKitGTK 4.1 and Win32/WebView2 backends implement native controls, UI-thread dispatch, close veto/history-safe JavaScript close, multiwindow pumping, and borrowed handles. Actual runtime gates pass on all three platforms. |
@@ -244,7 +244,8 @@ src/
   browser.zig    browser discovery and launching through std.process
   bridge.ts      browser bridge source
   bridge.js      generated from bridge.ts, committed, embedded at build time
-sdk/             TypeScript SDK with React, Vue, and Solid bindings
+sdk/             TypeScript SDK with React, Vue, and Solid bindings; scaffolder
+templates/       app templates used by the scaffolder
 ```
 
 Keep tests beside their modules. Split `app.zig` only when it develops a clear

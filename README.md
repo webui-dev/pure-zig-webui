@@ -22,7 +22,8 @@ The current phase provides:
 - embedded HTML, static directories, custom resources, external URLs, and a
   built-in JavaScript bridge written in TypeScript;
 - Vite development servers with hot reload through `Content.dev_server`;
-- a TypeScript SDK with React, Vue, and Solid bindings (`sdk/`);
+- a TypeScript SDK with React, Vue, and Solid bindings, plus app templates
+  (`sdk/`, `templates/`);
 - application-wide default static directories for windows without content;
 - optional recursive directory monitoring with per-window browser reloads;
 - inline and file-backed per-window favicons;
@@ -549,6 +550,21 @@ directory therefore need no `<script src="webui.js">` tag. Observing
 connection state replaces the bridge's built-in connection-loss banner, so
 render your own.
 
+Scaffold a Zig app with a React, Vue, or Solid frontend:
+
+```sh
+cd sdk && npm install
+npm run create -- ../../my-app --template react   # or vue, solid
+cd ../../my-app/web && npm install && cd ..
+zig build run                                     # build web/dist and open it
+# hot reload: `npm run dev` in web/, then `zig build dev`
+```
+
+Generated apps reference this checkout through `build.zig.zon` `.path` and a
+`file:` SDK dependency. Their Vite configs dedupe the framework package so the
+linked SDK shares the app's instance. The Vue template pins TypeScript 6
+because `vue-tsc` does not support TypeScript 7 yet.
+
 Non-loopback listening requires both explicit public mode and TLS:
 
 ```zig
@@ -700,10 +716,10 @@ External-browser examples warn and shut down when no browser connects.
 
 `zig build fuzz --fuzz=100K` exercises bounded protocol parsers. CI installs
 Node, Deno, and Bun, runs the core and bridge suites, type-checks and tests the
-SDK, checks that `src/bridge.js` matches `src/bridge.ts`, executes native
-smoke gates on Linux/macOS/Windows (with xdotool or `mouse_event` pointer input for
-frameless drag and resize on Linux and Windows), and cross-builds all five
-ledger targets.
+SDK, checks that `src/bridge.js` matches `src/bridge.ts`, builds a scaffolded
+app for each template, executes native smoke gates on Linux/macOS/Windows
+(with xdotool or `mouse_event` pointer input for frameless drag and resize on
+Linux and Windows), and cross-builds all five ledger targets.
 
 The [capability ledger](docs/PURE_ZIG_REFACTOR.md) records implemented behavior,
 open semantic gaps, and dated cross-platform validation evidence. The earlier

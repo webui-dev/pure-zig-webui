@@ -27,16 +27,20 @@
       "default": "./dist/solid.js"
     }
   },
+  "bin": {
+    "create-zig-webui": "./dist/create.js"
+  },
   "files": [
     "dist",
     "src"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.create.json",
     "build:bridge": "tsc -p tsconfig.bridge.json",
-    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.bridge.json --noEmit && tsc -p tsconfig.test.json",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.create.json --noEmit && tsc -p tsconfig.bridge.json --noEmit && tsc -p tsconfig.test.json",
     "prepare": "npm run build",
-    "test": "node --conditions=browser --test --test-force-exit --test-timeout=30000 test/"
+    "test": "node --conditions=browser --test --test-force-exit --test-timeout=30000 test/",
+    "create": "node dist/create.js"
   },
   "peerDependencies": {
     "react": ">=18",
