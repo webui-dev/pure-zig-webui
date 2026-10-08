@@ -83,7 +83,7 @@ macOS transparency/profile and Wayland absolute-coordinate limits are unchanged.
 | Upstream WebUI | Its core is the roughly 14,500-line `src/webui.c`, mixing protocol, server, browser, WebView, and process management |
 | Browser bridge | About 1,006 lines of TypeScript using the 8-byte WebUI binary header |
 | Linsang | Zig 0.17 with HTTP/1.1, WebSocket, static files, TLS, and connection lifecycle support |
-| Linsang validation | At `d2a076e1ffc0bccb8a8c9ed87af313049567e597` (Zig 0.17.0, cancelation-independent stop, `Io.operateTimeout` socket deadlines), 96 tests pass on macOS and the 15 Linux-only tests skip (all 111 pass on macOS with the gates lifted); Linux CI runs all of them, plus fuzzing and TLS interop |
+| Linsang validation | At `4b710d829f80a1597bafbf7e67a4a701bfa84e81` (Zig 0.17.0, cancelation-independent stop, `Io.operateTimeout` socket deadlines), 96 tests pass on macOS and the 15 Linux-only tests skip (all 111 pass on macOS with the gates lifted); Linux CI runs all of them, plus fuzzing and TLS interop |
 
 [Linsang issue #1](https://github.com/jinzhongjia/Linsang/issues/1) added a
 reference-counted `WebSocketPeer`, immediate cross-task sends, safe send/close
@@ -668,7 +668,7 @@ This snapshot used Linsang `db11eb05e897e4dccdab701e110dc8a6948cb690`, from
 [PR #3](https://github.com/jinzhongjia/Linsang/pull/3) (authorization-context,
 deadline, canonical-path, immutable TLS-reader, and concurrency fixes). That PR
 has since been merged. Linsang is now pinned to
-`d2a076e1ffc0bccb8a8c9ed87af313049567e597` on `main`: the Zig 0.17.0 port, a
+`4b710d829f80a1597bafbf7e67a4a701bfa84e81` on `main`: the Zig 0.17.0 port, a
 stop that does not depend on cancelation, and socket deadlines through
 `Io.operateTimeout`, which make keep-alive and WebSocket round trips about
 three times faster.
