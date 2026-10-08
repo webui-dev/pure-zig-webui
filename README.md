@@ -1,536 +1,129 @@
 # zig-webui
 
 > [!WARNING]
-> This is an experimental project under active development and is not suitable
+> Experimental and not yet released. APIs may change, and it is not suitable
 > for production use.
 
-zig-webui is a Zig-native reimplementation of WebUI. The core does not
-compile or link the upstream WebUI C library or CivetWeb.
-[Linsang](https://github.com/jinzhongjia/Linsang) provides HTTP and WebSocket
-support.
+zig-webui is a Zig-native reimplementation of [WebUI](https://github.com/webui-dev/webui):
+build desktop apps with a Zig backend and an HTML/JavaScript frontend that runs
+in an installed browser or an optional native WebView.
 
-The semantic gaps found by the latest upstream source audit are closed,
-including upstream's default presentation policy (F5, context menu, DevTools).
-See the [open semantic gaps](docs/PURE_ZIG_REFACTOR.md#open-semantic-gaps)
-and the [source comparison](docs/UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
+- **Pure Zig.** It does not compile or link the WebUI C library, CivetWeb, or any
+  bundled C, C++, or Objective-C. [Linsang](https://github.com/jinzhongjia/Linsang)
+  provides HTTP, WebSocket, and TLS.
+- **Upstream parity.** It covers the WebUI `2.5.0-beta.4` capabilities with a
+  Zig-native API, including upstream's window, bridge, and presentation
+  behavior. The [capability ledger](docs/PURE_ZIG_REFACTOR.md) maps every
+  upstream API and lists no open semantic gaps.
+- **Any browser or native.** App-mode windows in Chrome, Edge, Firefox, and other
+  installed browsers, or WKWebView, WebKitGTK, and WebView2 through system APIs.
+- **Modern frontends.** A TypeScript SDK with React, Vue, and Solid bindings,
+  app templates, and Vite hot reload.
+- **Safe by default.** Loopback-only, per-window capability URLs and tokens,
+  Origin checks, bounded resources, and explicit errors instead of silent
+  fallbacks.
 
-The current phase provides:
+## Contents
 
-- Zig 0.17;
-- one `App`, multiple isolated windows, and automatic port selection;
-- embedded HTML, static directories, custom resources, external URLs, and a
-  built-in JavaScript bridge written in TypeScript;
-- Vite development servers with hot reload through `Content.dev_server`;
-- upstream's presentation policy: F5 reloads only while bridge logging is on
-  (the default in Debug builds), page context menus are suppressed outside
-  `<input>` elements, and WebView2 DevTools are enabled only in Debug builds
-  (`native.Window.devToolsEnabled()` reports the engine state);
-- a TypeScript SDK with React, Vue, and Solid bindings, plus app templates
-  (`sdk/`, `templates/`);
-- application-wide default static directories for windows without content;
-- optional recursive directory monitoring with per-window browser reloads;
-- inline and file-backed per-window favicons;
-- runtime content and resource-handler replacement through
-  `Window.setContent()`;
-- targeted runtime content replacement through `Client.show()`;
-- explicit browser connection waiting and timeout through
-  `Window.waitForConnection()`;
-- window connected/shown state through `Window.isShown()`;
-- JavaScript calls to Zig bindings with return values;
-- thread-safe runtime binding and event-handler replacement, with client replay;
-- typed integer, float, and boolean call arguments and replies;
-- owned one-shot delayed binding replies through `Call.deferReply()`;
-- window and targeted `Call.client` calls to JavaScript with results, errors,
-  timeouts, and stale-client detection;
-- targeted client navigation, close, and raw binary delivery;
-- bounded multi-client windows through `WindowOptions.max_clients`;
-- bounded concurrent evaluations through
-  `WindowOptions.max_pending_evals`;
-- bounded delayed replies through `WindowOptions.max_pending_replies`;
-- explicit connection, WebSocket message, call, argument, binding, event, and
-  script limits through `App.Options.limits`;
-- automatic browser-to-Zig protocol fragmentation for large calls and
-  JavaScript results, bounded by `Limits.max_ws_message_size`;
-- window navigation, close, raw-data, and JavaScript broadcasts with
-  per-client results;
-- targeted and broadcast fire-and-forget JavaScript through `Client.run` and
-  `Window.run`;
-- connected, disconnected, click, and intercepted navigation events through
-  `Window.onEvent`;
-- per-window serial or concurrent binding and event execution through
-  `Window.setEventMode()`;
-- bounded concurrent handlers through `WindowOptions.max_pending_events`;
-- caller-provided internal logging through `App.Options.logger`;
-- same-origin WebSocket validation for hosted content and external-page Origin
-  validation for `.external_url`;
-- optional path-scoped `HttpOnly` cookie authorization through
-  `App.Options.use_cookies`, locking single-client windows to their first
-  client;
-- optional Deno, Node.js, or Bun interpretation of served `.js` and `.ts`
-  files through `App.WindowOptions.runtime`;
-- loopback-only listening by default and caller-provided TLS for explicit
-  public listening;
-- app-mode window launching through installed-browser discovery, with a
-  managed per-browser profile and OS URL opening as the fallback;
-- explicit browser launching with custom executable paths and argv;
-- per-window kiosk and headless modes plus persistent initial and runtime size
-  and position;
-- per-window Chromium and Firefox forced-color control and browser-native
-  high-contrast detection;
-- generated Firefox app profiles that hide the browser toolbars;
-- per-window browser profile directories with deletable managed profiles,
-  and Chromium-family proxy rules;
-- per-window browser child identifiers and deterministic process cleanup;
-- Windows external-browser focus with explicit errors on unsupported
-  platforms and unavailable windows;
-- current backend process ID through `parentProcessId()`;
-- default-browser launching and deterministic shutdown;
-- optional native WKWebView, GTK3/WebKitGTK 4.1, and WebView2 hosting through
-  system APIs, with native controls, close veto, and borrowed window handles.
+- [Requirements](#requirements)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Frontend apps (TypeScript, React, Vue, Solid)](#frontend-apps)
+- [Guide](#guide)
+- [Native WebViews](#native-webviews)
+- [Development](#development)
+
+## Requirements
+
+- Zig **0.17.0**.
+- At runtime, an installed browser. Chromium-family browsers support every
+  window control. Without a known browser, the OS default URL handler opens a
+  normal tab.
+- Optional: Node.js for the TypeScript SDK, the app templates, and the bridge
+  tests. Building and using the Zig package never needs Node or npm.
+- Optional native WebViews: macOS WebKit, Linux GTK3 with WebKitGTK 4.1, or the
+  Windows WebView2 Runtime.
+
+## Install
+
+```sh
+zig fetch --save=zig_webui git+https://github.com/webui-dev/pure-zig-webui
+```
+
+```zig
+// build.zig
+const webui = b.dependency("zig_webui", .{
+    .target = target,
+    .optimize = optimize,
+}).module("webui");
+
+const exe = b.addExecutable(.{
+    .name = "app",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "webui", .module = webui }},
+    }),
+});
+```
+
+Native WebViews also need system linkage; see
+[Native WebViews](#native-webviews).
+
+## Quick start
 
 ```zig
 const std = @import("std");
 const webui = @import("webui");
 
-fn hello(call: *webui.Call, _: ?*anyopaque) !void {
-    try call.reply("Hello from Zig");
+const html =
+    \\<!doctype html>
+    \\<button onclick="webui.call('greet', 'Zig').then(alert)">Greet</button>
+    \\<script src="webui.js"></script>
+;
+
+fn greet(call: *webui.Call, _: ?*anyopaque) !void {
+    var buffer: [64]u8 = undefined;
+    try call.reply(try std.fmt.bufPrint(&buffer, "Hello, {s}!", .{try call.string(0)}));
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const io = init.io;
-
-    var app = webui.App.init(gpa, .{});
+    var app = webui.App.init(init.gpa, .{});
     defer app.deinit();
-    const window = try app.createWindow(.{
-        .content = .{
-            .html =
-            \\<button onclick="webui.call('hello').then(alert)">Call Zig</button>
-            \\<script src="webui.js"></script>
-            ,
-        },
-    });
-    try window.bind(io, "hello", hello, null);
+    const window = try app.createWindow(.{ .content = .{ .html = html } });
+    try window.bind(init.io, "greet", greet, null);
 
-    var running = try app.start(io);
+    var running = try app.start(init.io);
     defer running.stop() catch {};
-    try window.open(io, &running);
-
-    var result_buffer: [64]u8 = undefined;
-    const result = try window.eval(
-        io,
-        "return 6 * 7",
-        &result_buffer,
-        .fromSeconds(5),
-    );
-    switch (result) {
-        .value => |value| std.debug.print("JavaScript: {s}\n", .{value}),
-        .javascript_error => |message| std.log.err("JavaScript: {s}", .{message}),
-    }
-    try running.wait();
+    try window.open(init.io, &running); // best installed browser, app mode
+    try running.wait(); // returns once every window has closed
 }
 ```
 
+The page loads the bridge from `webui.js`, relative to the window's
+capability URL, and calls Zig with `webui.call(name, ...args)`. Replies are
+strings. Every bound name is also available as `webui.<name>(...)`.
+
+## Frontend apps
+
+The `sdk/` directory holds the `zig-webui` TypeScript SDK. It is not published to
+npm yet; apps depend on this checkout by path.
+
+Scaffold a Zig app with a React, Vue, or Solid frontend:
+
 ```sh
-zig build test
-zig build
-zig build run
+cd sdk && npm install                              # builds the SDK once
+npm run create -- ../../my-app --template react    # or vue, solid
+cd ../../my-app/web && npm install && cd ..
+zig build run                                      # build web/dist and open it
 ```
 
-`zig build test` uses Node's built-in test runner for the browser bridge when
-Node is available and otherwise skips those tests with a warning. Building and
-using the library does not require Node or npm. CI and release validation
-should run `zig build test-bridge`, which fails when Node is unavailable.
-`Window.evalAll` returns owned results; call `deinit` on them after consuming
-every per-client outcome.
-
-`Running.wait()` evaluates every window independently and returns, then stops
-the application, once no window remains active. A connected window is active.
-After its last client leaves, a backend `Window.close()` finishes that window
-immediately, while any other disconnect gets a 1.5-second reconnect grace
-measured from the latest disconnect, so reloads and `Window.setContent()` can
-reconnect. A close intent belongs to its own window and is cleared when that
-window authenticates a new client, so closing one window never shortens another
-window's reload grace.
-
-Until any window connects, every window waits up to
-`App.Options.startup_timeout` (15 seconds by default, like upstream
-`webui_set_timeout`). After that, a never-connected window keeps the wait alive
-only if `Window.open()` or `Window.openWithBrowser()` was called for it, timed
-from that call like upstream `webui_show`. Each page or bridge request extends
-first-connection waiting by five seconds for slow pages. Set
-`startup_timeout = null` to wait indefinitely for the first client; zero and
-negative durations return `error.InvalidStartupTimeout` from `start`.
-`Running.requestExit()` sends a backend close to every page and makes the
-active wait return, like `webui_exit()`; it is safe from handlers and other
-threads. Only one `wait()` may run at a time; another returns
-`error.AlreadyWaiting`, and `wait()` after `stop()` returns immediately.
-Bridge retries do not extend the grace period or restart a stopped backend.
-Longer outages can recover only while the application keeps its server running.
-
-`App.createWindow()` also works while the app runs, from handlers or other
-threads: the window is served at once with its own fresh token, capability,
-and cookie, opens its folder, and starts its own folder monitor.
-`App.destroyWindow()` is upstream `webui_destroy()`. Before `start` it frees
-the window at once. While running it stops routing immediately, so the
-window's page, bridge script, and WebSocket upgrades answer `404`. Connected
-pages get a backend close, and any later message on their transport closes
-it with `1001`. In the background, queued and running handlers of that window
-are cancelled, the caller included, so a reply from a handler that destroys
-its own window is best effort. Its folder monitor and managed browser stop
-too, while the browser profile is kept. The window's memory is freed once its
-last connection, request, and deferred reply finish, and `Running.stop()`
-completes any cleanup still pending. `Client.window()` returns the window of a
-call or event, so a handler can destroy its own window. Other windows keep
-running. When no window remains, `Running.wait()` returns. Destroying
-an unknown or already destroyed window returns `error.UnknownWindow` without
-reading it. A destroyed `Window` handle and its `Client` handles must not be
-used again, or concurrently with the destroy call.
-
-`Window.open()` discovers the best installed browser and launches it as a
-standalone app window, exactly like `Window.openWithBrowser()` with that
-browser. It returns immediately. When no known browser is installed it hands
-the URL to the OS default handler, which opens an ordinary tab and therefore
-returns `error.ExplicitBrowserRequired` when any window control is active.
-Call `Window.waitForConnection(io, timeout)` when startup must wait for a
-browser; it returns the first connected `Client`. `Window.eval()` uses the same
-total timeout for connection waiting and JavaScript execution.
-
-Call `openUrl(gpa, io, url)` to open any non-empty URL with the OS default
-handler. `browserExists(gpa, io, browser)` checks an explicit `Browser`, while
-`bestBrowser(gpa, io)` returns the first installed browser in the preferred
-platform order or `null`. Discovery never opens the selected browser. On
-Windows it probes `PATH` and the `App Paths` registration. Chrome and Chromium
-both install `chrome.exe`, so, like upstream, a folder with Google's
-`initial_preferences` or `master_preferences` file is Google Chrome and any
-other `chrome.exe` is Chromium. On macOS it checks `/Applications`,
-`/System/Applications`, and `~/Applications`, then finds the bundle anywhere
-else by its bundle identifier through Spotlight's `mdfind`, which may return
-nothing when indexing is off. Other platforms run each executable candidate
-on `PATH` with `--version`, like upstream.
-
-`Window.openWithBrowser(&running, options)` launches a selected `Browser`
-with an optional full executable path and additional argv. Chromium-family
-browsers receive an `--app=` URL argument; Firefox receives `-new-window`.
-When `options.arguments` is empty, Chromium-family browsers also receive a set
-of default arguments that suppress first-run interstitials, extensions,
-background services, translation, sync, and proxies; a non-empty
-`options.arguments` replaces those defaults entirely.
-The returned `BrowserProcessId`, also available through
-`Window.browserProcessId()`, is a PID on POSIX and a process handle on
-Windows. Each window retains at most one launched child; launching another
-replaces it, and `Running.stop()` kills and reaps every retained child.
-
-`Window.focus(&running)` restores a minimized retained browser window and
-brings it to the foreground on Windows. It returns `error.NoManagedBrowser`
-before a browser is launched, `error.BrowserProcessUnavailable` for an invalid
-child handle, `error.BrowserWindowNotFound` when the child has no visible
-top-level window, and `error.BrowserFocusFailed` when Windows refuses the
-foreground request. Linux and macOS return `error.UnsupportedPlatform`.
-
-`parentProcessId()` returns the numeric ID of the current Zig backend process,
-which is the parent of browsers launched directly by this package. It is
-process-wide and does not require a `Window`. Targets without a supported
-process-ID API return `error.UnsupportedPlatform`.
-
-Set `.kiosk`, `.hide`, `.size`, or `.position` in `App.WindowOptions` to
-control the initial browser window. `.hide` launches the browser headless.
-Chromium-family browsers support all four controls. Firefox supports kiosk,
-hide, and size but returns `error.UnsupportedBrowserControl` for position;
-Safari returns the same error for any of these controls. Width and height must
-be non-zero, while positions may be negative for secondary displays. Only the
-OS-handler fallback inside `Window.open()` cannot honour these controls, and it
-returns `error.ExplicitBrowserRequired` instead of ignoring them.
-
-Set `.high_contrast = false` in `App.WindowOptions` to disable Chromium's
-forced-color feature for that window. Firefox has no flag for it, so the
-setting is written into the window's generated Firefox profile; with a
-caller-managed `.profile_directory`, which zig-webui never modifies, Firefox
-returns `error.UnsupportedBrowserHighContrast`. Safari always returns that
-error instead of ignoring this setting.
-The browser-side `webui.isHighContrast()` detects active forced colors or a
-stronger contrast preference through native media queries and requires no
-external OS program.
-
-Set `.profile_directory` in `App.WindowOptions` to launch Chromium-family
-browsers with `--user-data-dir` or Firefox with `--profile`. Set
-`.proxy_server` for Chromium-family browsers to pass one `--proxy-server`
-argument without invoking a shell. The app copies both strings. Profile
-directories remain caller-managed and are never deleted by zig-webui.
-Firefox returns `error.UnsupportedBrowserProxy` for proxy configuration;
-Safari returns `error.UnsupportedBrowserProfile` or
-`error.UnsupportedBrowserProxy` instead of silently ignoring either option.
-
-Without `.profile_directory`, each Chromium-family or Firefox window gets an
-independent managed profile leaf under its browser-family temporary root, for
-example `/tmp/.WebUI/WebUIChromeProfile/<window-capability>`. Different windows
-no longer hand their URL to the same browser process. Reopening a window stops
-and reaps its previous child before launching the replacement. A failed
-replacement leaves no stale child identifier.
-
-Before each launch, a generated Firefox profile receives upstream's app-mode
-setup: a `chrome/userChrome.css` that hides the tab strip, toolbars, and
-sidebar, and a `user.js` that enables it and turns off the default-browser
-check, the close warning, tabs in the title bar, and the first-run pages.
-`user.js` is rewritten each time, so a changed `.high_contrast` applies on the
-next launch. Snap Firefox cannot see the host `/tmp`, so when
-`/snap/bin/firefox` exists on Linux, Firefox profiles live in the snap's user
-directory, `<home>/snap/firefox/common/.mozilla/firefox/.WebUI/WebUIFirefoxProfile`,
-like upstream. The home directory comes from the current user's `/etc/passwd`
-entry, as snapd does; without one, the launch returns
-`error.HomeDirectoryUnavailable`.
-
-`Window.deleteProfile(&running)` stops the retained child and removes only that
-window's generated leaf. `managedProfileDirectory(gpa, io, browser)` returns
-the family root; `deleteManagedProfile` and `deleteAllManagedProfiles` remove roots
-and all their leaves, so stop every associated browser before using them.
-Caller-provided profiles remain caller-owned; `Window.deleteProfile` returns
-`error.CallerManagedProfile`. Do not share a caller profile with other live
-browser instances; identical configured profiles in one app are rejected with
-`error.BrowserProfileInUse`.
-
-`Window.setSize(io, size)` and `Window.setPosition(io, position)` persist new
-geometry, return the number of currently notified clients, and replay the
-latest values to clients that connect later. Subsequent
-`Window.openWithBrowser()` calls use the updated values. Connected external
-browsers receive `window.resizeTo()` or `window.moveTo()` requests; browser
-security policy may ignore those requests for ordinary tabs.
-
-`Window.setCenter(io)`, and `.center = true` in `App.WindowOptions`, centre
-the window on the primary display. Only the browser knows the screen
-geometry, so it computes the coordinates itself, which means centring takes
-effect once a client connects rather than at launch. Centring and an explicit
-position are mutually exclusive: each one clears the other, and setting both
-in `App.WindowOptions` returns `error.ConflictingWindowPlacement`.
-
-Serve a directory by setting
-`.content = .{ .directory = "path/to/public" }`. The path is opened when the
-app starts and closed when it stops. Physical directory requests, with or
-without a trailing slash, redirect with HTTP 302 to the first readable regular
-file in this order: `index.html`, `index.htm`, `index.ts`, `index.js`.
-The redirect preserves the encoded path and query string, so relative assets
-resolve under the selected directory. Index lookup does not follow symlinks.
-Custom resources receive borrowed `webui.Request` and `webui.Response` values;
-complete the response before the handler returns. A handler declines a path by
-answering `404` with an empty body, like an upstream file handler returning
-`NULL`; WebUI then asks it for `index.html`, `index.htm`, `index.ts`, and
-`index.js` below that path and redirects with `302` to the first one it
-answers, matching upstream virtual-directory probing.
-
-Use `.content = .{ .site = .{ ... } }` to compose upstream's embedded HTML,
-file handler, root folder, and entry file. Every field is optional, but at
-least one of `html`, `handler`, and `directory` is required:
-
-```zig
-.content = .{ .site = .{
-    .handler = .{ .handler = apiHandler, .user_data = &state },
-    .directory = "ui",
-    .entry = "pages/main.html",
-} },
-```
-
-Requests resolve in upstream order: the `handler`, then virtual-index probing
-through it, then `html` at the root, then files from `directory` with the usual
-directory-index redirects, then the default favicon or `404`. `entry`, like
-`webui_show(window, "pages/main.html")`, makes the root redirect to that file
-(served by the handler or present in the folder) and replaces the `index.*`
-candidates with its file name when probing handler paths. It must be a relative
-path without `..`, empty components, `<>?#"`, or reserved bridge names
-(`error.InvalidEntry`) and cannot be combined with `html`
-(`error.InvalidContent`).
-
-`Window.installContent(&running, content)` replaces content for later requests
-without navigating any client, like changing the root folder or file handler
-of a shown upstream window. `Window.setContent` replaces and navigates. Because
-an external URL changes the page origin, `installContent` returns
-`error.NavigationRequired` when either the current or the new content is
-`.external_url`.
-
-Set `.runtime = .deno`, `.node_js`, or `.bun` in `App.WindowOptions` to run
-served `.js` and `.ts` files through an external interpreter instead of
-sending them to the browser. Directory index selection happens first, so an
-HTML/HTM entry takes precedence over TS/JS regardless of runtime selection.
-Following a script-index redirect executes that script only when a runtime is
-enabled; without one it is served as a static resource. The interpreter is
-spawned as argv, never through a shell, and receives the script path followed by
-the raw query string, so a query can never become a command. Successful standard
-output is answered as `200 text/plain` and bounded by `Limits.max_runtime_output`;
-a run is abandoned
-after 30 seconds. Unlike upstream's empty-success fallback, unavailable
-interpreters (missing, inaccessible, or invalid executables) answer `503`,
-timeouts answer `504`, and output-limit violations or unsuccessful exits answer
-`502`. Failed runs never return partial stdout or interpreter diagnostics to
-the browser; diagnostics remain in the window logger. Static resources are
-unaffected. Resource paths are percent-decoded and validated once before runtime
-or static dispatch; encoded script suffixes cannot expose server-side source.
-Encoded separators, invalid UTF-8, NUL, and traversal are rejected. Interpreters
-reject symlink components and nonregular scripts. The directory tree must remain
-trusted: an attacker who can rewrite executable scripts already controls that
-interpreter's code and permissions.
-
-Set `App.Options.default_directory` to let windows created without `.content`
-inherit one static directory. Explicit window content takes precedence. A
-window without either setting returns `error.MissingContent`.
-
-Set `App.Options.folder_monitor_interval` to a positive `std.Io.Duration` to
-recursively poll active directory content. A changed tree sends
-`location.reload();` to that window's connected clients. Monitoring is
-disabled by default and stops with `Running.stop()`.
-
-Use `Window.setIcon(io, data, mime_type)` for in-memory favicon data or
-`Window.setIconFile(io, path)` for SVG, PNG, ICO, JPEG, GIF, WebP, or AVIF
-files. Embedded HTML receives a relative favicon link automatically.
-Directory and custom pages can reference `favicon.ico` relative to the window
-capability root.
-Like upstream, `favicon.ico` and `favicon.svg` resolve to the custom icon, then
-a readable file of that name in directory content, then a built-in default:
-`favicon.ico` redirects with `302` to `favicon.svg`, which serves the default
-SVG. The origin-root `/favicon.ico` and `/favicon.svg` that browsers request for
-pages without an icon link also serve that default. Custom handlers keep full
-control of their own favicon paths.
-
-`Window.setContent(&running, content)` prepares and installs new content, then
-navigates every connected client to it and returns the number notified. An
-invalid replacement leaves the current content unchanged. If client
-notification fails, the prepared replacement remains installed.
-
-`Client.show(&running, content)` installs the same window-wide content but
-navigates only the selected client, matching upstream `webui_show_client()`.
-Other connected pages are not reloaded; later resource requests use the new
-window content.
-
-`Window.onEvent` installs one handler for browser lifecycle, click, and
-navigation events. `Event.data` contains the element ID for clicks, the target
-URL for navigation, and is empty for connected or disconnected events.
-Navigation attempts are intercepted while an event handler is installed; call
-`Event.client.navigate` from the handler to continue them. Backend-initiated
-navigation bypasses that interception. `Window.bind(io, name, handler, user_data)`
-and `Window.onEvent(io, handler, user_data)` work before and during execution.
-New registrations reach connected clients through `ADD_ID` and are replayed
-before a reconnect's `CONNECTED` event. Existing in-flight handlers retain their
-snapshot; keep old `user_data` alive until those invocations have finished.
-Non-conflicting binding names also expose `webui.<name>(...)`; core and inherited
-properties are never overwritten, and `webui.call(name, ...)` always remains
-available.
-
-Inside a binding handler, `Call.name` is the binding name that matched and
-`Call.origin` is `.call` for an explicit JavaScript call or `.click` for a DOM
-click on the element with that ID; click handlers have no arguments and their
-reply is not sent. `Call.cookies` and `Event.cookies` hold the raw `Cookie`
-header the client sent with its WebSocket upgrade, like upstream
-`webui_event_t.cookies`; `Call.cookie(name)` and `Event.cookie(name)` return one
-value. These slices are valid only for the handler duration. Upgrades whose
-`Cookie` header exceeds `Limits.max_cookie_size` (8 KiB by default) are
-answered with `431` instead of being truncated.
-
-For a click, the general event handler runs before the named binding, using the
-same registration snapshot and scheduled task in both event modes.
-
-Handlers use a bounded FIFO worker queue in `.serial` mode, leaving the network
-receiver free to process replies and heartbeats. A handler can safely evaluate
-JavaScript on its own client. `Window.setEventMode(.concurrent)` starts newly
-received work independently. Both modes own queued data, obey
-`WindowOptions.max_pending_events`, and are canceled and joined by
-`Running.stop()`. Evaluation's total deadline includes connection waiting,
-send-lock contention, transmission, and waiting for the JavaScript response.
-Sent evaluations that time out or are canceled keep their wire ID reserved until
-the late result is discarded or the client disconnects. IDs cannot be reused to
-misattribute an old result after 16-bit wrap; exhausting that space returns
-`error.EvaluationIdsExhausted`. Tracking is bounded to 8 KiB per evaluated client.
-
-Set `App.Options.logger` and optional `logger_user_data` to receive formatted
-internal messages with a `std.log.Level`. The message slice is valid only
-during the callback. The callback must be thread-safe when concurrent event
-handling is enabled. Without a callback, messages use `std.log`.
-
-`Window.bind(io, "button", ...)` also dispatches clicks from elements with
-`id="button"`, including elements added after the bridge loads. Every matching
-ancestor receives the bubbling click from inner to outer; an unbound or empty
-inner ID does not hide a bound parent. DOM click handlers receive no arguments
-and their replies are ignored; explicit `webui.call("button", ...)` remains
-available.
-
-Binding handlers can transfer an explicit `webui.call()` response beyond the
-handler lifetime with `Call.deferReply()`. Complete the owned `PendingReply`
-once with `reply()`, `replyInt()`, `replyFloat()`, or `replyBool()`, or call
-`deinit()` to abandon it. All pending replies must be completed or abandoned
-before `App.deinit()`.
-
-The browser-side `webui` object also provides connection events, runtime
-logging, Base64 helpers, navigation control, and native high-contrast media
-query detection.
-
-The bridge retries lost transports after 500ms and authenticates every new
-connection before enabling calls. Connection establishment and authentication
-have a five-second deadline. Authenticated connections send text `ping` every
-20 seconds and require `pong` within 10 seconds; missing replies trigger
-reconnection. The server accepts only this exact authenticated text heartbeat,
-not arbitrary text messages.
-The server independently enforces a five-second authentication deadline and a
-25-second authenticated idle limit. Temporary client-capacity rejection is
-retryable; a stale transport cannot permanently occupy a single-client window.
-Protocol authentication is pinned to the window whose HTTP upgrade passed its
-Origin and cookie policy.
-
-Disconnects reject outstanding `webui.call()` promises; they are never replayed,
-because a binding may already have produced side effects. Results from
-JavaScript evaluations started on an old connection cannot reach a replacement
-connection. Authentication rejection and protocol/policy failures stop retries,
-as do backend close commands and page unloads. Returning from the browser's
-back-forward cache reconnects unless the bridge was permanently stopped.
-
-A nonblocking status banner appears after a connection loss persists for one
-second, or an initial connection fails to authenticate within five seconds.
-Opening a replacement socket does not remove it; successful authentication does.
-Authentication or protocol/policy rejection displays a terminal error instead
-of claiming to retry. Backend close and page unload remove bridge-owned UI.
-Installing `webui.setEventCallback()` suppresses the default banner so the
-application can own its connection UI. The callback receives the initial failed
-attempt and subsequent connected/disconnected transitions without duplicate
-notifications; callback exceptions do not interrupt recovery.
-
-`webui.call()` reserves a nonzero 16-bit request ID until its response arrives,
-the send fails, or the connection closes. Allocation skips pending IDs when
-wrapping; with all 65,535 IDs occupied, only the new call is rejected and no
-packet is sent. A slow deferred reply cannot be overwritten by later calls.
-
-When a WebSocket is already open but authentication is pending, `webui.call()`
-waits for that same socket's authentication before sending. Waiting calls are
-bounded to 65,535 and share the existing five-second handshake deadline.
-Transport loss, rejection, and unload reject them without replay on a new
-socket. Calls made before the socket opens or during an offline retry still
-reject immediately.
-
-Browser-to-Zig protocol packets of at least 65,500 bytes are sent as ordered
-`MULTI` chunks and reassembled per client. The announced total size is strictly
-parsed and bounded by `Limits.max_ws_message_size`; incomplete state is released
-when the client disconnects.
-
-Use `Client.run` or `Window.run` when JavaScript results and errors are not
-needed. These methods use the protocol's `JS_QUICK` command and do not consume
-pending evaluation slots.
-
-External pages use `.content = .{ .external_url = "http://..." }`.
-`Window.url` returns the external page, while `Window.bridgeUrl` returns the
-capability-scoped script URL that the caller-owned page must load. The bridge
-connects its WebSocket to the script's origin instead of the page's origin,
-and the server accepts the external page's Origin for that window.
-
-Development servers such as Vite use `.content = .{ .dev_server =
-"http://localhost:5173/" }`. They behave like `.external_url`, but the browser
-opens the page with `#webui-bridge=<percent-encoded bridge URL>`. The URL
-fragment never reaches the development server. The TypeScript SDK reads the
-fragment, removes it from the address bar, keeps it in session storage for
-hot reloads, and loads the bridge. The URL must not already contain a fragment.
-
-## TypeScript SDK and frameworks
-
-`src/bridge.ts` is the bridge source. `src/bridge.js` is generated from it with
-`npm run build:bridge` in `sdk/`. The generated file is committed, so
-building the Zig package still needs no Node or TypeScript.
-
-`sdk/` is the `zig-webui` npm package. It is not published to npm; apps depend
-on this checkout by path. Run `npm install` in `sdk/` once to build `dist/`.
+For hot reload, run `npm run dev` in `web/`, then `zig build dev` in the
+project root. The generated Zig host uses `.content = .{ .dev_server =
+"http://localhost:5173/" }`. The browser receives the bridge URL in the
+`#webui-bridge=` fragment, which never reaches the dev server. The SDK reads
+it, removes it from the address bar, and keeps it for reloads.
 
 | Import | API |
 |---|---|
@@ -540,35 +133,161 @@ on this checkout by path. Run `npm install` in `sdk/` once to build `dist/`.
 | `zig-webui/solid` | `createConnected()`, `createBridge()` (signals) |
 
 ```ts
+// Import the SDK before your router so it takes the dev-server fragment first.
 import { bindings } from "zig-webui";
 
 const zig = bindings<{ greet: [name: string] }>();
-const reply = await zig.greet("Zig"); // Zig replies are strings
+const reply = await zig.greet("Zig");
 ```
 
-`loadBridge` uses an included `webui.js` when the page has one. Otherwise it
-loads the bridge from the `dev_server` fragment or session storage, or from
-the capability path of a page served by zig-webui. Pages served from a
-directory therefore need no `<script src="webui.js">` tag. Observing
-connection state replaces the bridge's built-in connection-loss banner, so
-render your own.
+The SDK finds the bridge in this order:
 
-Scaffold a Zig app with a React, Vue, or Solid frontend:
+1. a `webui.js` the page already includes;
+2. the `dev_server` fragment or session storage;
+3. the capability path of a page that zig-webui serves.
 
-```sh
-cd sdk && npm install
-npm run create -- ../../my-app --template react   # or vue, solid
-cd ../../my-app/web && npm install && cd ..
-zig build run                                     # build web/dist and open it
-# hot reload: `npm run dev` in web/, then `zig build dev`
+Built `web/dist` apps therefore need no script tag. Observing connection state
+replaces the bridge's built-in connection-loss banner, so render your own.
+
+## Guide
+
+### Window content
+
+Set `.content` in `App.WindowOptions`, or replace it later.
+
+| Content | Use |
+|---|---|
+| `.html = "..."` | Embedded HTML, copied into the window. |
+| `.directory = "path"` | Static files. A directory request redirects to `index.html`, `index.htm`, `index.ts`, or `index.js`. |
+| `.custom = .{ .handler = f }` | Your handler answers each request with borrowed `webui.Request`/`webui.Response`. An empty `404` declines a path; the server then probes `index.*` below it. |
+| `.site = .{ .html, .handler, .directory, .entry }` | Upstream's composition, resolved in this order: handler, virtual-index probing, `html`, then `directory`. `entry` redirects the root to a page. |
+| `.external_url = "https://..."` | A page served elsewhere. It must load `Window.bridgeUrl()`, and its Origin is accepted for this window. |
+| `.dev_server = "http://localhost:5173/"` | Like `.external_url`, but the bridge URL is passed in the URL fragment for the SDK. |
+
+To change content at runtime:
+
+- `Window.setContent()` installs new content and navigates every client.
+- `Client.show()` navigates one client.
+- `Window.installContent()` swaps content without navigating; external
+  content needs `setContent()`.
+
+`App.Options.default_directory` serves windows created without content.
+`App.Options.folder_monitor_interval` reloads a window's clients when its
+directory tree changes.
+
+`Window.setIcon()` and `Window.setIconFile()` set the favicon. Without one,
+`favicon.ico` and `favicon.svg` fall back to a readable file of that name in
+the content, then to a built-in icon.
+
+Set `.runtime = .deno`, `.node_js`, or `.bun` to run served `.js` and `.ts`
+files in an external interpreter and return their stdout. The interpreter runs
+as argv with a 30-second limit and bounded output. A missing interpreter
+answers `503`, a timeout `504`, and a failed run `502`.
+
+### Calling Zig from JavaScript
+
+`Window.bind(io, name, handler, user_data)` registers a binding. Bindings can
+be added or replaced while the app runs; connected pages receive them at once.
+
+- **Arguments:** `Call.string(i)`, `int(i)`, `float(i)`, `boolean(i)`, and
+  `bytes(i)`.
+- **Replies:** `reply()`, `replyInt()`, `replyFloat()`, and `replyBool()`.
+- **Later replies:** `Call.deferReply()` returns an owned `PendingReply`;
+  complete it once, or `deinit()` it to abandon it.
+- **Clicks:** an element whose `id` matches a binding also calls it on click.
+  Clicks have no arguments, and their replies are ignored.
+- **Metadata:** `Call.name`, `Call.origin` (`.call` or `.click`), and
+  `Call.cookies` with `cookie(name)`.
+
+`Window.onEvent(io, handler, user_data)` receives `.connected`,
+`.disconnected`, `.click`, and `.navigation` events. While it is installed,
+link and script navigations are intercepted and sent to the handler;
+`event.client.navigate()` continues them.
+
+Handlers run on a bounded worker queue: FIFO per window by default, or
+`Window.setEventMode(.concurrent)`. `Running.stop()` cancels and joins them.
+
+### Calling JavaScript from Zig
+
+- `Window.eval(io, script, buffer, timeout)` waits for a client and returns
+  `.value` or `.javascript_error`.
+- `Window.evalAll()` returns owned per-client results; call `deinit()` on them.
+- `Window.run()` and `Client.run()` send fire-and-forget scripts.
+- `navigate()`, `close()`, and `sendRaw()` act on a window or on one client.
+
+Evaluations have a total deadline, and results from an old connection never
+reach a new one.
+
+### Lifecycle
+
+```zig
+var running = try app.start(io);
+defer running.stop() catch {};
+try window.open(io, &running);
+try running.wait();
 ```
 
-Generated apps reference this checkout through `build.zig.zon` `.path` and a
-`file:` SDK dependency. Their Vite configs dedupe the framework package so the
-linked SDK shares the app's instance. The Vue template pins TypeScript 6
-because `vue-tsc` does not support TypeScript 7 yet.
+`Running.wait()` returns once no window is active. After its last client
+leaves, a window gets a 1.5-second reconnect grace, so reloads and
+`setContent()` survive. `Window.close()` ends a window at once.
 
-Non-loopback listening requires both explicit public mode and TLS:
+Before the first connection, windows wait up to `App.Options.startup_timeout`
+(15 seconds). `Running.requestExit()` closes every page and ends the wait,
+like `webui_exit()`. `App.createWindow()` and `App.destroyWindow()` also work
+while the app runs, including from handlers.
+
+### Browser windows
+
+- `Window.open()` launches the best installed browser as an app window.
+- `Window.openWithBrowser(&running, .{ .browser = .firefox })` picks a browser;
+  `.executable` and `.arguments` override the path and the default arguments.
+- `bestBrowser()` and `browserExists()` query the installed browsers.
+- `openUrl()` opens any URL with the OS handler.
+
+| `App.WindowOptions` | Effect |
+|---|---|
+| `.size`, `.position`, `.center` | Initial geometry; change it later with `Window.setSize()`, `setPosition()`, and `setCenter()`. |
+| `.kiosk`, `.hide` | Kiosk or headless browser. |
+| `.high_contrast = false` | Disables forced colors (Chromium flag, Firefox profile). |
+| `.profile_directory` | A caller-owned profile, never modified. Otherwise each window gets a managed profile; `Window.deleteProfile()` removes it. |
+| `.proxy_server` | Chromium-family proxy rule. |
+| `.max_clients` | Allow more than one client per window. |
+
+Firefox windows get a generated app-mode profile that hides the toolbars, like
+upstream. A browser that cannot honor an option returns an explicit error,
+such as `error.UnsupportedBrowserControl`, instead of ignoring it. Each window
+retains its launched browser; `Running.stop()` kills and reaps it.
+`Window.focus()` raises it on Windows.
+
+### Browser bridge
+
+The bridge (`webui.js`, written in TypeScript in `src/bridge.ts`) behaves like
+upstream's:
+
+- **Reconnect:** it retries lost connections after 500 ms and authenticates
+  every new socket within 5 seconds. Pending calls are rejected and never
+  replayed.
+- **Heartbeat:** text `ping` every 20 seconds, with a 10-second `pong` deadline.
+- **Status banner:** shown after a lost or rejected connection, unless the page
+  installs `webui.setEventCallback()`.
+- **Page API:** `webui.call()`, `isConnected()`, `setLogging()`, `encode()`,
+  `decode()`, `isHighContrast()`, and `allowNavigation()`.
+- **Presentation, as upstream:**
+  - F5 reloads only while logging is on. Logging is on by default in Debug
+    builds.
+  - Page context menus are suppressed except on `<input>` elements.
+  - WebView2 DevTools are enabled only in Debug builds.
+
+### Security
+
+- The server listens on loopback by default. Each window has a random
+  capability path and token, and WebSocket upgrades must pass an Origin check.
+- `App.Options.use_cookies` adds path-scoped `HttpOnly` cookie authorization
+  and locks a single-client window to its first client.
+- `App.Options.limits` bounds connections, messages, calls, arguments,
+  bindings, events, and scripts.
+- Non-loopback listening requires `.public = true` and caller-provided TLS. A
+  self-signed certificate is never generated.
 
 ```zig
 var app = webui.App.init(gpa, .{
@@ -579,155 +298,121 @@ var app = webui.App.init(gpa, .{
         .certificate_pem = @embedFile("certificate.pem"),
         .private_key_pem = @embedFile("private-key.pem"),
     },
-    .limits = .{
-        .max_connections = 128,
-        .max_unauthenticated_connections = 16,
-        .max_ws_message_size = 1 << 20,
-    },
 });
 ```
 
-The certificate and private key are parsed by `App.start()` and released by
-`Running.stop()`. zig-webui never generates a self-signed certificate.
+## Native WebViews
 
-`use_cookies` requires hosted content. Combining it with `.external_url` returns
-`error.ExternalUrlCookiesUnsupported` rather than silently weakening Strict
-cookies or accepting a cross-site page that cannot authenticate.
-
-## Optional native WebViews
-
-`webui.native` is separate from external-browser launching. It contains only Zig
-source and calls installed platform frameworks; it never builds bundled C,
-C++, or Objective-C. Normal `zig build` does not link GUI libraries.
+`webui.native` hosts a window in WKWebView (macOS), WebKitGTK 4.1 (Linux), or
+WebView2 (Windows) through system APIs. It is separate from browser launching,
+and a normal `zig build` links no GUI libraries.
 
 ```zig
 var view = try webui.native.Window.open(gpa, io, window, &running, .{
-    .title = "Native WebUI",
+    .title = "My App",
     .size = .{ .width = 900, .height = 600 },
-    .resizable = true,
 });
 defer view.deinit() catch {};
-try view.run(); // Main/UI thread; std.Io workers serve the WebUI backend.
+try view.run(); // UI thread; std.Io workers serve the backend
 ```
 
-Create and operate windows on their UI owner thread (the main thread on macOS,
-one process-wide GTK thread on Linux). Use bounded `view.dispatch(callback,
-user_data)` from workers. Do not call `Running.wait()` on the UI thread; pump
-with `view.run()` or `view.poll()`, then stop the server. Join dispatch producers
-before deinit; queued user data is borrowed until execution or queue cancellation.
-Deinit from a native callback or recursive poll returns
-`error.ReentrantNativeOperation`.
+Link the platform libraries in your `build.zig` when you use it:
 
-Native controls are methods of the returned `view`, not browser JavaScript
-geometry requests: `setSize`, `setPosition`, `center`, `setMinimumSize`,
+```zig
+const module = exe.root_module;
+switch (target.result.os.tag) {
+    .macos => {
+        module.link_libc = true;
+        module.linkSystemLibrary("objc", .{});
+        for ([_][]const u8{ "Foundation", "AppKit", "WebKit" }) |framework|
+            module.linkFramework(framework, .{});
+    },
+    .linux => module.link_libc = true, // GTK3 and WebKitGTK load at runtime
+    .windows => for ([_][]const u8{ "user32", "gdi32", "ole32", "kernel32", "dwmapi" }) |library|
+        module.linkSystemLibrary(library, .{}),
+    else => {},
+}
+```
+
+**Threading.** Create and operate native windows on their UI thread: the main
+thread on macOS, and one GTK thread on Linux. Pump them with `view.run()` or
+`view.poll()`; do not call `Running.wait()` on the UI thread. Use
+`view.dispatch()` from worker threads.
+
+**Controls.** `setSize`, `setPosition`, `center`, `setMinimumSize`,
 `setResizable`, `setFrameless`, `setTransparent`, `setVisible`, `setKiosk`,
-`minimize`, `maximize`, `restore`, and `focus`. `geometry()` reports toolkit
-logical coordinates: content size and outer-window position (Cocoa uses its
-native lower-left origin). `handle()` returns a borrowed tagged Cocoa,
-GTK, or Win32 handle, invalid after native close or deinit.
-Frameless windows move and resize as upstream's adapters do, and
-`dragRegion()` reports how pages mark drag areas on the current backend:
-- `.webui_property` (WebKitGTK): pressing an element whose nearest
-  `--webui-app-region` value is `drag` starts a window-manager move once the
-  primary button moves; `no-drag` opts descendants out. The host honors a
-  request only while the primary button is held. Resizable frameless windows
-  resize from a 6 px edge band and show matching resize cursors.
-- `.css_app_region` (WebView2): CSS `app-region: drag` or
-  `-webkit-app-region: drag` areas act as the caption through Settings9
-  non-client regions; runtimes without Settings9 report `.none`. Resizable
-  frameless windows keep a sizing border.
-- `.window_background` (Cocoa): no CSS regions; frameless windows are movable
-  by their background where WebKit treats the point as background.
+`minimize`, `maximize`, `restore`, `focus`, `geometry()`, and `handle()`.
 
-Pages that target every backend declare all three properties:
+**Window behavior.**
+
+- **Titles:** page titles become the window title, unless
+  `follow_page_title = false`.
+- **Closing:** `setCloseHandler()` can veto user and JavaScript closes;
+  `view.close()` always closes.
+- **Navigation:** `navigation_handler` (or `setNavigationHandler()`) decides
+  every page, frame, and redirect navigation inside the engine.
+- **DevTools:** `devToolsEnabled()` reports the engine state.
+
+**Frameless dragging.** `dragRegion()` reports how each backend marks drag
+areas. To support every backend, declare all three properties:
 
 ```css
 .titlebar { --webui-app-region: drag; app-region: drag; -webkit-app-region: drag; }
 .titlebar button { --webui-app-region: no-drag; app-region: no-drag; -webkit-app-region: no-drag; }
 ```
 
+**Platform limits.**
 
-Like upstream, each non-empty page title replaces the host window title,
-including later `document.title` changes. `Options.title` is the initial title
-and `setTitle` applies at once until the page reports another title. An empty
-page title keeps the host title; WebView2 instead reports its own default title
-for untitled documents. Set `follow_page_title = false`, or call
-`setFollowPageTitle(false)`, to keep the title under host control; re-enabling
-applies the current page title. `title(gpa)` returns an owned copy of the host
-title.
+- **macOS:** no transparent pages and no custom profile directories; both return
+  errors, as in upstream.
+- **Linux:** position, centering, and geometry need X11. Transparency needs an
+  RGBA visual and a compositor. A missing runtime or display returns an error.
+- **Windows:** needs the WebView2 Runtime and the matching `WebView2Loader.dll`,
+  through `Options.webview2_loader` or normal DLL discovery. Nothing is
+  downloaded.
 
-`setCloseHandler(handler, user_data)` handles OS and JavaScript close requests on
-the UI thread; return `false` to veto. Document-start native integration keeps a
-vetoed page and its bridge alive, including after navigation history changes.
-`view.close()` force-closes without invoking that veto. Pumping one window also
-services native events and accepted close requests for other windows on its UI
-thread.
-
-`Options.navigation_handler` or `setNavigationHandler(handler, user_data)`
-decides page navigations in the engine, like upstream's WebKitGTK policy
-handler, so it also sees navigations the browser bridge cannot intercept or that
-happen without a live bridge. The handler runs on the UI thread with a borrowed
-`NavigationRequest { url, kind }` and returns `false` to cancel and keep the
-current page. Without a handler every navigation proceeds.
-
-- The host's own requests (the initial load and `navigate()`) are not reported.
-- Navigations in child frames are reported too.
-- Every server redirect hop is reported as its own request, so a handler can
-  stop a redirect to another origin. WKWebView has no public redirect flag, so
-  this is the only behavior that is consistent across engines.
-- WebKitGTK and WKWebView report `link`, `form_submission`, `back_forward`,
-  `reload`, `form_resubmission`, or `other`. WebView2 reports only `reload`,
-  `back_forward`, and `other`.
-- A navigation whose URL cannot be read is cancelled.
-
-With an `onEvent` handler installed, the bridge intercepts link clicks and
-script navigations before the engine sees them; call `webui.allowNavigation(true)`
-in the page to leave those decisions to the native handler.
-
-Platform prerequisites and explicit limits:
-
-- **macOS:** link `objc`, Foundation, AppKit, and WebKit. Public WKWebView APIs do
-  not provide transparent page compositing or arbitrary profile directories;
-  those options return explicit errors, matching upstream's macOS capability
-  boundary rather than using private selectors.
-- **Linux:** link system libc and install GTK3 plus WebKitGTK 4.1. Cross-build
-  with a GNU target such as `aarch64-linux-gnu`. Libraries are loaded dynamically;
-  a missing runtime or display returns an error. Position/centering/geometry
-  require X11; transparency requires an RGBA visual and a compositor.
-- **Windows:** link `user32`, `gdi32`, `ole32`, `kernel32`, and `dwmapi`; install the
-  WebView2 Runtime and provide the architecture-matching `WebView2Loader.dll`
-  through `Options.webview2_loader` or normal DLL discovery. No runtime is
-  downloaded by the library. Initialization is bounded to 60 seconds; late COM
-  callbacks retain safe independent ownership. Transparency requires DWM
-  composition and the Controller2 interface.
-
-The build configures this linkage for the native example:
+## Development
 
 ```sh
+zig build                  # library and examples
+zig build test             # core tests, plus bridge tests when Node is installed
+zig build test-bridge      # bridge tests; requires Node
+zig build fuzz --fuzz=100K # protocol parser fuzzing
+zig build run              # minimal example
+zig build run-bindings     # also: run-dynamic-content, run-managed-browser,
+                           # run-runtime, run-public-tls -- cert.pem key.pem
 zig build run-native -Dnative=true
-zig build test-native -Dnative=true
-# Windows: append -- --loader C:/path/to/WebView2Loader.dll
+zig build test-native -Dnative=true   # actual native WebView smoke
 ```
 
-## Examples and validation
+SDK and bridge source:
 
-Retained examples cover runtime bindings, dynamic content, managed browsers,
-interpreter resources, caller-provided public TLS, and native WebViews:
-`zig build run-bindings`, `run-dynamic-content`, `run-managed-browser`,
-`run-runtime`, and `run-public-tls -- certificate.pem private-key.pem`.
-External-browser examples warn and shut down when no browser connects.
+```sh
+cd sdk
+npm install
+npm run check          # type-check the SDK, scaffolder, and bridge
+npm test               # SDK tests on Node's built-in runner
+npm run build:bridge   # regenerate src/bridge.js from src/bridge.ts
+```
 
-`zig build fuzz --fuzz=100K` exercises bounded protocol parsers. CI installs
-Node, Deno, and Bun, runs the core and bridge suites, type-checks and tests the
-SDK, checks that `src/bridge.js` matches `src/bridge.ts`, builds a scaffolded
-app for each template, executes native smoke gates on Linux/macOS/Windows
-(with xdotool or `mouse_event` pointer input for frameless drag and resize on
-Linux and Windows), and cross-builds all five ledger targets.
+`src/bridge.js` is generated and committed. Edit `src/bridge.ts`, and CI
+rejects a stale copy.
 
-The [capability ledger](docs/PURE_ZIG_REFACTOR.md) records implemented behavior,
-open semantic gaps, and dated cross-platform validation evidence. The earlier
-rewrite-closure claim was withdrawn after the source rescan; existing passing
-gates do not prove untested upstream behavior. The experimental warning applies.
+CI runs on Linux, macOS, and Windows. It installs Node, Deno, and Bun, then:
+
+- runs the core, bridge, and SDK tests;
+- builds a scaffolded app for each template;
+- runs the native WebView smoke tests with real pointer input;
+- cross-builds `x86_64-linux`, `aarch64-linux`, `x86_64-windows`,
+  `x86_64-macos`, and `aarch64-macos`.
+
+More documentation:
+
+- [Capability ledger](docs/PURE_ZIG_REFACTOR.md): upstream API mapping,
+  validation evidence, and risks.
+- [Upstream logic audit](docs/UPSTREAM_LOGIC_AUDIT.md): source comparison with
+  upstream WebUI.
+- [AGENTS.md](AGENTS.md): contribution and testing rules.
 
 ## License
 
