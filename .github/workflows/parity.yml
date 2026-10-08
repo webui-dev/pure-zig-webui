@@ -149,6 +149,30 @@ jobs:
           name: windows-native-surface
           path: ${{ runner.temp }}/native-visual.png
           if-no-files-found: ignore
+  sdk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - name: Install Zig
+        run: |
+          curl --fail --location --max-time 120 https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz --output "$RUNNER_TEMP/zig.tar.xz"
+          tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-0.17.0" >> "$GITHUB_PATH"
+      - name: SDK types and tests
+        working-directory: sdk
+        run: |
+          npm ci
+          npm run check
+          npm test
+      - name: Committed bridge matches its TypeScript source
+        working-directory: sdk
+        run: |
+          npm run build:bridge
+          git diff --exit-code -- ../src/bridge.js
   cross:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

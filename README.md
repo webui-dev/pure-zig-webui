@@ -20,8 +20,9 @@ The current phase provides:
 - Zig 0.17;
 - one `App`, multiple isolated windows, and automatic port selection;
 - embedded HTML, static directories, custom resources, external URLs, and a
-  built-in JavaScript bridge;
+  built-in JavaScript bridge written in TypeScript;
 - Vite development servers with hot reload through `Content.dev_server`;
+- a TypeScript SDK with React, Vue, and Solid bindings (`sdk/`);
 - application-wide default static directories for windows without content;
 - optional recursive directory monitoring with per-window browser reloads;
 - inline and file-backed per-window favicons;
@@ -514,8 +515,39 @@ and the server accepts the external page's Origin for that window.
 Development servers such as Vite use `.content = .{ .dev_server =
 "http://localhost:5173/" }`. They behave like `.external_url`, but the browser
 opens the page with `#webui-bridge=<percent-encoded bridge URL>`. The URL
-fragment never reaches the development server; the page loads that script.
-The URL must not already contain a fragment.
+fragment never reaches the development server. The TypeScript SDK reads the
+fragment, removes it from the address bar, keeps it in session storage for
+hot reloads, and loads the bridge. The URL must not already contain a fragment.
+
+## TypeScript SDK and frameworks
+
+`src/bridge.ts` is the bridge source. `src/bridge.js` is generated from it with
+`npm run build:bridge` in `sdk/`. The generated file is committed, so
+building the Zig package still needs no Node or TypeScript.
+
+`sdk/` is the `zig-webui` npm package. It is not published to npm; apps depend
+on this checkout by path. Run `npm install` in `sdk/` once to build `dist/`.
+
+| Import | API |
+|---|---|
+| `zig-webui` | `call`, typed `bindings<T>()`, `loadBridge`, `getBridge`, `isConnected`, `subscribe` |
+| `zig-webui/react` | `useConnected()`, `useBridge()` |
+| `zig-webui/vue` | `useConnected()`, `useBridge()` (read-only refs) |
+| `zig-webui/solid` | `createConnected()`, `createBridge()` (signals) |
+
+```ts
+import { bindings } from "zig-webui";
+
+const zig = bindings<{ greet: [name: string] }>();
+const reply = await zig.greet("Zig"); // Zig replies are strings
+```
+
+`loadBridge` uses an included `webui.js` when the page has one. Otherwise it
+loads the bridge from the `dev_server` fragment or session storage, or from
+the capability path of a page served by zig-webui. Pages served from a
+directory therefore need no `<script src="webui.js">` tag. Observing
+connection state replaces the bridge's built-in connection-loss banner, so
+render your own.
 
 Non-loopback listening requires both explicit public mode and TLS:
 
@@ -667,8 +699,9 @@ interpreter resources, caller-provided public TLS, and native WebViews:
 External-browser examples warn and shut down when no browser connects.
 
 `zig build fuzz --fuzz=100K` exercises bounded protocol parsers. CI installs
-Node, Deno, and Bun, runs the core and bridge suites, executes native smoke gates
-on Linux/macOS/Windows (with xdotool or `mouse_event` pointer input for
+Node, Deno, and Bun, runs the core and bridge suites, type-checks and tests the
+SDK, checks that `src/bridge.js` matches `src/bridge.ts`, executes native
+smoke gates on Linux/macOS/Windows (with xdotool or `mouse_event` pointer input for
 frameless drag and resize on Linux and Windows), and cross-builds all five
 ledger targets.
 

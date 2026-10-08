@@ -28,6 +28,12 @@
   application lifecycle and routing in `src/app.zig`.
 - Keep tests beside the Zig module they exercise. Keep browser bridge tests in
   `src/bridge.test.js`.
+- Edit the bridge in `src/bridge.ts`, then regenerate the committed
+  `src/bridge.js` with `npm run build:bridge` in `sdk/`. Never hand-edit the
+  generated file; CI rejects a stale one.
+- The TypeScript SDK (`sdk/`) is the only place that may use npm
+  dependencies. Keep SDK tests in `sdk/test/` on Node's
+  built-in test runner, and run `npm run check` and `npm test` there.
 - Prefer Zig standard-library facilities and pass child-process arguments as
   argv. Never invoke a shell or interpolate user input into commands.
 - Preserve explicit ownership and deterministic cleanup. Pair every retained
@@ -53,7 +59,7 @@
 - Put timeouts on external-process and browser-dependent tests. Always
   terminate and reap children during replacement, failure, and shutdown.
 - Node-based bridge tests must use Node's built-in test runner only; do not add
-  npm dependencies or require Node to build the package.
+  npm dependencies or require Node to build the Zig package.
 
 ## Testing Requirements
 

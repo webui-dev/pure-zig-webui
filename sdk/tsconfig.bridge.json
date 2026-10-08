@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "types": [],
+    "strict": true,
+    "rootDir": "../src",
+    "outDir": "../src",
+    "newLine": "lf",
+    "skipLibCheck": true
+  },
+  "files": [
+    "../src/bridge.ts"
+  ]
+}

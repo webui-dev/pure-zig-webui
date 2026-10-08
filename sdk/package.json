@@ -1,0 +1,68 @@
+{
+  "name": "zig-webui",
+  "version": "0.0.0",
+  "private": true,
+  "description": "TypeScript SDK for zig-webui pages, with React and Vue bindings",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": [
+    "./dist/index.js",
+    "./src/index.ts"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "default": "./dist/react.js"
+    },
+    "./vue": {
+      "types": "./dist/vue.d.ts",
+      "default": "./dist/vue.js"
+    },
+    "./solid": {
+      "types": "./dist/solid.d.ts",
+      "default": "./dist/solid.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:bridge": "tsc -p tsconfig.bridge.json",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.bridge.json --noEmit && tsc -p tsconfig.test.json",
+    "prepare": "npm run build",
+    "test": "node --conditions=browser --test --test-force-exit --test-timeout=30000 test/"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "vue": ">=3.3",
+    "solid-js": ">=1.8"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "vue": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "26.6.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "happy-dom": "20.14.5",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "solid-js": "1.9.17",
+    "typescript": "7.0.2",
+    "vue": "3.5.43"
+  }
+}
