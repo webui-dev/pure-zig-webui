@@ -2,11 +2,11 @@
     .name = .zig_webui,
     .version = "2.5.0-beta.4",
     .fingerprint = 0x95965ed3cdfb8c33,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .linsang = .{
-            .hash = "Linsang-0.0.0-SZhixNTPBgAFNzofDbxNvJ-mV6zSGNm7brP3jHExQfcC",
-            .url = "https://github.com/jinzhongjia/Linsang/archive/db11eb05e897e4dccdab701e110dc8a6948cb690.tar.gz",
+            .hash = "Linsang-0.0.0-SZhixD3UBgBFXQLR91a5ugrVDqK9bXrOa5lE_K7OJV9x",
+            .url = "https://github.com/jinzhongjia/Linsang/archive/ae4c2f0396a97c89d1a0da0a39e697cbedbec5fa.tar.gz",
         },
     },
     .paths = .{

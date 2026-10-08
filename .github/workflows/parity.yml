@@ -23,7 +23,7 @@ jobs:
       - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed
         with:
           deno-version: v2.x
-      - name: Install Zig 0.16 on POSIX
+      - name: Install Zig 0.17 on POSIX
         if: runner.os != 'Windows'
         shell: bash
         run: |
@@ -32,18 +32,18 @@ jobs:
           os=linux
           if [ "$RUNNER_OS" = macOS ]; then os=macos; fi
           if [ "$arch" = arm64 ]; then arch=aarch64; fi
-          archive="zig-${arch}-${os}-0.16.0.tar.xz"
-          curl --fail --location --max-time 120 "https://ziglang.org/download/0.16.0/$archive" --output "$RUNNER_TEMP/zig.tar.xz"
+          archive="zig-${arch}-${os}-0.17.0.tar.xz"
+          curl --fail --location --max-time 120 "https://ziglang.org/download/0.17.0/$archive" --output "$RUNNER_TEMP/zig.tar.xz"
           tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-${arch}-${os}-0.16.0" >> "$GITHUB_PATH"
-      - name: Install Zig 0.16 and WebView2 on Windows
+          echo "$RUNNER_TEMP/zig-${arch}-${os}-0.17.0" >> "$GITHUB_PATH"
+      - name: Install Zig 0.17 and WebView2 on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Invoke-WebRequest 'https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip' -OutFile "$env:RUNNER_TEMP/zig.zip" -TimeoutSec 120
+          Invoke-WebRequest 'https://ziglang.org/download/0.17.0/zig-x86_64-windows-0.17.0.zip' -OutFile "$env:RUNNER_TEMP/zig.zip" -TimeoutSec 120
           Expand-Archive "$env:RUNNER_TEMP/zig.zip" -DestinationPath "$env:RUNNER_TEMP/zig"
-          "$env:RUNNER_TEMP/zig/zig-x86_64-windows-0.16.0" | Out-File $env:GITHUB_PATH -Append
+          "$env:RUNNER_TEMP/zig/zig-x86_64-windows-0.17.0" | Out-File $env:GITHUB_PATH -Append
           Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.2903.40/microsoft.web.webview2.1.0.2903.40.nupkg' -OutFile "$env:RUNNER_TEMP/webview2.zip" -TimeoutSec 120
           Expand-Archive "$env:RUNNER_TEMP/webview2.zip" -DestinationPath "$env:RUNNER_TEMP/webview2"
           $loader = "$env:RUNNER_TEMP/webview2/build/native/x64/WebView2Loader.dll"
@@ -156,9 +156,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Install Zig
         run: |
-          curl --fail --location --max-time 120 https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz --output "$RUNNER_TEMP/zig.tar.xz"
+          curl --fail --location --max-time 120 https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz --output "$RUNNER_TEMP/zig.tar.xz"
           tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-0.17.0" >> "$GITHUB_PATH"
       - name: Cross-target core builds
         run: |
           zig build -Dtarget=x86_64-linux

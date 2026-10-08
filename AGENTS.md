@@ -10,7 +10,7 @@
 
 ## Toolchain and Scope
 
-- Use Zig 0.16.0. Do not add compatibility code for Zig 0.15 or older.
+- Use Zig 0.17.0. Do not add compatibility code for Zig 0.16 or older.
 - Keep the core implementation pure Zig. Do not compile or link WebUI,
   CivetWeb, or bundled C, C++, or Objective-C code.
 - Use only the Zig standard library and the pinned Linsang dependency unless a

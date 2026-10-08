@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
         "test-bridge",
         "Run browser bridge tests (requires Node.js)",
     );
-    if (b.findProgram(&.{"node"}, &.{}) catch null) |node| {
+    if (b.findProgram(.{ .names = &.{"node"} })) |node| {
         const bridge_tests = b.addSystemCommand(&.{ node, "--test" });
         bridge_tests.addFileArg(b.path("src/bridge.test.js"));
         test_step.dependOn(&bridge_tests.step);
@@ -78,7 +78,7 @@ pub fn build(b: *std.Build) void {
         });
         b.installArtifact(example);
         const command = b.addRunArtifact(example);
-        if (b.args) |args| command.addArgs(args);
+        command.addPassthruArgs();
         b.step(b.fmt("run-{s}", .{name}), b.fmt("Run {s} example", .{name})).dependOn(&command.step);
     }
 
@@ -107,11 +107,11 @@ pub fn build(b: *std.Build) void {
         const native_example = b.addExecutable(.{ .name = "native", .root_module = native_module });
         b.installArtifact(native_example);
         const native_run = b.addRunArtifact(native_example);
-        if (b.args) |args| native_run.addArgs(args);
+        native_run.addPassthruArgs();
         b.step("run-native", "Run optional native WebView example").dependOn(&native_run.step);
         const smoke = b.addRunArtifact(native_example);
         smoke.addArg("--smoke");
-        if (b.args) |args| smoke.addArgs(args);
+        smoke.addPassthruArgs();
         native_test.dependOn(&smoke.step);
     } else {
         native_test.dependOn(&b.addFail("Use -Dnative=true and install the platform WebView runtime").step);

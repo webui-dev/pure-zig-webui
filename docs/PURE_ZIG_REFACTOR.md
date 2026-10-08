@@ -81,7 +81,7 @@ macOS transparency/profile and Wayland absolute-coordinate limits are unchanged.
 | Capability reference | WebUI `2.5.0-beta.4` at `337a183cea0a9c5daee16acb77eed2d5443bbbb0` |
 | Upstream WebUI | Its core is the roughly 14,500-line `src/webui.c`, mixing protocol, server, browser, WebView, and process management |
 | Browser bridge | About 1,006 lines of TypeScript using the 8-byte WebUI binary header |
-| Linsang | Zig 0.16 with HTTP/1.1, WebSocket, static files, TLS, and connection lifecycle support |
+| Linsang | Zig 0.17 with HTTP/1.1, WebSocket, static files, TLS, and connection lifecycle support |
 | Linsang validation | All 101 tests pass at `3b50417e3ddb7a0651a8dd8b7154f26c4d4e5608` |
 
 [Linsang issue #1](https://github.com/jinzhongjia/Linsang/issues/1) added a
@@ -117,7 +117,7 @@ races, and synchronous access to the actual `port = 0` address through
 ### Permanent non-goals
 
 - A C API, `src/c.zig`, extern struct ABI, or interface compatibility APIs.
-- Zig 0.14 or 0.15 compatibility. Zig 0.16 is the baseline.
+- Zig 0.16 or older compatibility. Zig 0.17 is the baseline.
 - Automatic self-signed certificate generation.
 
 ### Native platform boundaries

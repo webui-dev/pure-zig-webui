@@ -17,7 +17,7 @@ and the [source comparison](docs/UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-resca
 
 The current phase provides:
 
-- Zig 0.16;
+- Zig 0.17;
 - one `App`, multiple isolated windows, and automatic port selection;
 - embedded HTML, static directories, custom resources, external URLs, and a
   built-in JavaScript bridge;

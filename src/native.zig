@@ -89,7 +89,7 @@ pub const Window = struct {
         errdefer gpa.destroy(state);
         const tasks = try gpa.alloc(QueuedTask, options.max_pending_tasks);
         errdefer gpa.free(tasks);
-        const terminated = try gpa.dupeZ(u8, url);
+        const terminated = try gpa.dupeSentinel(u8, url, 0);
         defer gpa.free(terminated);
         state.* = .{
             .gpa = gpa,
@@ -198,7 +198,7 @@ pub const Window = struct {
     pub fn setTitle(self: Window, value: []const u8) !void {
         try self.checkOpen();
         try types.validateText(value);
-        const terminated = try self.state.gpa.dupeZ(u8, value);
+        const terminated = try self.state.gpa.dupeSentinel(u8, value, 0);
         defer self.state.gpa.free(terminated);
         if (supported) try self.state.backend.setTitle(terminated);
     }
@@ -220,7 +220,7 @@ pub const Window = struct {
     pub fn navigate(self: Window, value: []const u8) !void {
         try self.checkOpen();
         try validateUrl(value);
-        const terminated = try self.state.gpa.dupeZ(u8, value);
+        const terminated = try self.state.gpa.dupeSentinel(u8, value, 0);
         defer self.state.gpa.free(terminated);
         if (supported) try self.state.backend.navigate(terminated);
     }

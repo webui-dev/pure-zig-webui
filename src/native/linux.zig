@@ -228,10 +228,11 @@ const Api = struct {
 
     fn load(gtk: *std.DynLib, webkit: *std.DynLib) !Api {
         var api: Api = undefined;
-        inline for (@typeInfo(Api).@"struct".fields) |field| {
-            const library = if (comptime std.mem.startsWith(u8, field.name, "webkit_") or std.mem.startsWith(u8, field.name, "jsc_")) webkit else gtk;
-            @field(api, field.name) = library.lookup(field.type, field.name ++ "\x00") orelse {
-                std.log.err("native Linux runtime lacks symbol {s}", .{field.name});
+        const info = @typeInfo(Api).@"struct";
+        inline for (info.field_names, info.field_types) |name, T| {
+            const library = if (comptime std.mem.startsWith(u8, name, "webkit_") or std.mem.startsWith(u8, name, "jsc_")) webkit else gtk;
+            @field(api, name) = library.lookup(T, name ++ "\x00") orelse {
+                std.log.err("native Linux runtime lacks symbol {s}", .{name});
                 return error.NativeRuntimeSymbolMissing;
             };
         }
@@ -332,7 +333,7 @@ pub const Backend = struct {
 
         if (options.profile_directory) |path| {
             try std.Io.Dir.cwd().createDirPath(io, path);
-            const data = try gpa.dupeZ(u8, path);
+            const data = try gpa.dupeSentinel(u8, path, 0);
             defer gpa.free(data);
             const cache = try std.fmt.allocPrintSentinel(gpa, "{s}/cache", .{path}, 0);
             defer gpa.free(cache);
@@ -383,7 +384,7 @@ pub const Backend = struct {
 
         // GTK/WebKit setters copy strings synchronously; no borrowed Options
         // slices or URL buffers are retained in this backend.
-        const initial_title = try gpa.dupeZ(u8, options.title);
+        const initial_title = try gpa.dupeSentinel(u8, options.title, 0);
         defer gpa.free(initial_title);
         api.gtk_window_set_title(window, initial_title);
         api.gtk_window_set_default_size(window, @intCast(options.size.width), @intCast(options.size.height));
@@ -786,7 +787,7 @@ pub const Backend = struct {
         if (event.type != 4 or event.button != 1) return 0; // GDK_BUTTON_PRESS, primary
         const edge = self.edgeAt(widget, event.x, event.y) orelse return 0;
         const window = self.window orelse return 0;
-        self.api.gtk_window_begin_resize_drag(window, @intFromEnum(edge), 1, std.math.lossyCast(c_int, event.x_root), std.math.lossyCast(c_int, event.y_root), event.time);
+        self.api.gtk_window_begin_resize_drag(window, @backingInt(edge), 1, std.math.lossyCast(c_int, event.x_root), std.math.lossyCast(c_int, event.y_root), event.time);
         return 1;
     }
 

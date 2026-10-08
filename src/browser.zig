@@ -1312,13 +1312,13 @@ test "browser candidates and preference order cover every browser" {
         parseCommandValue("/usr/bin/browser\r\n", null).?,
     );
 
-    var seen: std.EnumSet(Browser) = .initEmpty();
+    var seen: std.EnumSet(Browser) = .empty;
     for (preferredBrowsers()) |selected| {
         try std.testing.expect(!seen.contains(selected));
         seen.insert(selected);
     }
     try std.testing.expectEqual(
-        std.meta.fields(Browser).len,
+        @typeInfo(Browser).@"enum".field_names.len,
         seen.count(),
     );
     try std.testing.expectEqual(Browser.chrome, preferredBrowsers()[0]);

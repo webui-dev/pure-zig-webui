@@ -561,7 +561,7 @@ const DirectoryContent = struct {
             } orelse break;
             var hash = std.hash.Wyhash.init(0);
             hash.update(entry.path);
-            const kind: u8 = @intFromEnum(entry.kind);
+            const kind: u8 = @backingInt(entry.kind);
             hash.update(std.mem.asBytes(&kind));
             const stat = entry.dir.statFile(io, entry.basename, .{
                 .follow_symlinks = false,
@@ -3335,8 +3335,8 @@ fn sameOrigin(origin_text: []const u8, target_text: []const u8) bool {
 
     var origin_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
     var target_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const origin_host = origin.getHost(&origin_host_buffer) catch return false;
-    const target_host = target.getHost(&target_host_buffer) catch return false;
+    const origin_host = std.Io.net.HostName.fromUri(origin, &origin_host_buffer) catch return false;
+    const target_host = std.Io.net.HostName.fromUri(target, &target_host_buffer) catch return false;
     return std.ascii.eqlIgnoreCase(origin_host.bytes, target_host.bytes);
 }
 
@@ -3599,8 +3599,8 @@ fn runScript(
             );
             const status: Linsang.Status = switch (err) {
                 error.FileNotFound, error.AccessDenied, error.InvalidExe => .service_unavailable,
-                error.Timeout => @enumFromInt(504),
-                error.StreamTooLong => @enumFromInt(502),
+                error.Timeout => @fromBackingInt(@intCast(504)),
+                error.StreamTooLong => @fromBackingInt(@intCast(502)),
                 else => unreachable,
             };
             return respondScript(response, status, "");
@@ -3619,7 +3619,7 @@ fn runScript(
             "Runtime {s} exited with {any} for {s}: {s}",
             .{ @tagName(runtime), result.term, sub_path, result.stderr },
         );
-        return respondScript(response, @enumFromInt(502), "");
+        return respondScript(response, @fromBackingInt(@intCast(502)), "");
     }
     return respondScript(response, .ok, result.stdout);
 }
@@ -3656,8 +3656,8 @@ fn writeHtml(
     include_icon: bool,
 ) !void {
     if (!include_icon) return response.write(html);
-    const insert_at = std.ascii.indexOfIgnoreCase(html, "</head>") orelse
-        std.ascii.indexOfIgnoreCase(html, "<body") orelse
+    const insert_at = std.ascii.findIgnoreCase(html, "</head>") orelse
+        std.ascii.findIgnoreCase(html, "<body") orelse
         html.len;
     try response.write(html[0..insert_at]);
     try response.write(favicon_link);
@@ -3703,7 +3703,7 @@ fn onRequest(
         }
         if (request.header("cookie")) |cookies| {
             if (cookies.len > window.limits.max_cookie_size) {
-                response.status = @enumFromInt(431);
+                response.status = @fromBackingInt(@intCast(431));
                 return .respond;
             }
         }
@@ -4002,7 +4002,7 @@ fn onOpen(connection: *Linsang.Connection, user_data: ?*anyopaque) void {
     const cookies = connection.req.header("cookie") orelse "";
     app.admitUpgrade(connection.io, @intFromPtr(connection), resolved.window, cookies) catch |err| {
         connection.wsClose(switch (err) {
-            error.ClientLimitReached => @enumFromInt(1013),
+            error.ClientLimitReached => @fromBackingInt(@intCast(1013)),
             error.CookieTooLarge => .policy_violation,
             else => .internal_error,
         }, "");
@@ -4074,7 +4074,7 @@ fn onMessage(
         const new_client = window.authenticate(connection, packet.header) catch |err| {
             // Capacity is temporary: a failed CHECK_TOKEN would make the
             // bridge stop reconnecting before a stale transport expires.
-            connection.wsClose(if (err == error.ClientLimitReached) @enumFromInt(1013) else .internal_error, "");
+            connection.wsClose(if (err == error.ClientLimitReached) @fromBackingInt(@intCast(1013)) else .internal_error, "");
             return;
         };
         app.authenticatedUpgrade(connection.io, @intFromPtr(connection));
@@ -4468,7 +4468,7 @@ test "calls and events expose binding name, origin, and bounded cookies" {
         io,
         &window.state.capability,
         "http://localhost",
-        "Cookie: session=" ++ "x" ** 64 ++ "\r\n",
+        "Cookie: session=" ++ @as([64]u8, @splat('x')) ++ "\r\n",
     ));
 
     const stream = try connectTestWebSocketHeaders(
@@ -5367,7 +5367,7 @@ fn readExact(stream: std.Io.net.Stream, io: std.Io, bytes: []u8) !void {
     var at: usize = 0;
     while (at < bytes.len) {
         var parts = [1][]u8{bytes[at..]};
-        const count = try io.vtable.netRead(io.userdata, stream.socket.handle, &parts);
+        const count = (try stream.readWithControl(io, &parts, &.{})).data_len;
         if (count == 0) return error.EndOfStream;
         at += count;
     }
@@ -5383,7 +5383,7 @@ fn readUntil(
     while (std.mem.indexOf(u8, buffer[0..len], needle) == null) {
         if (len == buffer.len) return error.StreamTooLong;
         var parts = [1][]u8{buffer[len..]};
-        const count = try io.vtable.netRead(io.userdata, stream.socket.handle, &parts);
+        const count = (try stream.readWithControl(io, &parts, &.{})).data_len;
         if (count == 0) break;
         len += count;
     }
@@ -5455,7 +5455,7 @@ fn sendClientFrameOpcode(
     if (payload.len > std.math.maxInt(u16)) return error.TestPayloadTooLarge;
     var frame: [std.math.maxInt(u16) + 8]u8 = undefined;
     const mask = [4]u8{ 1, 2, 3, 4 };
-    frame[0] = 0x80 | @as(u8, @intFromEnum(opcode));
+    frame[0] = 0x80 | @as(u8, @backingInt(opcode));
     const payload_at: usize = if (payload.len <= 125) blk: {
         frame[1] = 0x80 | @as(u8, @intCast(payload.len));
         @memcpy(frame[2..6], &mask);
@@ -5487,7 +5487,7 @@ fn readServerFrameOpcode(
 ) ![]u8 {
     var header: [2]u8 = undefined;
     try readExact(stream, io, &header);
-    if (header[0] != (0x80 | @as(u8, @intFromEnum(opcode))) or
+    if (header[0] != (0x80 | @as(u8, @backingInt(opcode))) or
         header[1] >= 126 or header[1] > buffer.len)
         return error.InvalidServerFrame;
     try readExact(stream, io, buffer[0..header[1]]);
@@ -6580,7 +6580,7 @@ test "runtime failures discard output and successful output respects the limit" 
     const cases = [_]struct {
         script: []const u8,
         limit: usize = 64,
-        status: Linsang.Status = @enumFromInt(502),
+        status: Linsang.Status = @fromBackingInt(@intCast(502)),
         body: []const u8 = "",
     }{
         .{ .script = "require('fs').writeSync(1, '12345678');", .limit = 8, .status = .ok, .body = "12345678" },
@@ -6614,7 +6614,7 @@ test "runtime timeout returns 504 without partial output" {
         &.{ "node", "-e", "require('fs').writeSync(1, 'partial-output'); setInterval(() => {}, 1000);" },
         64,
         .{ .raw = .fromMilliseconds(100), .clock = .awake },
-        @enumFromInt(504),
+        @fromBackingInt(@intCast(504)),
         "",
     );
 }
@@ -6649,7 +6649,7 @@ fn expectRuntimeHttpResponse(
     try std.testing.expect(std.mem.startsWith(
         u8,
         response,
-        try std.fmt.bufPrint(&prefix, "HTTP/1.1 {d} ", .{@intFromEnum(status)}),
+        try std.fmt.bufPrint(&prefix, "HTTP/1.1 {d} ", .{@backingInt(status)}),
     ));
     const body_at = (std.mem.indexOf(u8, response, "\r\n\r\n") orelse
         return error.MissingHttpHeaders) + 4;
@@ -6729,10 +6729,10 @@ fn testRuntimeHttp(runtime: Runtime) !void {
         body: []const u8,
     }{
         .{ .resource = "index.js?name=zig", .status = .ok, .body = "interpreted:name=zig\n" },
-        .{ .resource = "broken.js", .status = @enumFromInt(502), .body = "" },
-        .{ .resource = "oversized.js", .status = @enumFromInt(502), .body = "" },
+        .{ .resource = "broken.js", .status = @fromBackingInt(@intCast(502)), .body = "" },
+        .{ .resource = "oversized.js", .status = @fromBackingInt(@intCast(502)), .body = "" },
         .{ .resource = "index.%6as?encoded=suffix", .status = .ok, .body = "interpreted:encoded=suffix\n" },
-        .{ .resource = "broken.%6as", .status = @enumFromInt(502), .body = "" },
+        .{ .resource = "broken.%6as", .status = @fromBackingInt(@intCast(502)), .body = "" },
     };
     for (cases) |case| {
         const target = try std.fmt.allocPrint(
@@ -8890,7 +8890,7 @@ test "upgrade admission owns only accepted connections and removes every state" 
     try app.admitUpgrade(io, 2, second.state, "");
     try std.testing.expect(removedWindow(&app, 1) == first.state);
     try std.testing.expect(removedWindow(&app, 2) == second.state);
-    const oversized = [_]u8{'a'} ** ((Limits{}).max_cookie_size + 1);
+    const oversized: [(Limits{}).max_cookie_size + 1]u8 = @splat('a');
     try std.testing.expectError(error.CookieTooLarge, app.admitUpgrade(io, 3, first.state, &oversized));
     try app.admitUpgrade(io, 3, first.state, oversized[0 .. oversized.len - 1]);
     _ = removedWindow(&app, 3);

@@ -33,7 +33,7 @@ pub const DecodeError = error{ InvalidPacket, UnknownCommand };
 
 pub fn decode(bytes: []const u8) DecodeError!Packet {
     if (bytes.len < header_len or bytes[0] != signature) return error.InvalidPacket;
-    const command: Command = @enumFromInt(bytes[7]);
+    const command: Command = @fromBackingInt(@intCast(bytes[7]));
     switch (command) {
         .js,
         .js_quick,
@@ -88,7 +88,7 @@ pub fn append(
     out.items[start] = signature;
     std.mem.writeInt(u32, out.items[start + 1 ..][0..4], header.token, .little);
     std.mem.writeInt(u16, out.items[start + 5 ..][0..2], header.id, .little);
-    out.items[start + 7] = @intFromEnum(header.command);
+    out.items[start + 7] = @backingInt(header.command);
     try out.appendSlice(gpa, payload);
 }
 
