@@ -3744,6 +3744,14 @@ fn onRequest(
         if (std.mem.eql(u8, request.path, "/favicon.ico") or
             std.mem.eql(u8, request.path, "/favicon.svg"))
             return writeDefaultFavicon(response, request.path[1..]);
+        // Upstream serves the page without a trailing slash. Relative page
+        // resources need one, so a live window's bare capability redirects.
+        if (request.path.len == capability_len + 1 and request.path[0] == '/') {
+            if (app.retainWindowByCapability(io, request.path[1..])) |window| {
+                window.release();
+                return redirectBelow(app.gpa, request, response, "");
+            }
+        }
         response.status = .not_found;
         return .respond;
     };
@@ -4586,6 +4594,34 @@ test "calls and events expose binding name, origin, and bounded cookies" {
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
     }
     try std.testing.expect(capture.disconnected_theme.load(.acquire));
+}
+
+test "a bare capability redirects to the window root with its query" {
+    try requireSocketIntegration();
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    const window = try app.createWindow(.{ .content = .{ .html = "bare" } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+
+    var target: [capability_len + 16]u8 = undefined;
+    var expected: [capability_len + 32]u8 = undefined;
+    var response: [1024]u8 = undefined;
+    var bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}", .{window.state.capability}), "\r\n\r\n", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 302"));
+    try std.testing.expect(std.mem.indexOf(u8, bytes, try std.fmt.bufPrint(&expected, "Location: /{s}/\r\n", .{window.state.capability})) != null);
+    bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}?a=1", .{window.state.capability}), "\r\n\r\n", &response);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, try std.fmt.bufPrint(&expected, "Location: /{s}/?a=1\r\n", .{window.state.capability})) != null);
+
+    // An unknown capability of the same length still answers 404.
+    var unknown = window.state.capability;
+    unknown[0] = if (unknown[0] == 'a') 'b' else 'a';
+    bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}", .{unknown}), "\r\n\r\n", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 404"));
 }
 
 test "favicon falls back from custom icon to local file to the default" {
