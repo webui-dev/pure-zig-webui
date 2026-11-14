@@ -3035,6 +3035,8 @@ pub const App = struct {
             .max_connections = self.options.limits.max_connections,
             .max_ws_message_size = self.options.limits.max_ws_message_size,
             .ws_idle_timeout = .fromSeconds(25),
+            // Upstream sets CivetWeb's `tcp_nodelay`; bridge frames are small.
+            .tcp_nodelay = true,
             .tls = if (self.tls_auth) |*auth| .{ .auth = auth } else null,
             .on_request = onRequest,
             .on_ws_open = onOpen,
@@ -9274,6 +9276,19 @@ test "managed browser replacement reaps its previous child before relaunch" {
     }));
     try std.testing.expectEqual(@as(?BrowserProcessId, null), try window.browserProcessId(&running));
     try std.testing.expectEqual(@as(?Browser, .chromium), app.lastBrowser(io));
+}
+
+test "the server disables Nagle like upstream" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var app = App.init(gpa, .{});
+    defer app.deinit();
+    _ = try app.createWindow(.{ .content = .{ .html = "nodelay" } });
+    var running = try app.start(io);
+    defer running.stop() catch {};
+    try std.testing.expect(app.server.?.config.tcp_nodelay);
 }
 
 test "late timed out evaluation cannot resolve a later request after ID wrap" {

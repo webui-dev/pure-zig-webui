@@ -56,16 +56,13 @@ bridge parsing, click delegation, bounded IDs, and argv launching. WebView2
 non-client regions were already enabled. Detailed function/line evidence for
 the previous rescan is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
-Open:
-
-| Area | Gap |
-|---|---|
-| `TCP_NODELAY` | Upstream `9125b20` sets CivetWeb's `tcp_nodelay`. Pinned Linsang does not disable Nagle on accepted sockets, so small WebSocket frames can be delayed. It needs Linsang support before zig-webui can pin it. |
+No semantic gaps remain open.
 
 Closed after the rescans, each with focused tests in the same change:
 
 | Area | Resolution |
 |---|---|
+| `TCP_NODELAY` | Like upstream `9125b20`, accepted sockets disable Nagle through Linsang's `Config.tcp_nodelay` (pinned at `21917cf`): `setsockopt` on POSIX, and on Windows an AFD `SOCKOPT` request, because Zig 0.17's AFD sockets have no Winsock context. Tests: Linsang `accepted sockets disable Nagle unless configured otherwise` reads the option back from the served socket on Linux, macOS, and Windows CI; `the server disables Nagle like upstream`. |
 | Browser selection | `bestChromiumBrowser()` returns the first installed browser in upstream's `ChromiumBased` order (Chrome, Edge, Epic, Vivaldi, Brave, Yandex, Chromium), or null. `Window.open()` reuses the browser of the app's last successful launch, like upstream's `current_browser` for `AnyBrowser`, while it is still discoverable, and otherwise uses `bestBrowser()`. Tests: `managed browser replacement reaps its previous child before relaunch` (a failed launch keeps the last browser) and the browser preference-order test. |
 | Default presentation | Matches upstream `bridge/webui.ts` and `win32_wv2.cpp`. The bridge blocks F5 unless logging is on. Logging starts on in Debug builds, which receive `__zigWebuiDebug`, like upstream's `WEBUI_LOG`, and `webui.setLogging()` toggles it. The bridge suppresses page context menus except on `<input>` elements, in every build. WebView2 enables DevTools only in Debug builds; WKWebView and WebKitGTK keep their default (off), as upstream does. `native.Window.devToolsEnabled()` reports the engine state. Tests: bridge `presentation policy blocks F5 unless logging and context menus outside inputs`, the build-mode check in `dev server windows open with the bridge URL in the fragment`, and the native smoke presentation step, which runs in Debug and release builds. |
 | Wait lifecycle | Close intent, reconnect grace, and first-connection waiting are per window; `startup_timeout` and `Running.requestExit()` give the initial wait upstream's timeout and `webui_exit` completion. Tests: `wait state tracks startup, activity, reconnect grace, and close per window`, `wait keeps per-window close intent and honours exit requests`. |
@@ -95,7 +92,7 @@ macOS transparency/profile and Wayland absolute-coordinate limits are unchanged.
 | Upstream WebUI | Its core is the roughly 14,500-line `src/webui.c`, mixing protocol, server, browser, WebView, and process management |
 | Browser bridge | About 1,006 lines of TypeScript using the 8-byte WebUI binary header |
 | Linsang | Zig 0.17 with HTTP/1.1, WebSocket, static files, TLS, and connection lifecycle support |
-| Linsang validation | At `4b710d829f80a1597bafbf7e67a4a701bfa84e81` (Zig 0.17.0, cancelation-independent stop, `Io.operateTimeout` socket deadlines), 96 tests pass on macOS and the 15 Linux-only tests skip (all 111 pass on macOS with the gates lifted); Linux CI runs all of them, plus fuzzing and TLS interop |
+| Linsang validation | At `21917cf965920952ecd326576b09fce2467e010d` (Zig 0.17.0, cancelation-independent stop, `Io.operateTimeout` socket deadlines, `TCP_NODELAY`), 97 tests pass on macOS and the 15 Linux-only tests skip; Linux CI runs all of them, plus fuzzing and TLS interop, and macOS and Windows CI run the suite |
 
 [Linsang issue #1](https://github.com/jinzhongjia/Linsang/issues/1) added a
 reference-counted `WebSocketPeer`, immediate cross-task sends, safe send/close
@@ -680,10 +677,10 @@ This snapshot used Linsang `db11eb05e897e4dccdab701e110dc8a6948cb690`, from
 [PR #3](https://github.com/jinzhongjia/Linsang/pull/3) (authorization-context,
 deadline, canonical-path, immutable TLS-reader, and concurrency fixes). That PR
 has since been merged. Linsang is now pinned to
-`4b710d829f80a1597bafbf7e67a4a701bfa84e81` on `main`: the Zig 0.17.0 port, a
-stop that does not depend on cancelation, and socket deadlines through
+`21917cf965920952ecd326576b09fce2467e010d` on `main`: the Zig 0.17.0 port, a
+stop that does not depend on cancelation, socket deadlines through
 `Io.operateTimeout`, which make keep-alive and WebSocket round trips about
-three times faster.
+three times faster, and `TCP_NODELAY` on accepted sockets.
 
 The permanent exclusions remain unchanged: no C ABI compatibility layer, no
 old-Zig compatibility code, and no automatic self-signed certificate. Platform
