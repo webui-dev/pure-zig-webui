@@ -210,7 +210,8 @@ Handlers run on a bounded worker queue: FIFO per window by default, or
 ### Calling JavaScript from Zig
 
 - `Window.eval(io, script, buffer, timeout)` waits for a client and returns
-  `.value` or `.javascript_error`.
+  `.value` or `.javascript_error`. A result longer than `buffer` returns
+  `error.ResultTooLarge` instead of being truncated as upstream does.
 - `Window.evalAll()` returns owned per-client results; call `deinit()` on them.
 - `Window.run()` and `Client.run()` send fire-and-forget scripts.
 - `navigate()`, `close()`, and `sendRaw()` act on a window or on one client.
