@@ -238,10 +238,13 @@ while the app runs, including from handlers.
 
 ### Browser windows
 
-- `Window.open()` launches the best installed browser as an app window.
+- `Window.open()` launches an app window with the browser the app last
+  launched, while it is still installed, otherwise the best installed one.
 - `Window.openWithBrowser(&running, .{ .browser = .firefox })` picks a browser;
   `.executable` and `.arguments` override the path and the default arguments.
-- `bestBrowser()` and `browserExists()` query the installed browsers.
+- `bestBrowser()` and `browserExists()` query the installed browsers;
+  `bestChromiumBrowser()` returns the first installed Chromium-family browser
+  (upstream's `ChromiumBased`), or null.
 - `openUrl()` opens any URL with the OS handler.
 
 | `App.WindowOptions` | Effect |

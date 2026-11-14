@@ -255,7 +255,24 @@ pub fn bestBrowser(
     gpa: std.mem.Allocator,
     io: std.Io,
 ) !?Browser {
-    for (preferredBrowsers()) |selected|
+    return firstExisting(gpa, io, preferredBrowsers());
+}
+
+/// Return the first available Chromium-family browser in upstream's
+/// `ChromiumBased` order, or null when none is installed.
+pub fn bestChromiumBrowser(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+) !?Browser {
+    return firstExisting(gpa, io, chromiumBrowsers());
+}
+
+fn firstExisting(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    candidates: []const Browser,
+) !?Browser {
+    for (candidates) |selected|
         if (try browserExists(gpa, io, selected)) return selected;
     return null;
 }
@@ -938,6 +955,11 @@ fn linuxExecutables(selected: Browser) []const []const u8 {
     };
 }
 
+/// Upstream `ChromiumBased` order; Opera is not part of it.
+fn chromiumBrowsers() []const Browser {
+    return &.{ .chrome, .edge, .epic, .vivaldi, .brave, .yandex, .chromium };
+}
+
 fn preferredBrowsers() []const Browser {
     return switch (builtin.os.tag) {
         .windows => &.{
@@ -1322,6 +1344,12 @@ test "browser candidates and preference order cover every browser" {
         seen.count(),
     );
     try std.testing.expectEqual(Browser.chrome, preferredBrowsers()[0]);
+    try std.testing.expectEqualSlices(
+        Browser,
+        &.{ .chrome, .edge, .epic, .vivaldi, .brave, .yandex, .chromium },
+        chromiumBrowsers(),
+    );
+    for (chromiumBrowsers()) |selected| try std.testing.expect(isChromium(selected));
 
     if (builtin.os.tag == .linux) {
         try std.testing.expect(try commandSucceeds(

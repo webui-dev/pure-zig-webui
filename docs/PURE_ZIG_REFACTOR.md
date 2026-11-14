@@ -20,7 +20,7 @@ the Zig standard library and launching an installed browser remain in scope.
 ## Current Rewrite Status
 
 Status snapshot: 2026-10-08 (Zig 0.17.0 and the TypeScript SDK). The latest
-upstream source rescan is from 2026-09-12.
+upstream source rescan is from 2026-11-14.
 
 The external-browser core is now implemented in Zig on top of pinned Linsang.
 The legacy wrapper, C API, compatibility files, and examples have been
@@ -45,16 +45,28 @@ The package remains experimental.
 ## Open Semantic Gaps
 
 Fresh comparison: upstream HEAD
-[`52f9e75b92faf9a23fd150b3c60051c4ec85fc69`](https://github.com/webui-dev/webui/tree/52f9e75b92faf9a23fd150b3c60051c4ec85fc69),
-also compared with the original pinned baseline. Detailed function/line evidence
-is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
+[`24c7d196edc63f5b777d465063c3d26731f52dea`](https://github.com/webui-dev/webui/tree/24c7d196edc63f5b777d465063c3d26731f52dea)
+(2026-11-14). `include/webui.h` is unchanged since the 2026-09-12 rescan of
+`52f9e75`. The 26 newer commits fix upstream C defects (per-connection
+WebSocket write locking and partial-write close, navigation argument counts,
+UTF-8 raw-data offsets, MutationObserver rebinding, late or oversized results,
+shell quoting, `profiles.ini` matching, and C memory ownership) whose
+behavior zig-webui already has through Linsang peers, typed events, byte-level
+bridge parsing, click delegation, bounded IDs, and argv launching. WebView2
+non-client regions were already enabled. Detailed function/line evidence for
+the previous rescan is in [the source audit](UPSTREAM_LOGIC_AUDIT.md#2026-09-12-source-rescan).
 
-No semantic gaps remain open.
+Open:
 
-Closed after the rescan, each with focused tests in the same change:
+| Area | Gap |
+|---|---|
+| `TCP_NODELAY` | Upstream `9125b20` sets CivetWeb's `tcp_nodelay`. Pinned Linsang does not disable Nagle on accepted sockets, so small WebSocket frames can be delayed. It needs Linsang support before zig-webui can pin it. |
+
+Closed after the rescans, each with focused tests in the same change:
 
 | Area | Resolution |
 |---|---|
+| Browser selection | `bestChromiumBrowser()` returns the first installed browser in upstream's `ChromiumBased` order (Chrome, Edge, Epic, Vivaldi, Brave, Yandex, Chromium), or null. `Window.open()` reuses the browser of the app's last successful launch, like upstream's `current_browser` for `AnyBrowser`, while it is still discoverable, and otherwise uses `bestBrowser()`. Tests: `managed browser replacement reaps its previous child before relaunch` (a failed launch keeps the last browser) and the browser preference-order test. |
 | Default presentation | Matches upstream `bridge/webui.ts` and `win32_wv2.cpp`. The bridge blocks F5 unless logging is on. Logging starts on in Debug builds, which receive `__zigWebuiDebug`, like upstream's `WEBUI_LOG`, and `webui.setLogging()` toggles it. The bridge suppresses page context menus except on `<input>` elements, in every build. WebView2 enables DevTools only in Debug builds; WKWebView and WebKitGTK keep their default (off), as upstream does. `native.Window.devToolsEnabled()` reports the engine state. Tests: bridge `presentation policy blocks F5 unless logging and context menus outside inputs`, the build-mode check in `dev server windows open with the bridge URL in the fragment`, and the native smoke presentation step, which runs in Debug and release builds. |
 | Wait lifecycle | Close intent, reconnect grace, and first-connection waiting are per window; `startup_timeout` and `Running.requestExit()` give the initial wait upstream's timeout and `webui_exit` completion. Tests: `wait state tracks startup, activity, reconnect grace, and close per window`, `wait keeps per-window close intent and honours exit requests`. |
 | Callback metadata | `Call.name`, `Call.origin` (`.call` or `.click`), and `Call.cookies`/`Event.cookies` with `cookie(name)` expose the binding name, call origin, and the upgrade's `Cookie` header, copied per connection under `Limits.max_cookie_size` (oversized upgrades answer `431`). Tests: `calls and events expose binding name, origin, and bounded cookies`, `cookie values parse from raw headers`, `upgrade admission owns only accepted connections and removes every state`. |
@@ -425,7 +437,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | Upstream API | Zig replacement |
 |---|---|
 | `webui_new_window()`, `webui_new_window_id()`, `webui_get_new_window_id()` | `App.createWindow()`, before or after `start`, and application-owned IDs. |
-| `webui_show()`, `webui_start_server()`, `webui_get_url()` | Initial `Content`, runtime `Window.setContent()`, `App.start()`, `Window.open()`, and `Window.url()`. Upstream's string sniffing becomes explicit variants: HTML `.html`, URL `.external_url` (or `.dev_server`, which also hands the page the bridge URL), folder `.directory`, and file `.site` with `entry`. `Window.open()` launches the best installed browser in app mode and falls back to the OS URL handler, matching upstream `webui_show()` with `AnyBrowser`. |
+| `webui_show()`, `webui_start_server()`, `webui_get_url()` | Initial `Content`, runtime `Window.setContent()`, `App.start()`, `Window.open()`, and `Window.url()`. Upstream's string sniffing becomes explicit variants: HTML `.html`, URL `.external_url` (or `.dev_server`, which also hands the page the bridge URL), folder `.directory`, and file `.site` with `entry`. `Window.open()` launches the best installed browser in app mode and falls back to the OS URL handler, matching upstream `webui_show()` with `AnyBrowser`, including reuse of the browser from the app's last successful launch while it is still discoverable. |
 | `webui_show_client()` | `Client.show()` replaces the window content and navigates only the selected client. |
 | `webui_is_shown()` | `Window.isShown()` reports whether the window has at least one connected browser client. |
 | `webui_set_center()` | `App.WindowOptions.center` and `Window.setCenter()` centre the window on the primary display. Upstream reads the monitor geometry natively, which needs GDK on Linux; the browser computes the coordinates instead, so centring applies once a client connects rather than at launch. Centring and an explicit position clear each other. |
@@ -434,7 +446,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_set_size()`, `webui_set_position()` | `App.WindowOptions.size` and `.position` set initial geometry. `Window.setSize()` and `Window.setPosition()` persist updates, notify connected clients, replay the latest geometry to later clients, and affect subsequent explicit browser launches. |
 | `webui_set_high_contrast()`, `webui_is_high_contrast()` | `App.WindowOptions.high_contrast` controls Chromium forced-color support and the generated Firefox profile's `browser.display.document_color_use` preference, with explicit errors for Safari and caller-managed Firefox profiles. Browser-side `webui.isHighContrast()` uses native forced-color and contrast media queries without external programs. |
 | `webui_open_url()` | `openUrl()` safely passes a non-empty URL as one argument to the platform default opener. |
-| `webui_get_best_browser()`, `webui_browser_exist()` | `bestBrowser()` and `browserExists()` discover registered or executable browser candidates through the public `Browser` enum, including registered Windows Chromium and macOS bundles found by bundle identifier. |
+| `webui_get_best_browser()`, `webui_browser_exist()`, `ChromiumBased` | `bestBrowser()`, `bestChromiumBrowser()`, and `browserExists()` discover registered or executable browser candidates through the public `Browser` enum, including registered Windows Chromium and macOS bundles found by bundle identifier. |
 | `webui_show_browser()`, `webui_set_browser_folder()`, `webui_set_custom_parameters()` | `Window.openWithBrowser()` accepts a `BrowserLaunchOptions` value with an explicit browser, optional full executable path, and additional argv. An empty argv applies the Chromium default arguments; a non-empty argv replaces them, matching upstream `custom_parameters`. |
 | `webui_get_child_process_id()` | `Window.openWithBrowser()` returns the retained direct child's `BrowserProcessId`; `Window.browserProcessId()` retrieves it later. |
 | `webui_get_parent_process_id()` | Root-level `parentProcessId()` returns the current Zig backend's numeric process ID without a redundant window argument. Unsupported process targets return an explicit error. |

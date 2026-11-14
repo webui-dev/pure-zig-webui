@@ -2366,13 +2366,20 @@ pub const Window = struct {
         try self.state.replaceIcon(io, data, mime_type);
     }
 
-    /// Launch the best available browser as a standalone app window. Falls
-    /// back to the operating system URL handler, which opens a regular tab and
-    /// therefore rejects active window controls, when no known browser exists.
+    /// Launch a standalone app window with the browser of the app's last
+    /// launch while it is still discoverable, otherwise the best available
+    /// one. Falls back to the operating system URL handler, which opens a
+    /// regular tab and therefore rejects active window controls, when no
+    /// known browser exists.
     pub fn open(self: Window, io: std.Io, running: *Running) !void {
         if (running.stopped or !running.app.started) return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
-        if (try browser.bestBrowser(self.state.gpa, io)) |selected| {
+        const gpa = self.state.gpa;
+        const last = if (running.app.lastBrowser(io)) |previous|
+            if (try browser.browserExists(gpa, io, previous)) previous else null
+        else
+            null;
+        if (last orelse try browser.bestBrowser(gpa, io)) |selected| {
             _ = try self.openWithBrowser(running, .{ .browser = selected });
             return;
         }
@@ -2663,6 +2670,9 @@ pub const App = struct {
     tls_auth: ?Linsang.tls.CertKeyPair = null,
     managed_browsers: std.ArrayList(ManagedBrowser) = .empty,
     browser_mutex: std.Io.Mutex = .init,
+    /// Browser of the last successful launch, reused by `Window.open()` like
+    /// upstream's `current_browser`. Guarded by `browser_mutex`.
+    last_browser: ?Browser = null,
     started: bool = false,
     /// Set by `Running.requestExit()` from any thread or handler.
     exit_requested: std.atomic.Value(bool) = .init(false),
@@ -3129,7 +3139,14 @@ pub const App = struct {
         managed.profile = profile;
         owns_profile = false;
         managed.child = try browser.launch(self.gpa, io, url, options, controls, profile);
+        self.last_browser = options.browser;
         return managed.child.?.id.?;
+    }
+
+    fn lastBrowser(self: *App, io: std.Io) ?Browser {
+        self.browser_mutex.lockUncancelable(io);
+        defer self.browser_mutex.unlock(io);
+        return self.last_browser;
     }
 
     fn deleteBrowserProfile(self: *App, io: std.Io, window: *WindowState) !bool {
@@ -9230,6 +9247,7 @@ test "managed browser replacement reaps its previous child before relaunch" {
         .executable = executable,
         .arguments = &.{state_file},
     };
+    try std.testing.expectEqual(@as(?Browser, null), app.lastBrowser(io));
     for (0..2) |_| {
         const id = try window.openWithBrowser(&running, options);
         var observed = false;
@@ -9248,11 +9266,14 @@ test "managed browser replacement reaps its previous child before relaunch" {
         }
         try std.testing.expect(observed);
     }
+    // `Window.open()` reuses the last successful launch; a failed one keeps it.
+    try std.testing.expectEqual(@as(?Browser, .chromium), app.lastBrowser(io));
     try std.testing.expectError(error.FileNotFound, window.openWithBrowser(&running, .{
-        .browser = .chromium,
+        .browser = .epic,
         .executable = missing_executable,
     }));
     try std.testing.expectEqual(@as(?BrowserProcessId, null), try window.browserProcessId(&running));
+    try std.testing.expectEqual(@as(?Browser, .chromium), app.lastBrowser(io));
 }
 
 test "late timed out evaluation cannot resolve a later request after ID wrap" {
