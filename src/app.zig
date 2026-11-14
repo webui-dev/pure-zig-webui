@@ -2445,6 +2445,26 @@ pub const Window = struct {
         return running.app.focusBrowser(running.inner.io, self.state);
     }
 
+    /// Minimize this window's retained browser window, like upstream's
+    /// `webui_minimize()` for browser windows. Windows acts directly; X11
+    /// needs `xdotool`, and macOS needs the Accessibility permission for
+    /// `osascript`. Native windows use `native.Window.minimize()`.
+    pub fn minimize(self: Window, running: *const Running) !void {
+        return self.setBrowserWindowState(running, .minimized);
+    }
+
+    /// Maximize this window's retained browser window, like upstream's
+    /// `webui_maximize()` for browser windows. X11 also needs `wmctrl`.
+    pub fn maximize(self: Window, running: *const Running) !void {
+        return self.setBrowserWindowState(running, .maximized);
+    }
+
+    fn setBrowserWindowState(self: Window, running: *const Running, state: browser.WindowState) !void {
+        if (running.stopped or !running.app.started) return error.NotRunning;
+        if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
+        return running.app.browserWindowState(running.inner.io, self.state, state);
+    }
+
     /// Return whether at least one browser client is connected.
     pub fn isShown(self: Window, io: std.Io) bool {
         return self.state.hasClients(io);
@@ -3185,6 +3205,24 @@ pub const App = struct {
             if (managed.window == window) {
                 const child = managed.child orelse return error.NoManagedBrowser;
                 return browser.focusProcess(child.id.?);
+            };
+        return error.NoManagedBrowser;
+    }
+
+    /// Holds `browser_mutex` while the bounded window tool runs, so the
+    /// child cannot be replaced or reaped and its ID reused meanwhile.
+    fn browserWindowState(
+        self: *App,
+        io: std.Io,
+        window: *WindowState,
+        state: browser.WindowState,
+    ) !void {
+        self.browser_mutex.lockUncancelable(io);
+        defer self.browser_mutex.unlock(io);
+        for (self.managed_browsers.items) |*managed|
+            if (managed.window == window) {
+                const child = managed.child orelse return error.NoManagedBrowser;
+                return browser.setProcessWindowState(self.gpa, io, child.id.?, state);
             };
         return error.NoManagedBrowser;
     }
@@ -6520,6 +6558,9 @@ test "selected browser launch applies window controls and owns process" {
         error.UnknownWindow,
         foreign_window.focus(&running),
     );
+    try std.testing.expectError(error.NoManagedBrowser, window.minimize(&running));
+    try std.testing.expectError(error.NoManagedBrowser, window.maximize(&running));
+    try std.testing.expectError(error.UnknownWindow, foreign_window.minimize(&running));
     try std.testing.expectEqual(
         @as(usize, 0),
         try window.setSize(io, .{ .width = 1366, .height = 768 }),
@@ -6665,6 +6706,7 @@ test "selected browser launch applies window controls and owns process" {
         window.browserProcessId(&running),
     );
     try std.testing.expectError(error.NotRunning, window.focus(&running));
+    try std.testing.expectError(error.NotRunning, window.maximize(&running));
     try std.testing.expectError(error.NotRunning, window.open(io, &running));
 }
 

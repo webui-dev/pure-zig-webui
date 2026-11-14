@@ -261,7 +261,12 @@ Firefox windows get a generated app-mode profile that hides the toolbars, like
 upstream. A browser that cannot honor an option returns an explicit error,
 such as `error.UnsupportedBrowserControl`, instead of ignoring it. Each window
 retains its launched browser; `Running.stop()` kills and reaps it.
-`Window.focus()` raises it on Windows.
+`Window.focus()` raises it on Windows. `Window.minimize()` and
+`Window.maximize()` act on it on Windows, on X11 through `xdotool` (and
+`wmctrl` to maximize), and on macOS through `osascript`, which needs the
+Accessibility permission. A missing tool returns
+`error.WindowToolUnavailable`, and a process with no single visible window
+returns `error.BrowserWindowNotFound` or `error.BrowserWindowAmbiguous`.
 
 ### Browser bridge
 

@@ -62,6 +62,7 @@ Closed after the rescans, each with focused tests in the same change:
 
 | Area | Resolution |
 |---|---|
+| Browser window state | Missed by earlier scans: upstream `02d2853` minimizes and maximizes browser windows, not only WebViews, and acts only on a unique window. `Window.minimize()`/`maximize()` follow it per platform, and Windows focus now shares the unique-window search and `AttachThreadInput`. Tests: `browser window state runs the platform tools as argv` (stub tools, failures, missing tools, deadline), `X11 window IDs parse from xdotool output`, `macOS window scripts interpolate only the process ID`, and the managed-browser guard assertions. |
 | Bare capability URL | Upstream serves the page at its root without a trailing slash. `/{capability}` of a live window answers `302` to `/{capability}/` with the query kept, so relative page resources resolve; unknown capabilities still answer `404`. Test: `a bare capability redirects to the window root with its query`. |
 | `TCP_NODELAY` | Like upstream `9125b20`, accepted sockets disable Nagle through Linsang's `Config.tcp_nodelay` (pinned at `21917cf`): `setsockopt` on POSIX, and on Windows an AFD `SOCKOPT` request, because Zig 0.17's AFD sockets have no Winsock context. Tests: Linsang `accepted sockets disable Nagle unless configured otherwise` reads the option back from the served socket on Linux, macOS, and Windows CI; `the server disables Nagle like upstream`. |
 | Browser selection | `bestChromiumBrowser()` returns the first installed browser in upstream's `ChromiumBased` order (Chrome, Edge, Epic, Vivaldi, Brave, Yandex, Chromium), or null. `Window.open()` reuses the browser of the app's last successful launch, like upstream's `current_browser` for `AnyBrowser`, while it is still discoverable, and otherwise uses `bestBrowser()`. Tests: `managed browser replacement reaps its previous child before relaunch` (a failed launch keeps the last browser) and the browser preference-order test. |
@@ -384,7 +385,7 @@ external-browser launch flags.
 |---|---|
 | `webui_set_kiosk()` | `App.WindowOptions.kiosk` for supported external browsers; `native.Window.setKiosk()` for native windows. |
 | `webui_set_hide()` | `App.WindowOptions.hide` for headless external browsers; `native.Options.hidden` and `native.Window.setVisible()` for native windows. |
-| `webui_minimize()`, `webui_maximize()` | `native.Window.minimize()`, `maximize()`, and `restore()`. |
+| `webui_minimize()`, `webui_maximize()` | `native.Window.minimize()`, `maximize()`, and `restore()` for native windows. For browser windows, `Window.minimize()` and `Window.maximize()` act on the retained child's window like upstream's `_webui_browser_window_state`: `ShowWindow` on Windows, `xdotool`/`wmctrl` argv on X11, and `osascript` System Events on macOS (Accessibility permission). Tools run with a five-second deadline; missing tools, timeouts, failed tools, and missing or ambiguous windows return explicit errors. |
 | `webui_set_resizable()`, `webui_set_minimum_size()` | `native.Options` and `native.Window.setResizable()` / `setMinimumSize()`. |
 | `webui_set_frameless()`, `webui_set_transparent()` | Native options and setters; `native.Window.dragRegion()` reports how pages declare drag areas. Windows transparency configures both host composition and WebView background; X11 requires RGBA/compositing. macOS transparency is explicitly unsupported, as upstream's native adapter does not implement it. |
 | `webui_show_wv()`, `webui_set_close_handler_wv()` | `native.Window.open()` plus `setCloseHandler()`. User/JavaScript close can be vetoed before destroying the page; `native.Window.close()` force-closes. |
@@ -439,7 +440,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_show_client()` | `Client.show()` replaces the window content and navigates only the selected client. |
 | `webui_is_shown()` | `Window.isShown()` reports whether the window has at least one connected browser client. |
 | `webui_set_center()` | `App.WindowOptions.center` and `Window.setCenter()` centre the window on the primary display. Upstream reads the monitor geometry natively, which needs GDK on Linux; the browser computes the coordinates instead, so centring applies once a client connects rather than at launch. Centring and an explicit position clear each other. |
-| `webui_focus()` | `Window.focus()` restores and focuses the visible top-level window belonging to the retained browser child on Windows. Missing children, invalid process handles, unavailable windows, and rejected foreground requests return explicit errors; Linux and macOS return `error.UnsupportedPlatform` instead of silently doing nothing. |
+| `webui_focus()` | `Window.focus()` restores and focuses the single visible, unowned top-level window of the retained browser child on Windows, borrowing the foreground thread's input like upstream. Missing children, invalid process handles, missing or ambiguous windows, and rejected foreground requests return explicit errors; Linux and macOS return `error.UnsupportedPlatform` instead of silently doing nothing. |
 | `webui_delete_profile()`, `webui_delete_all_profiles()` | `Window.deleteProfile()`, `deleteManagedProfile()`, and `deleteAllManagedProfiles()` remove generated profile directories only. A window configured with `.profile_directory` returns `error.CallerManagedProfile`; caller-owned directories are never deleted. |
 | `webui_set_size()`, `webui_set_position()` | `App.WindowOptions.size` and `.position` set initial geometry. `Window.setSize()` and `Window.setPosition()` persist updates, notify connected clients, replay the latest geometry to later clients, and affect subsequent explicit browser launches. |
 | `webui_set_high_contrast()`, `webui_is_high_contrast()` | `App.WindowOptions.high_contrast` controls Chromium forced-color support and the generated Firefox profile's `browser.display.document_color_use` preference, with explicit errors for Safari and caller-managed Firefox profiles. Browser-side `webui.isHighContrast()` uses native forced-color and contrast media queries without external programs. |
@@ -542,9 +543,11 @@ standard application directories.
   high-contrast media preferences.
 - Generated Firefox profiles receive upstream's toolbar-hiding
   `userChrome.css` and app-mode `user.js` before every launch.
-- Windows external-browser focus enumerates visible top-level windows owned by
-  the retained browser child, restores a minimized match, and requests the
-  foreground. Other platforms return `error.UnsupportedPlatform`.
+- Windows external-browser focus finds the single visible, unowned top-level
+  window of the retained browser child, restores it if minimized, and requests
+  the foreground. Other platforms return `error.UnsupportedPlatform`.
+- Browser-window minimize and maximize use the same window on Windows, and
+  bounded `xdotool`/`wmctrl` or `osascript` argv on X11 and macOS.
 - Native options/setters implement minimize, maximize, resizable, minimum size,
   geometry, frameless, visible and transparent behavior through the optional
   platform adapters; explicit platform limitations are listed above.

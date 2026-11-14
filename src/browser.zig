@@ -128,50 +128,182 @@ pub fn focusProcess(process: ProcessId) !void {
 }
 
 fn focusWindowsProcess(process: ProcessId) !void {
-    const process_id = Win32.GetProcessId(process);
-    if (process_id == 0) return error.BrowserProcessUnavailable;
+    const window = try Win32.processWindow(process);
+    if (Win32.IsIconic(window).toBool()) _ = Win32.ShowWindow(window, Win32.sw_restore);
+    // Only the foreground process may change the foreground window, so
+    // borrow the input state of the thread that owns it, like upstream.
+    const current = if (Win32.GetForegroundWindow()) |foreground|
+        Win32.GetWindowThreadProcessId(foreground, null)
+    else
+        0;
+    const target = Win32.GetWindowThreadProcessId(window, null);
+    const attach = current != 0 and target != 0 and current != target;
+    if (attach) _ = Win32.AttachThreadInput(current, target, .TRUE);
+    defer if (attach) {
+        _ = Win32.AttachThreadInput(current, target, .FALSE);
+    };
+    _ = Win32.BringWindowToTop(window);
+    if (!Win32.SetForegroundWindow(window).toBool()) return error.BrowserFocusFailed;
+}
 
-    var context = Win32.FocusContext{ .process_id = process_id };
-    _ = Win32.EnumWindows(
-        Win32.focusWindow,
-        @bitCast(@intFromPtr(&context)),
-    );
-    if (!context.found) return error.BrowserWindowNotFound;
-    if (!context.focused) return error.BrowserFocusFailed;
+pub const WindowState = enum { minimized, maximized };
+
+/// Minimize or maximize the top-level window of a retained browser child.
+/// A page cannot do this to its own browser window, so, like upstream, the
+/// platform is asked: Windows directly, X11 through `xdotool` and `wmctrl`,
+/// and macOS through `osascript` and System Events, which needs the
+/// Accessibility permission. Missing tools return `error.WindowToolUnavailable`.
+pub fn setProcessWindowState(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    process: ProcessId,
+    state: WindowState,
+) !void {
+    return switch (builtin.os.tag) {
+        .windows => {
+            const window = try Win32.processWindow(process);
+            _ = Win32.ShowWindow(window, switch (state) {
+                .minimized => Win32.sw_minimize,
+                .maximized => Win32.sw_maximize,
+            });
+        },
+        .macos => macosWindowState(gpa, io, "osascript", process, state),
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly => x11WindowState(gpa, io, .{}, process, state),
+        else => error.UnsupportedPlatform,
+    };
+}
+
+const X11Tools = struct {
+    xdotool: []const u8 = "xdotool",
+    wmctrl: []const u8 = "wmctrl",
+};
+
+fn x11WindowState(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    tools: X11Tools,
+    pid: i64,
+    state: WindowState,
+) !void {
+    var pid_buffer: [24]u8 = undefined;
+    const pid_text = try std.fmt.bufPrint(&pid_buffer, "{d}", .{pid});
+    // `xdotool search` exits 1 when nothing matches.
+    const found = try runWindowTool(gpa, io, &.{
+        tools.xdotool, "search", "--pid", pid_text, "--onlyvisible", "--limit", "1",
+    }, window_tool_timeout) orelse return error.BrowserWindowNotFound;
+    defer gpa.free(found);
+    const window = parseX11WindowId(found) orelse return error.BrowserWindowNotFound;
+    const done = try runWindowTool(gpa, io, switch (state) {
+        .minimized => &.{ tools.xdotool, "windowminimize", window },
+        .maximized => &.{ tools.wmctrl, "-i", "-r", window, "-b", "add,maximized_vert,maximized_horz" },
+    }, window_tool_timeout) orelse return error.BrowserWindowStateFailed;
+    gpa.free(done);
+}
+
+/// First line of `xdotool search` output: a decimal X11 window ID.
+fn parseX11WindowId(output: []const u8) ?[]const u8 {
+    var lines = std.mem.tokenizeAny(u8, output, "\r\n");
+    const line = std.mem.trim(u8, lines.next() orelse return null, " \t");
+    if (line.len == 0 or line.len > 20) return null;
+    for (line) |byte| if (!std.ascii.isDigit(byte)) return null;
+    return line;
+}
+
+fn macosWindowState(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    osascript: []const u8,
+    pid: i64,
+    state: WindowState,
+) !void {
+    var script_buffer: [256]u8 = undefined;
+    const script = try macosWindowScript(&script_buffer, pid, state);
+    const done = try runWindowTool(gpa, io, &.{ osascript, "-e", script }, window_tool_timeout) orelse
+        return error.BrowserWindowStateFailed;
+    gpa.free(done);
+}
+
+/// Upstream's System Events scripts. The PID is the only interpolated value.
+fn macosWindowScript(buffer: []u8, pid: i64, state: WindowState) ![]const u8 {
+    return switch (state) {
+        .minimized => std.fmt.bufPrint(buffer, "tell application \"System Events\" to set value of attribute \"AXMinimized\" of window 1 of (first process whose unix id is {d}) to true", .{pid}),
+        .maximized => std.fmt.bufPrint(buffer, "tell application \"System Events\" to perform action \"AXZoomWindow\" of window 1 of (first process whose unix id is {d})", .{pid}),
+    };
+}
+
+const window_tool_timeout: std.Io.Duration = .fromSeconds(5);
+
+/// Run a window tool with a deadline. Returns its stdout, or null when it
+/// exits unsuccessfully.
+fn runWindowTool(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    timeout: std.Io.Duration,
+) !?[]u8 {
+    const result = std.process.run(gpa, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(4 << 10),
+        .stderr_limit = .limited(4 << 10),
+        .timeout = .{ .duration = .{ .raw = timeout, .clock = .awake } },
+    }) catch |err| return switch (err) {
+        error.FileNotFound, error.AccessDenied, error.InvalidExe => error.WindowToolUnavailable,
+        error.Timeout => error.WindowToolTimeout,
+        else => err,
+    };
+    gpa.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return result.stdout,
+        else => {},
+    }
+    gpa.free(result.stdout);
+    return null;
 }
 
 const Win32 = struct {
     const windows = std.os.windows;
     const sw_restore = 9;
     const sw_shownormal = 1;
+    const sw_minimize = 6;
+    const sw_maximize = 3;
+    const gw_owner = 4;
 
-    const FocusContext = struct {
+    const WindowSearch = struct {
         process_id: windows.DWORD,
-        found: bool = false,
-        focused: bool = false,
+        window: ?windows.HWND = null,
+        matches: usize = 0,
     };
 
-    fn focusWindow(
+    /// The single visible, unowned top-level window of a process. Owned
+    /// windows are popups and tool windows. Several matches are refused,
+    /// like upstream, because acting on a guess could move another window.
+    fn processWindow(process: ProcessId) !windows.HWND {
+        const process_id = GetProcessId(process);
+        if (process_id == 0) return error.BrowserProcessUnavailable;
+        var search: WindowSearch = .{ .process_id = process_id };
+        _ = EnumWindows(matchWindow, @bitCast(@intFromPtr(&search)));
+        return switch (search.matches) {
+            0 => error.BrowserWindowNotFound,
+            1 => search.window.?,
+            else => error.BrowserWindowAmbiguous,
+        };
+    }
+
+    fn matchWindow(
         window: windows.HWND,
         context_value: windows.LPARAM,
     ) callconv(.winapi) windows.BOOL {
+        const search: *WindowSearch = @ptrFromInt(@as(usize, @bitCast(context_value)));
         var window_process_id: windows.DWORD = 0;
         _ = GetWindowThreadProcessId(window, &window_process_id);
-        if (window_process_id != context(context_value).process_id or
-            !IsWindowVisible(window).toBool())
+        if (window_process_id == search.process_id and
+            IsWindowVisible(window).toBool() and
+            GetWindow(window, gw_owner) == null)
         {
-            return .TRUE;
+            search.matches += 1;
+            if (search.window == null) search.window = window;
         }
-
-        const focus = context(context_value);
-        focus.found = true;
-        if (IsIconic(window).toBool()) _ = ShowWindow(window, sw_restore);
-        focus.focused = SetForegroundWindow(window).toBool();
-        return .FALSE;
-    }
-
-    fn context(value: windows.LPARAM) *FocusContext {
-        return @ptrFromInt(@as(usize, @bitCast(value)));
+        return .TRUE;
     }
 
     extern "kernel32" fn GetProcessId(process: windows.HANDLE) callconv(.winapi) windows.DWORD;
@@ -196,6 +328,14 @@ const Win32 = struct {
     extern "user32" fn IsIconic(window: windows.HWND) callconv(.winapi) windows.BOOL;
     extern "user32" fn ShowWindow(window: windows.HWND, command: c_int) callconv(.winapi) windows.BOOL;
     extern "user32" fn SetForegroundWindow(window: windows.HWND) callconv(.winapi) windows.BOOL;
+    extern "user32" fn GetForegroundWindow() callconv(.winapi) ?windows.HWND;
+    extern "user32" fn GetWindow(window: windows.HWND, command: windows.UINT) callconv(.winapi) ?windows.HWND;
+    extern "user32" fn BringWindowToTop(window: windows.HWND) callconv(.winapi) windows.BOOL;
+    extern "user32" fn AttachThreadInput(
+        attach: windows.DWORD,
+        attach_to: windows.DWORD,
+        enable: windows.BOOL,
+    ) callconv(.winapi) windows.BOOL;
 };
 
 /// Open a non-empty URL with the operating system's default handler.
@@ -1233,6 +1373,94 @@ test "browser focus has an explicit platform contract" {
             focusProcess(@as(ProcessId, 1)),
         );
     }
+}
+
+test "X11 window IDs parse from xdotool output" {
+    try std.testing.expectEqualStrings("62914563", parseX11WindowId("62914563\n").?);
+    try std.testing.expectEqualStrings("7", parseX11WindowId("7\r\n9\n").?);
+    try std.testing.expectEqualStrings("12", parseX11WindowId("\n 12 \n").?);
+    try std.testing.expect(parseX11WindowId("") == null);
+    try std.testing.expect(parseX11WindowId("\n") == null);
+    try std.testing.expect(parseX11WindowId("0x3c00003\n") == null);
+    try std.testing.expect(parseX11WindowId("12 34\n") == null);
+    try std.testing.expect(parseX11WindowId("123456789012345678901\n") == null);
+}
+
+test "macOS window scripts interpolate only the process ID" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "tell application \"System Events\" to set value of attribute \"AXMinimized\" of window 1 of (first process whose unix id is 4242) to true",
+        try macosWindowScript(&buffer, 4242, .minimized),
+    );
+    try std.testing.expectEqualStrings(
+        "tell application \"System Events\" to perform action \"AXZoomWindow\" of window 1 of (first process whose unix id is 4242)",
+        try macosWindowScript(&buffer, 4242, .maximized),
+    );
+}
+
+test "browser window state runs the platform tools as argv" {
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectError(
+            error.BrowserProcessUnavailable,
+            setProcessWindowState(std.testing.allocator, std.testing.io, @ptrFromInt(1), .minimized),
+        );
+        return;
+    }
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(base);
+    // Each stub appends its arguments to `log`; `search` prints a window ID.
+    const stubs = [_]struct { name: []const u8, body: []const u8 }{
+        .{ .name = "xdotool", .body = "if [ \"$1\" = search ]; then echo 4242; fi" },
+        .{ .name = "xdotool-empty", .body = "exit 1" },
+        .{ .name = "wmctrl", .body = "true" },
+        .{ .name = "osascript", .body = "true" },
+        .{ .name = "failing", .body = "exit 1" },
+        .{ .name = "slow", .body = "sleep 5" },
+    };
+    for (stubs) |stub| {
+        const script = try std.fmt.allocPrint(gpa, "#!/bin/sh\necho \"{s} $*\" >> {s}/log\n{s}\n", .{ stub.name, base, stub.body });
+        defer gpa.free(script);
+        try tmp.dir.writeFile(io, .{
+            .sub_path = stub.name,
+            .flags = .{ .permissions = .executable_file },
+            .data = script,
+        });
+    }
+    var paths: [stubs.len][]u8 = undefined;
+    for (stubs, &paths) |stub, *path| path.* = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, stub.name });
+    defer for (paths) |path| gpa.free(path);
+    const xdotool, const xdotool_empty, const wmctrl, const osascript, const failing, const slow = paths;
+
+    try x11WindowState(gpa, io, .{ .xdotool = xdotool, .wmctrl = wmctrl }, 77, .minimized);
+    try x11WindowState(gpa, io, .{ .xdotool = xdotool, .wmctrl = wmctrl }, 77, .maximized);
+    try macosWindowState(gpa, io, osascript, 77, .minimized);
+    const log = try tmp.dir.readFileAlloc(io, "log", gpa, .limited(4096));
+    defer gpa.free(log);
+    try std.testing.expectEqualStrings(
+        "xdotool search --pid 77 --onlyvisible --limit 1\n" ++
+            "xdotool windowminimize 4242\n" ++
+            "xdotool search --pid 77 --onlyvisible --limit 1\n" ++
+            "wmctrl -i -r 4242 -b add,maximized_vert,maximized_horz\n" ++
+            "osascript -e tell application \"System Events\" to set value of attribute \"AXMinimized\" of window 1 of (first process whose unix id is 77) to true\n",
+        log,
+    );
+
+    // No visible window, a failing tool, and missing tools are explicit.
+    try std.testing.expectError(error.BrowserWindowNotFound, x11WindowState(gpa, io, .{ .xdotool = xdotool_empty, .wmctrl = wmctrl }, 77, .minimized));
+    try std.testing.expectError(error.BrowserWindowStateFailed, x11WindowState(gpa, io, .{ .xdotool = xdotool, .wmctrl = failing }, 77, .maximized));
+    try std.testing.expectError(error.BrowserWindowStateFailed, macosWindowState(gpa, io, failing, 77, .maximized));
+    const missing = try std.fmt.allocPrint(gpa, "{s}/missing", .{base});
+    defer gpa.free(missing);
+    try std.testing.expectError(error.WindowToolUnavailable, x11WindowState(gpa, io, .{ .xdotool = missing }, 77, .minimized));
+    try std.testing.expectError(error.WindowToolUnavailable, x11WindowState(gpa, io, .{ .xdotool = xdotool, .wmctrl = missing }, 77, .maximized));
+    try std.testing.expectError(error.WindowToolUnavailable, macosWindowState(gpa, io, missing, 77, .minimized));
+    // A tool that hangs, like osascript waiting on a permission prompt, is
+    // killed at the deadline.
+    try std.testing.expectError(error.WindowToolTimeout, runWindowTool(gpa, io, &.{slow}, .fromMilliseconds(100)));
 }
 
 test "Windows Chrome and Chromium installs are told apart by Google's installer files" {
