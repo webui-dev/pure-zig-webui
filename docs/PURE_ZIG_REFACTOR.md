@@ -62,6 +62,7 @@ Closed after the rescans, each with focused tests in the same change:
 
 | Area | Resolution |
 |---|---|
+| Per-window servers and ports | Like upstream, each window has its own listener: `WindowOptions.port` (zero selects a free port), `Window.port()` like `webui_get_port()`, and `Window.setPort()`, which while running starts the new listener first, navigates connected pages to the new URL and closes the old one, like upstream `a973618`/`ef03466`. Capability routing stays: a window's server serves only that window's capability. A port another window of the app serves is refused with `error.AddressInUse` before binding, since Windows `SO_REUSEADDR` sockets may share a port. Destroying a window closes its listener. Tests: `each window listens on its own port and setPort moves it`, `windows are created and destroyed while the app runs`, and the route test's foreign-capability case. |
 | Browser window state | Missed by earlier scans: upstream `02d2853` minimizes and maximizes browser windows, not only WebViews, and acts only on a unique window. `Window.minimize()`/`maximize()` follow it per platform, and Windows focus now shares the unique-window search and `AttachThreadInput`. Tests: `browser window state runs the platform tools as argv` (stub tools, failures, missing tools, deadline), `X11 window IDs parse from xdotool output`, `macOS window scripts interpolate only the process ID`, and the managed-browser guard assertions. |
 | Bare capability URL | Upstream serves the page at its root without a trailing slash. `/{capability}` of a live window answers `302` to `/{capability}/` with the query kept, so relative page resources resolve; unknown capabilities still answer `404`. Test: `a bare capability redirects to the window root with its query`. |
 | `TCP_NODELAY` | Like upstream `9125b20`, accepted sockets disable Nagle through Linsang's `Config.tcp_nodelay` (pinned at `21917cf`): `setsockopt` on POSIX, and on Windows an AFD `SOCKOPT` request, because Zig 0.17's AFD sockets have no Winsock context. Tests: Linsang `accepted sockets disable Nagle unless configured otherwise` reads the option back from the served socket on Linux, macOS, and Windows CI; `the server disables Nagle like upstream`. |
@@ -156,7 +157,7 @@ Zig or Linsang directly replaces these upstream components:
 | Global `WEBUI_MAX_IDS` arrays | Dynamic window and client state owned by `App` |
 | pthread/Win32 mutexes and conditions | `std.Io` tasks and limited synchronization |
 | MIME, base64, path, and random helpers | Zig standard library or Linsang |
-| One server and port per window | One server per `App`, routed by window capability |
+| One server and port per window | One Linsang server per window, still routed by window capability |
 | C ABI events and manual value decoding | Zig `Call` and `Event` types |
 
 Only WebUI-specific behavior needs a Zig implementation:
@@ -474,7 +475,7 @@ Mappings with an explicit remaining gap are partial, not parity-complete:
 | `webui_set_logger()` | `App.Options.logger` and `logger_user_data`; messages use `std.log.Level` and fall back to `std.log` when no callback is set. |
 | `webui_set_public()` | `App.Options.public` permits non-loopback listening only with TLS; Origin and explicit connection and protocol limits are enforced. |
 | `webui_set_tls_certificate()` | `App.Options.tls` accepts caller-provided PEM certificate and private-key bytes. |
-| `webui_set_port()`, `webui_get_port()`, `webui_get_free_port()` | `App.Options.port`, including `0` for automatic selection, and the running window URL. |
+| `webui_set_port()`, `webui_get_port()`, `webui_get_free_port()` | `WindowOptions.port` per window, including `0` for automatic selection; `Window.port()` reads the actual port and `Window.setPort()` moves a running window, reloading its pages at the new URL. |
 | `webui_set_root_folder()`, `webui_set_file_handler()`, `webui_set_file_handler_window()`, `webui_return_http()` | `.directory`, `.custom`, or composed `.site` content with a borrowed `Response`; an empty `404` declines a path for virtual-index probing and folder fallthrough. `Window.installContent()` swaps resources without navigation. HTTP work may await before callback return, but there is no owned delayed HTTP reply. |
 | `webui_get_mime_type()` | Linsang resource handling. |
 | `webui_encode()`, `webui_decode()`, `webui_malloc()`, `webui_free()`, `webui_memcpy()` | Zig standard library and allocators. |

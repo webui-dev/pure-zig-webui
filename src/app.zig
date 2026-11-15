@@ -54,6 +54,7 @@ pub const Tls = struct {
 };
 
 pub const Limits = struct {
+    /// Per window listener; WebSocket upgrades are also bounded app-wide.
     max_connections: usize = 128,
     max_unauthenticated_connections: usize = 16,
     max_ws_message_size: usize = 1 << 20,
@@ -777,6 +778,14 @@ const WindowState = struct {
     pending_events: usize = 0,
     next_client_id: u64 = 1,
     next_eval_id: u16 = 1,
+    /// Requested listening port; zero selects a free one on each start.
+    port: u16 = 0,
+    /// This window's listener while it is served. Replaced only under
+    /// `server_mutex`, which connection callbacks never take.
+    server: ?*WindowServer = null,
+    server_mutex: std.Io.Mutex = .init,
+    /// The served port, readable without `server_mutex`; zero when stopped.
+    bound_port: std.atomic.Value(u16) = .init(0),
     const HandlerTask = struct {
         next: ?*HandlerTask = null,
         target: Client,
@@ -822,6 +831,50 @@ const WindowState = struct {
         if (self.browser_controls.proxy_server) |proxy|
             self.gpa.free(proxy);
         self.gpa.destroy(self);
+    }
+
+    /// Stop this window's server, if any; later port queries fail.
+    fn stopServer(self: *WindowState, app: *App, io: std.Io) void {
+        const server = blk: {
+            self.server_mutex.lockUncancelable(io);
+            defer self.server_mutex.unlock(io);
+            const server = self.server orelse return;
+            self.server = null;
+            self.bound_port.store(0, .release);
+            break :blk server;
+        };
+        app.stopWindowServer(server);
+    }
+
+    /// The URL a browser opens for this window when served on `port`.
+    fn pageUrl(
+        self: *WindowState,
+        app: *const App,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        port: u16,
+    ) ![]u8 {
+        self.content_mutex.lockSharedUncancelable(io);
+        defer self.content_mutex.unlockShared(io);
+        switch (self.content) {
+            .external_url => |external| {
+                if (!external.bridge_fragment) return gpa.dupe(u8, external.url);
+                const bridge_url = try windowUrl(app, gpa, self, port, "webui.js");
+                defer gpa.free(bridge_url);
+                const component: std.Uri.Component = .{ .raw = bridge_url };
+                return std.fmt.allocPrint(gpa, "{s}#webui-bridge={f}", .{
+                    external.url,
+                    std.fmt.alt(component, .formatEscaped),
+                });
+            },
+            else => return windowUrl(app, gpa, self, port, ""),
+        }
+    }
+
+    fn serverPort(self: *WindowState, io: std.Io) !u16 {
+        self.server_mutex.lockUncancelable(io);
+        defer self.server_mutex.unlock(io);
+        return (self.server orelse return error.NotRunning).port();
     }
 
     fn replaceContent(
@@ -2048,10 +2101,10 @@ pub const Client = struct {
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
         if (running.app.options.use_cookies and content.isExternal())
             return error.ExternalUrlCookiesUnsupported;
-        var peer = try self.retainPeer(running.inner.io);
+        var peer = try self.retainPeer(running.io);
         defer peer.deinit();
 
-        try self.state.replaceContent(running.inner.io, content, false);
+        try self.state.replaceContent(running.io, content, false);
         const target_url = try (Window{ .state = self.state }).url(
             running,
             self.state.gpa,
@@ -2136,6 +2189,28 @@ fn evalBroadcastClient(
     };
 }
 
+/// `{scheme}://{address}:{port}/{capability}/{resource}` for a window.
+fn windowUrl(
+    app: *const App,
+    gpa: std.mem.Allocator,
+    state: *const WindowState,
+    port: u16,
+    resource: []const u8,
+) ![]u8 {
+    const scheme = if (app.options.tls == null) "http" else "https";
+    const address = app.options.address;
+    const ipv6 = std.mem.indexOfScalar(u8, address, ':') != null;
+    return std.fmt.allocPrint(gpa, "{s}://{s}{s}{s}:{d}/{s}/{s}", .{
+        scheme,
+        if (ipv6) "[" else "",
+        address,
+        if (ipv6) "]" else "",
+        port,
+        state.capability,
+        resource,
+    });
+}
+
 fn indexOfWindow(windows: []const *WindowState, state: *WindowState) ?usize {
     // ponytail: window counts are tiny; use a map if hundreds become normal.
     for (windows, 0..) |window, index|
@@ -2165,6 +2240,7 @@ fn assignWindowIdentity(
 
 /// Finish destroying a window that `App.destroyWindow` unregistered.
 fn reapWindow(app: *App, state: *WindowState, io: std.Io) std.Io.Cancelable!void {
+    state.stopServer(app, io);
     state.retireEvents(io);
     state.stopMonitor(io);
     app.removeBrowser(io, state);
@@ -2309,10 +2385,10 @@ pub const Window = struct {
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
         if (running.app.options.use_cookies and content.isExternal())
             return error.ExternalUrlCookiesUnsupported;
-        try self.state.replaceContent(running.inner.io, content, false);
+        try self.state.replaceContent(running.io, content, false);
         const target_url = try self.url(running, self.state.gpa);
         defer self.state.gpa.free(target_url);
-        return self.navigate(running.inner.io, target_url);
+        return self.navigate(running.io, target_url);
     }
 
     /// Replace served content for later requests without navigating any
@@ -2331,7 +2407,7 @@ pub const Window = struct {
             return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
         if (content.isExternal()) return error.NavigationRequired;
-        try self.state.replaceContent(running.inner.io, content, true);
+        try self.state.replaceContent(running.io, content, true);
     }
 
     /// Copy favicon data and its HTTP content type into this window.
@@ -2402,10 +2478,10 @@ pub const Window = struct {
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
         const page_url = try self.url(running, self.state.gpa);
         defer self.state.gpa.free(page_url);
-        const controls = self.state.browserControls(running.inner.io);
-        self.state.markShown(running.inner.io);
+        const controls = self.state.browserControls(running.io);
+        self.state.markShown(running.io);
         return running.app.launchBrowser(
-            running.inner.io,
+            running.io,
             self.state,
             page_url,
             options,
@@ -2420,7 +2496,7 @@ pub const Window = struct {
     pub fn deleteProfile(self: Window, running: *const Running) !bool {
         if (running.stopped or !running.app.started) return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
-        const io = running.inner.io;
+        const io = running.io;
         if (self.state.browserControls(io).profile_directory != null)
             return error.CallerManagedProfile;
         return running.app.deleteBrowserProfile(io, self.state);
@@ -2434,7 +2510,7 @@ pub const Window = struct {
         if (running.stopped or !running.app.started)
             return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
-        return running.app.browserId(running.inner.io, self.state);
+        return running.app.browserId(running.io, self.state);
     }
 
     /// Bring this window's retained browser process to the foreground.
@@ -2442,7 +2518,7 @@ pub const Window = struct {
     pub fn focus(self: Window, running: *const Running) !void {
         if (running.stopped or !running.app.started) return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
-        return running.app.focusBrowser(running.inner.io, self.state);
+        return running.app.focusBrowser(running.io, self.state);
     }
 
     /// Minimize this window's retained browser window, like upstream's
@@ -2462,7 +2538,7 @@ pub const Window = struct {
     fn setBrowserWindowState(self: Window, running: *const Running, state: browser.WindowState) !void {
         if (running.stopped or !running.app.started) return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
-        return running.app.browserWindowState(running.inner.io, self.state, state);
+        return running.app.browserWindowState(running.io, self.state, state);
     }
 
     /// Return whether at least one browser client is connected.
@@ -2517,40 +2593,7 @@ pub const Window = struct {
     ) ![]u8 {
         if (running.stopped) return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
-        self.state.content_mutex.lockSharedUncancelable(running.inner.io);
-        defer self.state.content_mutex.unlockShared(running.inner.io);
-        switch (self.state.content) {
-            .external_url => |external| {
-                if (!external.bridge_fragment) return gpa.dupe(u8, external.url);
-                const bridge_url = try self.bridgeUrl(running, gpa);
-                defer gpa.free(bridge_url);
-                const component: std.Uri.Component = .{ .raw = bridge_url };
-                return std.fmt.allocPrint(gpa, "{s}#webui-bridge={f}", .{
-                    external.url,
-                    std.fmt.alt(component, .formatEscaped),
-                });
-            },
-            else => {},
-        }
-        const scheme = if (running.app.options.tls == null) "http" else "https";
-        return if (std.mem.indexOfScalar(
-            u8,
-            running.app.options.address,
-            ':',
-        ) == null)
-            std.fmt.allocPrint(gpa, "{s}://{s}:{d}/{s}/", .{
-                scheme,
-                running.app.options.address,
-                running.inner.address.getPort(),
-                self.state.capability,
-            })
-        else
-            std.fmt.allocPrint(gpa, "{s}://[{s}]:{d}/{s}/", .{
-                scheme,
-                running.app.options.address,
-                running.inner.address.getPort(),
-                self.state.capability,
-            });
+        return self.state.pageUrl(running.app, running.io, gpa, try self.state.serverPort(running.io));
     }
 
     /// Return the capability-scoped bridge URL for this window.
@@ -2561,25 +2604,46 @@ pub const Window = struct {
     ) ![]u8 {
         if (running.stopped) return error.NotRunning;
         if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
-        const scheme = if (running.app.options.tls == null) "http" else "https";
-        return if (std.mem.indexOfScalar(
-            u8,
-            running.app.options.address,
-            ':',
-        ) == null)
-            std.fmt.allocPrint(gpa, "{s}://{s}:{d}/{s}/webui.js", .{
-                scheme,
-                running.app.options.address,
-                running.inner.address.getPort(),
-                self.state.capability,
-            })
-        else
-            std.fmt.allocPrint(gpa, "{s}://[{s}]:{d}/{s}/webui.js", .{
-                scheme,
-                running.app.options.address,
-                running.inner.address.getPort(),
-                self.state.capability,
-            });
+        return windowUrl(running.app, gpa, self.state, try self.state.serverPort(running.io), "webui.js");
+    }
+
+    /// This window's actual listening port, like upstream `webui_get_port()`.
+    pub fn port(self: Window, running: *const Running) !u16 {
+        if (running.stopped) return error.NotRunning;
+        if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
+        return self.state.serverPort(running.io);
+    }
+
+    /// Move this running window to `new_port`, zero selecting a free one,
+    /// like upstream `webui_set_port()` after `webui_show()`. The new
+    /// listener starts first, so a port in use returns its error and keeps
+    /// the window served where it was. Connected pages are then navigated
+    /// to the new URL and the old listener closes; its connections
+    /// disconnect and reconnect within the usual grace. Requesting the
+    /// current port does nothing.
+    pub fn setPort(self: Window, running: *const Running, new_port: u16) !void {
+        if (running.stopped) return error.NotRunning;
+        if (!running.app.hasWindow(self.state)) return error.UnknownWindow;
+        const io = running.io;
+        const state = self.state;
+        state.server_mutex.lockUncancelable(io);
+        defer state.server_mutex.unlock(io);
+        const previous = state.server orelse return error.NotRunning;
+        if (new_port != 0 and new_port == previous.port()) return;
+        {
+            running.app.windows_lock.lockSharedUncancelable(io);
+            defer running.app.windows_lock.unlockShared(io);
+            if (running.app.portTaken(state, new_port)) return error.AddressInUse;
+        }
+        const replacement = try running.app.startWindowServer(io, state, new_port);
+        state.server = replacement;
+        state.port = new_port;
+        if (state.pageUrl(running.app, io, state.gpa, replacement.port())) |target| {
+            defer state.gpa.free(target);
+            _ = state.broadcast(io, .navigation, target) catch |err|
+                state.log(.warn, "Port change navigation failed: {}", .{err});
+        } else |err| state.log(.warn, "Port change navigation failed: {}", .{err});
+        running.app.stopWindowServer(previous);
     }
 
     pub fn eval(
@@ -2685,7 +2749,6 @@ pub const App = struct {
     /// Destroyed windows whose cleanup has not finished yet.
     retiring: std.ArrayList(*WindowState) = .empty,
     reaper_tasks: std.Io.Group = .init,
-    server: ?Linsang.Server = null,
     server_io: ?std.Io = null,
     tls_auth: ?Linsang.tls.CertKeyPair = null,
     managed_browsers: std.ArrayList(ManagedBrowser) = .empty,
@@ -2787,7 +2850,6 @@ pub const App = struct {
 
     pub const Options = struct {
         address: []const u8 = "127.0.0.1",
-        port: u16 = 0,
         public: bool = false,
         tls: ?Tls = null,
         use_cookies: bool = false,
@@ -2806,6 +2868,10 @@ pub const App = struct {
 
     pub const WindowOptions = struct {
         content: ?Content = null,
+        /// This window's own listening port, like upstream
+        /// `webui_set_port()`; zero selects a free port. Change it while
+        /// running with `Window.setPort()`.
+        port: u16 = 0,
         /// Launch the selected browser in kiosk mode.
         kiosk: bool = false,
         /// Launch the selected browser headless, without a visible window.
@@ -2935,6 +3001,7 @@ pub const App = struct {
             .runtime = options.runtime,
             .center = options.center,
             .browser_controls = browser_controls,
+            .port = options.port,
         };
         if (self.started)
             try self.registerRunningWindow(state)
@@ -2959,6 +3026,11 @@ pub const App = struct {
         errdefer state.running.store(false, .release);
         if (self.options.folder_monitor_interval) |interval|
             try state.startMonitor(io, interval);
+        errdefer state.stopMonitor(io);
+        // Last fallible step: its connections wait on `windows_lock`, so it
+        // must never be stopped while that lock is held.
+        if (self.portTaken(state, state.port)) return error.AddressInUse;
+        state.server = try self.startWindowServer(io, state, state.port);
         self.windows.appendAssumeCapacity(state);
     }
 
@@ -2966,8 +3038,8 @@ pub const App = struct {
     /// window is freed at once. While running, routing stops immediately:
     /// new requests and connections are refused, connected pages receive a
     /// backend close and later messages close their connection. Queued
-    /// handlers are cancelled and the window's directory monitor and managed
-    /// browser stop in the background; its memory is freed after its last
+    /// handlers are cancelled and the window's listener, directory monitor
+    /// and managed browser stop in the background; its memory is freed after its last
     /// connection and deferred reply finish, and `Running.stop` completes
     /// any cleanup still pending. Safe from handlers, including this
     /// window's own. The handle and its clients are invalid afterwards.
@@ -3049,35 +3121,86 @@ pub const App = struct {
             for (self.windows.items) |window|
                 try window.startMonitor(io, interval);
         }
-        self.server = Linsang.Server.init(self.gpa, .{
-            .address = self.options.address,
-            .port = self.options.port,
-            .max_connections = self.options.limits.max_connections,
-            .max_ws_message_size = self.options.limits.max_ws_message_size,
-            .ws_idle_timeout = .fromSeconds(25),
-            // Upstream sets CivetWeb's `tcp_nodelay`; bridge frames are small.
-            .tcp_nodelay = true,
-            .tls = if (self.tls_auth) |*auth| .{ .auth = auth } else null,
-            .on_request = onRequest,
-            .on_ws_open = onOpen,
-            .on_ws_message = onMessage,
-            .on_ws_close = onClose,
-            .user_data = self,
-        });
-        errdefer self.server = null;
         self.server_io = io;
         errdefer self.server_io = null;
         for (self.windows.items) |window| window.running.store(true, .release);
         errdefer for (self.windows.items) |window|
             window.running.store(false, .release);
-        // Published before the server spawns connection tasks, which may
-        // create or destroy windows from handlers.
+        // Published before the servers spawn connection tasks. Windows stay
+        // fixed until every server is up: handlers created by early
+        // connections see `error.NotRunning` from createWindow and
+        // destroyWindow rather than racing this loop.
         self.started = true;
         errdefer self.started = false;
-        self.accepting_windows = true;
-        errdefer self.accepting_windows = false;
-        const inner = try self.server.?.start(io);
-        return .{ .app = self, .inner = inner };
+        // A server that already accepted may have scheduled handlers.
+        errdefer for (self.windows.items) |window| {
+            if (window.server) |server| self.stopWindowServer(server);
+            window.server = null;
+            window.bound_port.store(0, .release);
+            window.cancelEvents(io);
+        };
+        for (self.windows.items) |window| {
+            if (self.portTaken(window, window.port)) return error.AddressInUse;
+            window.server = try self.startWindowServer(io, window, window.port);
+        }
+        {
+            self.windows_lock.lockUncancelable(io);
+            defer self.windows_lock.unlock(io);
+            self.accepting_windows = true;
+        }
+        return .{ .app = self, .io = io };
+    }
+
+    /// Bind and serve one window on `port`, zero selecting a free one.
+    fn startWindowServer(
+        self: *App,
+        io: std.Io,
+        window: *WindowState,
+        port: u16,
+    ) !*WindowServer {
+        const server = try self.gpa.create(WindowServer);
+        errdefer self.gpa.destroy(server);
+        server.* = .{
+            .app = self,
+            .window = window,
+            .server = .init(self.gpa, .{
+                .address = self.options.address,
+                .port = port,
+                .max_connections = self.options.limits.max_connections,
+                .max_ws_message_size = self.options.limits.max_ws_message_size,
+                .ws_idle_timeout = .fromSeconds(25),
+                // Upstream sets CivetWeb's `tcp_nodelay`; bridge frames are small.
+                .tcp_nodelay = true,
+                .tls = if (self.tls_auth) |*auth| .{ .auth = auth } else null,
+                .on_request = onRequest,
+                .on_ws_open = onOpen,
+                .on_ws_message = onMessage,
+                .on_ws_close = onClose,
+                .user_data = server,
+            }),
+        };
+        server.running = try server.server.start(io);
+        window.bound_port.store(server.port(), .release);
+        return server;
+    }
+
+    /// Whether another window of this app already serves `port`. Checked
+    /// before binding because Windows sockets with `SO_REUSEADDR` may share
+    /// a listening port. The caller holds `windows_lock` or runs before the
+    /// window list can change.
+    fn portTaken(self: *const App, window: *const WindowState, port: u16) bool {
+        if (port == 0) return false;
+        for (self.windows.items) |other|
+            if (other != window and other.bound_port.load(.acquire) == port) return true;
+        return false;
+    }
+
+    /// Close one window server's listener and connections, then free it.
+    /// Never call this while holding `windows_lock`: its connections take it.
+    fn stopWindowServer(self: *App, server: *WindowServer) void {
+        server.running.stop() catch |err|
+            server.window.log(.warn, "Window server stop failed: {}", .{err});
+        self.gpa.destroy(server);
     }
 
     fn validateNetworkOptions(self: *const App) !void {
@@ -3090,7 +3213,7 @@ pub const App = struct {
                 return error.InvalidStartupTimeout;
         const address = std.Io.net.IpAddress.parse(
             self.options.address,
-            self.options.port,
+            0,
         ) catch return error.InvalidAddress;
         if (!isLoopbackAddress(address)) {
             if (!self.options.public) return error.PublicListeningNotEnabled;
@@ -3308,25 +3431,27 @@ pub const App = struct {
 
 pub const Running = struct {
     app: *App,
-    inner: Linsang.server.Running,
+    io: std.Io,
     stopped: bool = false,
 
     pub fn stop(self: *Running) !void {
         if (self.stopped) return;
-        try self.inner.stop();
-        self.app.closeRegistration(self.inner.io);
+        const io = self.io;
+        // Afterwards the window list is fixed and destroyed windows' servers
+        // are stopped.
+        self.app.closeRegistration(io);
         for (self.app.windows.items) |window| {
             window.running.store(false, .release);
-            window.stopMonitor(self.inner.io);
+            window.stopServer(self.app, io);
+            window.stopMonitor(io);
         }
         for (self.app.windows.items) |window|
-            window.cancelEvents(self.inner.io);
-        self.app.stopBrowsers(self.inner.io);
+            window.cancelEvents(io);
+        self.app.stopBrowsers(io);
         self.app.closeDirectories();
         self.app.deinitTls();
         self.stopped = true;
         self.app.started = false;
-        self.app.server = null;
         self.app.server_io = null;
         std.debug.assert(
             self.app.unauthenticated_connections.load(.acquire) == 0,
@@ -3339,7 +3464,7 @@ pub const Running = struct {
     pub fn requestExit(self: *const Running) void {
         if (self.stopped) return;
         const app = self.app;
-        const io = self.inner.io;
+        const io = self.io;
         {
             app.windows_lock.lockSharedUncancelable(io);
             defer app.windows_lock.unlockShared(io);
@@ -3366,7 +3491,7 @@ pub const Running = struct {
         const app = self.app;
         if (app.waiting.swap(true, .acq_rel)) return error.AlreadyWaiting;
         defer app.waiting.store(false, .release);
-        const io = self.inner.io;
+        const io = self.io;
         // ponytail: polling is enough for UI shutdown; use an event if latency
         // below 10 ms becomes meaningful.
         while (!app.exit_requested.load(.acquire)) {
@@ -3389,7 +3514,34 @@ pub const Running = struct {
     }
 };
 
-fn appFrom(user_data: ?*anyopaque) *App {
+/// One window's listener, like upstream's per-window server. Its
+/// callbacks serve only `window`; it is freed after its server stops.
+const WindowServer = struct {
+    app: *App,
+    window: *WindowState,
+    server: Linsang.Server,
+    running: Linsang.server.Running = undefined,
+
+    fn port(self: *const WindowServer) u16 {
+        return self.running.address.getPort();
+    }
+
+    /// The live window this server serves, retained, when `capability`
+    /// names it. Other windows' capabilities are not served here.
+    fn retainWindow(
+        self: *WindowServer,
+        io: std.Io,
+        capability: []const u8,
+    ) ?*WindowState {
+        const window = self.app.retainWindowByCapability(io, capability) orelse
+            return null;
+        if (window == self.window) return window;
+        window.release();
+        return null;
+    }
+};
+
+fn serverFrom(user_data: ?*anyopaque) *WindowServer {
     return @ptrCast(@alignCast(user_data.?));
 }
 
@@ -3741,7 +3893,7 @@ fn respondScript(
 }
 
 /// Resolve a capability path. The caller releases the returned window.
-fn route(app: *App, io: std.Io, path: []const u8) ?Route {
+fn route(server: *WindowServer, io: std.Io, path: []const u8) ?Route {
     if (path.len < capability_len + 2 or
         path[0] != '/' or
         path[capability_len + 1] != '/')
@@ -3749,7 +3901,7 @@ fn route(app: *App, io: std.Io, path: []const u8) ?Route {
         return null;
     }
     return .{
-        .window = app.retainWindowByCapability(io, path[1 .. capability_len + 1]) orelse
+        .window = server.retainWindow(io, path[1 .. capability_len + 1]) orelse
             return null,
         .resource = path[capability_len + 2 ..],
     };
@@ -3774,9 +3926,10 @@ fn onRequest(
     response: *Linsang.Response,
     user_data: ?*anyopaque,
 ) Linsang.Action {
-    const app = appFrom(user_data);
+    const server = serverFrom(user_data);
+    const app = server.app;
     const io = app.server_io orelse return failResponse(response);
-    var resolved = route(app, io, request.path) orelse {
+    var resolved = route(server, io, request.path) orelse {
         // Browsers request /favicon.ico at the origin root for pages that do
         // not declare an icon. The default icon is public, constant data.
         if (std.mem.eql(u8, request.path, "/favicon.ico") or
@@ -3785,7 +3938,7 @@ fn onRequest(
         // Upstream serves the page without a trailing slash. Relative page
         // resources need one, so a live window's bare capability redirects.
         if (request.path.len == capability_len + 1 and request.path[0] == '/') {
-            if (app.retainWindowByCapability(io, request.path[1..])) |window| {
+            if (server.retainWindow(io, request.path[1..])) |window| {
                 window.release();
                 return redirectBelow(app.gpa, request, response, "");
             }
@@ -4104,7 +4257,8 @@ fn send(
 }
 
 fn onOpen(connection: *Linsang.Connection, user_data: ?*anyopaque) void {
-    const app = appFrom(user_data);
+    const server = serverFrom(user_data);
+    const app = server.app;
     connection.setWebSocketDeadline(.fromNow(connection.io, .{
         .clock = .awake,
         .raw = .fromSeconds(5),
@@ -4112,7 +4266,7 @@ fn onOpen(connection: *Linsang.Connection, user_data: ?*anyopaque) void {
     // Linsang guarantees req remains valid through this callback. Copy only
     // stable identity and a bounded cookie copy: no request/header/path slice
     // survives the callback.
-    const resolved = route(app, connection.io, connection.req.path) orelse {
+    const resolved = route(server, connection.io, connection.req.path) orelse {
         connection.wsClose(.policy_violation, "");
         return;
     };
@@ -4132,7 +4286,7 @@ fn onMessage(
     message: Linsang.websocket.Message,
     user_data: ?*anyopaque,
 ) void {
-    const app = appFrom(user_data);
+    const app = serverFrom(user_data).app;
     // The upgrade record keeps its window alive until this connection's
     // onClose, and callbacks of one connection never overlap.
     const upgraded = app.authorizedWindow(connection.io, @intFromPtr(connection));
@@ -4320,7 +4474,7 @@ fn onMessage(
 }
 
 fn onClose(connection: *Linsang.Connection, user_data: ?*anyopaque) void {
-    const app = appFrom(user_data);
+    const app = serverFrom(user_data).app;
     const upgrade = app.removeUpgrade(connection.io, @intFromPtr(connection)) orelse return;
     const window = upgrade.window;
     defer window.release();
@@ -4333,6 +4487,30 @@ fn onClose(connection: *Linsang.Connection, user_data: ?*anyopaque) void {
         }) catch |err| if (err != error.WindowDestroyed)
             window.log(.err, "WebUI event dispatch failed: {}", .{err});
     }
+}
+
+/// A destroyed window stops routing at once, then its listener closes in
+/// the background.
+fn expectWindowGone(address: std.Io.net.IpAddress, io: std.Io, path: []const u8) !void {
+    var response: [2048]u8 = undefined;
+    for (0..1000) |_| {
+        const bytes = getTestPath(address, io, path, "\r\n\r\n", &response) catch |err| switch (err) {
+            error.ConnectionRefused => return,
+            // Accepted while the listener was closing.
+            error.ConnectionResetByPeer => continue,
+            else => return err,
+        };
+        // Empty when the connection closed while the listener was closing.
+        if (bytes.len != 0)
+            try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 404"));
+        try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+    }
+    return error.ListenerStillOpen;
+}
+
+/// The listener address of a served window in tests.
+fn testAddress(window: Window) std.Io.net.IpAddress {
+    return window.state.server.?.running.address;
 }
 
 test "multi packet accumulator completes exactly and rejects overflow" {
@@ -4455,10 +4633,10 @@ test "wait keeps per-window close intent and honours exit requests" {
         const second = try app.createWindow(.{ .content = .{ .html = "second" } });
         var running = try app.start(io);
         defer running.stop() catch {};
-        const first_stream = try connectTestWebSocket(running.inner.address, io, &first.state.capability);
+        const first_stream = try connectTestWebSocket(testAddress(first), io, &first.state.capability);
         defer first_stream.close(io);
         try std.testing.expect(try authenticateTestClient(first_stream, io, gpa, first.state.token, &first.state.capability, &response_buffer));
-        const second_stream = try connectTestWebSocket(running.inner.address, io, &second.state.capability);
+        const second_stream = try connectTestWebSocket(testAddress(second), io, &second.state.capability);
         defer second_stream.close(io);
         try std.testing.expect(try authenticateTestClient(second_stream, io, gpa, second.state.token, &second.state.capability, &response_buffer));
 
@@ -4482,7 +4660,7 @@ test "wait keeps per-window close intent and honours exit requests" {
             try std.Io.sleep(io, .fromMilliseconds(1), .awake);
         }
         try std.Io.sleep(io, .fromMilliseconds(100), .awake);
-        const reloaded = try connectTestWebSocket(running.inner.address, io, &second.state.capability);
+        const reloaded = try connectTestWebSocket(testAddress(second), io, &second.state.capability);
         defer reloaded.close(io);
         try std.testing.expect(try authenticateTestClient(reloaded, io, gpa, second.state.token, &second.state.capability, &response_buffer));
         try waitForShown(second, io);
@@ -4582,7 +4760,7 @@ test "calls and events expose binding name, origin, and bounded cookies" {
 
     // Oversized cookie headers are refused before the upgrade.
     try std.testing.expectError(error.WebSocketUpgradeFailed, connectTestWebSocketHeaders(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
         "http://localhost",
@@ -4590,7 +4768,7 @@ test "calls and events expose binding name, origin, and bounded cookies" {
     ));
 
     const stream = try connectTestWebSocketHeaders(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
         "http://localhost",
@@ -4649,16 +4827,16 @@ test "a bare capability redirects to the window root with its query" {
     var target: [capability_len + 16]u8 = undefined;
     var expected: [capability_len + 32]u8 = undefined;
     var response: [1024]u8 = undefined;
-    var bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}", .{window.state.capability}), "\r\n\r\n", &response);
+    var bytes = try getTestPath(testAddress(window), io, try std.fmt.bufPrint(&target, "/{s}", .{window.state.capability}), "\r\n\r\n", &response);
     try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 302"));
     try std.testing.expect(std.mem.indexOf(u8, bytes, try std.fmt.bufPrint(&expected, "Location: /{s}/\r\n", .{window.state.capability})) != null);
-    bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}?a=1", .{window.state.capability}), "\r\n\r\n", &response);
+    bytes = try getTestPath(testAddress(window), io, try std.fmt.bufPrint(&target, "/{s}?a=1", .{window.state.capability}), "\r\n\r\n", &response);
     try std.testing.expect(std.mem.indexOf(u8, bytes, try std.fmt.bufPrint(&expected, "Location: /{s}/?a=1\r\n", .{window.state.capability})) != null);
 
     // An unknown capability of the same length still answers 404.
     var unknown = window.state.capability;
     unknown[0] = if (unknown[0] == 'a') 'b' else 'a';
-    bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}", .{unknown}), "\r\n\r\n", &response);
+    bytes = try getTestPath(testAddress(window), io, try std.fmt.bufPrint(&target, "/{s}", .{unknown}), "\r\n\r\n", &response);
     try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 404"));
 }
 
@@ -4689,30 +4867,30 @@ test "favicon falls back from custom icon to local file to the default" {
     var target: [capability_len + 16]u8 = undefined;
     var response: [2048]u8 = undefined;
     // Origin-root requests, made for pages without an icon link.
-    var bytes = try getTestPath(running.inner.address, io, "/favicon.ico", "\r\n\r\n", &response);
+    var bytes = try getTestPath(testAddress(html), io, "/favicon.ico", "\r\n\r\n", &response);
     try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 302"));
     try std.testing.expect(std.mem.indexOf(u8, bytes, "Location: favicon.svg\r\n") != null);
-    bytes = try getTestPath(running.inner.address, io, "/favicon.svg", "</svg>", &response);
+    bytes = try getTestPath(testAddress(html), io, "/favicon.svg", "</svg>", &response);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "Content-Type: image/svg+xml\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, bytes, default_favicon));
-    bytes = try getTestPath(running.inner.address, io, "/favicon.png", "\r\n\r\n", &response);
+    bytes = try getTestPath(testAddress(html), io, "/favicon.png", "\r\n\r\n", &response);
     try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 404"));
 
     // Capability-scoped requests for windows without a custom icon.
     for ([_]Window{ html, missing }) |window| {
-        bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}/favicon.ico", .{window.state.capability}), "\r\n\r\n", &response);
+        bytes = try getTestPath(testAddress(window), io, try std.fmt.bufPrint(&target, "/{s}/favicon.ico", .{window.state.capability}), "\r\n\r\n", &response);
         try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 302"));
-        bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}/favicon.svg", .{window.state.capability}), "</svg>", &response);
+        bytes = try getTestPath(testAddress(window), io, try std.fmt.bufPrint(&target, "/{s}/favicon.svg", .{window.state.capability}), "</svg>", &response);
         try std.testing.expect(std.mem.endsWith(u8, bytes, default_favicon));
     }
-    bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}/favicon.svg", .{local.state.capability}), "</svg>", &response);
+    bytes = try getTestPath(testAddress(local), io, try std.fmt.bufPrint(&target, "/{s}/favicon.svg", .{local.state.capability}), "</svg>", &response);
     try std.testing.expect(std.mem.endsWith(u8, bytes, "<svg>local</svg>"));
-    bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}/favicon.ico", .{local.state.capability}), "\r\n\r\n", &response);
+    bytes = try getTestPath(testAddress(local), io, try std.fmt.bufPrint(&target, "/{s}/favicon.ico", .{local.state.capability}), "\r\n\r\n", &response);
     try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 302"));
 
     // A custom icon still wins over the default.
     try html.setIcon(io, "<svg>custom</svg>", "image/svg+xml");
-    bytes = try getTestPath(running.inner.address, io, try std.fmt.bufPrint(&target, "/{s}/favicon.ico", .{html.state.capability}), "</svg>", &response);
+    bytes = try getTestPath(testAddress(html), io, try std.fmt.bufPrint(&target, "/{s}/favicon.ico", .{html.state.capability}), "</svg>", &response);
     try std.testing.expect(std.mem.endsWith(u8, bytes, "<svg>custom</svg>"));
 }
 
@@ -4786,33 +4964,32 @@ test "site content resolves handler, virtual index, html, folder, and entry in u
     const custom = try app.createWindow(.{ .content = .{ .custom = handler } });
     var running = try app.start(io);
     defer running.stop() catch {};
-    const address = running.inner.address;
 
     // The handler is consulted first, then probed for a virtual index, then
     // the root HTML and the folder answer.
-    try expectBody(address, io, composed, "api/data", "HTTP/1.1 200", "handler data");
-    try expectBody(address, io, composed, "", "HTTP/1.1 200", "root page</body></html>");
-    try expectBody(address, io, composed, "style.css", "HTTP/1.1 200", "body{}");
-    try expectRedirect(address, io, composed, "virtual", "virtual/index.html");
-    try expectRedirect(address, io, composed, "virtual/?q=1", "virtual/index.html?q=1");
-    try expectBody(address, io, composed, "favicon.ico", "HTTP/1.1 302", "Location: favicon.svg\r\n");
-    try expectBody(address, io, composed, "favicon.svg", "HTTP/1.1 200", default_favicon);
-    try expectBody(address, io, composed, "missing.txt", "HTTP/1.1 404", "\r\n\r\n");
+    try expectBody(testAddress(composed), io, composed, "api/data", "HTTP/1.1 200", "handler data");
+    try expectBody(testAddress(composed), io, composed, "", "HTTP/1.1 200", "root page</body></html>");
+    try expectBody(testAddress(composed), io, composed, "style.css", "HTTP/1.1 200", "body{}");
+    try expectRedirect(testAddress(composed), io, composed, "virtual", "virtual/index.html");
+    try expectRedirect(testAddress(composed), io, composed, "virtual/?q=1", "virtual/index.html?q=1");
+    try expectBody(testAddress(composed), io, composed, "favicon.ico", "HTTP/1.1 302", "Location: favicon.svg\r\n");
+    try expectBody(testAddress(composed), io, composed, "favicon.svg", "HTTP/1.1 200", default_favicon);
+    try expectBody(testAddress(composed), io, composed, "missing.txt", "HTTP/1.1 404", "\r\n\r\n");
 
     // Entry files redirect the root, from the folder or through the handler.
-    try expectRedirect(address, io, entry_folder, "", "pages/main.html");
-    try expectBody(address, io, entry_folder, "pages/main.html", "HTTP/1.1 200", "main page");
-    try expectRedirect(address, io, entry_handler, "", "app%20page.html");
-    try expectBody(address, io, entry_handler, "app%20page.html", "HTTP/1.1 200", "app page");
+    try expectRedirect(testAddress(entry_folder), io, entry_folder, "", "pages/main.html");
+    try expectBody(testAddress(entry_folder), io, entry_folder, "pages/main.html", "HTTP/1.1 200", "main page");
+    try expectRedirect(testAddress(entry_handler), io, entry_handler, "", "app%20page.html");
+    try expectBody(testAddress(entry_handler), io, entry_handler, "app%20page.html", "HTTP/1.1 200", "app page");
     // With an entry only its file name is probed, never index.*.
     calls.store(0, .monotonic);
-    try expectBody(address, io, entry_handler, "virtual", "HTTP/1.1 404", "\r\n\r\n");
+    try expectBody(testAddress(entry_handler), io, entry_handler, "virtual", "HTTP/1.1 404", "\r\n\r\n");
     try std.testing.expectEqual(@as(usize, 2), calls.load(.monotonic));
 
     // Plain custom content gains the same virtual-directory probing.
-    try expectRedirect(address, io, custom, "docs", "docs/index.htm");
-    try expectBody(address, io, custom, "docs/index.htm", "HTTP/1.1 200", "custom docs");
-    try expectBody(address, io, custom, "nothing", "HTTP/1.1 404", "\r\n\r\n");
+    try expectRedirect(testAddress(custom), io, custom, "docs", "docs/index.htm");
+    try expectBody(testAddress(custom), io, custom, "docs/index.htm", "HTTP/1.1 200", "custom docs");
+    try expectBody(testAddress(custom), io, custom, "nothing", "HTTP/1.1 404", "\r\n\r\n");
 }
 
 test "dev server windows open with the bridge URL in the fragment" {
@@ -4849,7 +5026,7 @@ test "dev server windows open with the bridge URL in the fragment" {
     const bridge_url = try window.bridgeUrl(&running, gpa);
     defer gpa.free(bridge_url);
     // The bridge learns the build mode, like upstream's WEBUI_LOG build.
-    try expectBody(running.inner.address, io, window, "webui.js", "HTTP/1.1 200", if (@import("builtin").mode == .debug)
+    try expectBody(testAddress(window), io, window, "webui.js", "HTTP/1.1 200", if (@import("builtin").mode == .debug)
         "globalThis.__zigWebuiDebug=true;\n"
     else
         "globalThis.__zigWebuiDebug=false;\n");
@@ -4865,13 +5042,13 @@ test "dev server windows open with the bridge URL in the fragment" {
 
     // The development server's origin may connect; others may not.
     try std.testing.expectError(error.WebSocketUpgradeFailed, connectTestWebSocketOrigin(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
         "http://localhost:5174",
     ));
     const stream = try connectTestWebSocketOrigin(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
         "http://localhost:5173",
@@ -4907,7 +5084,7 @@ test "installed content changes resources without navigating clients" {
     try std.testing.expectError(error.NavigationRequired, window.installContent(&running, .{ .external_url = "https://example.com/" }));
     try std.testing.expectError(error.NavigationRequired, external.installContent(&running, .{ .html = "hosted" }));
 
-    const stream = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    const stream = try connectTestWebSocket(testAddress(window), io, &window.state.capability);
     defer stream.close(io);
     var wire: [256]u8 = undefined;
     try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &wire));
@@ -4916,8 +5093,8 @@ test "installed content changes resources without navigating clients" {
         .html = "<html>second</html>",
         .handler = .{ .handler = siteTestHandler, .user_data = &calls },
     } });
-    try expectBody(running.inner.address, io, window, "", "HTTP/1.1 200", "<html>second</html>");
-    try expectBody(running.inner.address, io, window, "api/data", "HTTP/1.1 200", "handler data");
+    try expectBody(testAddress(window), io, window, "", "HTTP/1.1 200", "<html>second</html>");
+    try expectBody(testAddress(window), io, window, "api/data", "HTTP/1.1 200", "handler data");
 
     // The next frame answers this call: no navigation was pushed first.
     var packet: std.ArrayList(u8) = .empty;
@@ -5245,19 +5422,30 @@ test "call accessors, window creation, and routes" {
         &window.state.capability,
         "0123456789abcdef0123456789abcdef",
     );
+    @memcpy(
+        &second.state.capability,
+        "fedcba9876543210fedcba9876543210",
+    );
+    var server: WindowServer = .{ .app = &app, .window = window.state, .server = undefined };
     const resolved = route(
-        &app,
+        &server,
         std.testing.io,
         "/0123456789abcdef0123456789abcdef/webui.js",
     ).?;
     defer resolved.window.release();
     try std.testing.expect(resolved.window == window.state);
     try std.testing.expectEqualStrings("webui.js", resolved.resource);
-    try std.testing.expect(route(&app, std.testing.io, "/short/") == null);
+    try std.testing.expect(route(&server, std.testing.io, "/short/") == null);
     try std.testing.expect(route(
-        &app,
+        &server,
         std.testing.io,
         "/ffffffffffffffffffffffffffffffff/",
+    ) == null);
+    // Each window's server serves only that window.
+    try std.testing.expect(route(
+        &server,
+        std.testing.io,
+        "/fedcba9876543210fedcba9876543210/webui.js",
     ) == null);
 
     var call: Call = .{
@@ -5913,7 +6101,7 @@ fn exerciseHeartbeat(io: std.Io, scenario: HeartbeatTest) anyerror!void {
         &.{"ping"};
     for (texts) |text| {
         const client = try connectTestWebSocket(
-            running.inner.address,
+            testAddress(window),
             io,
             &window.state.capability,
         );
@@ -6069,7 +6257,7 @@ test "runtime geometry persists for current and future clients" {
     var running = try app.start(io);
     defer running.stop() catch {};
     const first_stream = try connectTestWebSocket(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
     );
@@ -6118,7 +6306,7 @@ test "runtime geometry persists for current and future clients" {
     );
 
     const second_stream = try connectTestWebSocket(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
     );
@@ -6177,7 +6365,7 @@ test "runtime geometry persists for current and future clients" {
 
     // ... and for clients that connect afterwards.
     const third_stream = try connectTestWebSocket(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
     );
@@ -6967,11 +7155,11 @@ fn testRuntimeHttp(runtime: Runtime) !void {
         defer gpa.free(target);
         var response: [4096]u8 = undefined;
         // No NUL is expected: read through Connection: close, not partial output.
-        const wire = try getTestPath(running.inner.address, io, target, "\x00", &response);
+        const wire = try getTestPath(testAddress(window), io, target, "\x00", &response);
         try expectRuntimeHttpResponse(wire, case.status, case.body);
     }
     // A failed script must not prevent a later static request.
-    try expectRuntimeStaticResponse(io, &running, window);
+    try expectRuntimeStaticResponse(io, window);
 }
 
 test "directory HTTP indexes preserve precedence, escaped paths, queries and relative assets" {
@@ -7014,7 +7202,7 @@ test "directory HTTP indexes preserve precedence, escaped paths, queries and rel
             const destination = try std.fmt.allocPrint(gpa, "/{s}/{s}", .{ window.state.capability, case.entry });
             defer gpa.free(destination);
             var response: [2048]u8 = undefined;
-            const wire = try getTestPath(running.inner.address, io, target, "\x00", &response);
+            const wire = try getTestPath(testAddress(window), io, target, "\x00", &response);
             try std.testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 302 "));
             const header = try std.fmt.allocPrint(gpa, "Location: {s}\r\n", .{destination});
             defer gpa.free(header);
@@ -7022,7 +7210,7 @@ test "directory HTTP indexes preserve precedence, escaped paths, queries and rel
             // Scripts are served verbatim only when interpretation is disabled;
             // the separate real-runtime tests exercise their execution.
             if (index == 0 or !case.script) {
-                const page = try getTestPath(running.inner.address, io, destination, "\x00", &response);
+                const page = try getTestPath(testAddress(window), io, destination, "\x00", &response);
                 try std.testing.expect(std.mem.startsWith(u8, page, "HTTP/1.1 200 "));
                 const body_at = (std.mem.indexOf(u8, page, "\r\n\r\n") orelse return error.MissingHttpHeaders) + 4;
                 try std.testing.expectEqualStrings(case.body, page[body_at..]);
@@ -7032,14 +7220,14 @@ test "directory HTTP indexes preserve precedence, escaped paths, queries and rel
             const target = try std.fmt.allocPrint(gpa, "/{s}/{s}", .{ window.state.capability, path });
             defer gpa.free(target);
             var response: [2048]u8 = undefined;
-            const wire = try getTestPath(running.inner.address, io, target, "\x00", &response);
+            const wire = try getTestPath(testAddress(window), io, target, "\x00", &response);
             try std.testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 404 "));
         }
     }
     var response: [2048]u8 = undefined;
     const asset = try std.fmt.allocPrint(gpa, "/{s}/docs/asset.txt", .{windows[0].state.capability});
     defer gpa.free(asset);
-    const page = try getTestPath(running.inner.address, io, asset, "\x00", &response);
+    const page = try getTestPath(testAddress(windows[0]), io, asset, "\x00", &response);
     try std.testing.expect(std.mem.startsWith(u8, page, "HTTP/1.1 200 "));
     const body_at = (std.mem.indexOf(u8, page, "\r\n\r\n") orelse return error.MissingHttpHeaders) + 4;
     try std.testing.expectEqualStrings("docs/asset.txt", page[body_at..]);
@@ -7063,7 +7251,7 @@ test "runtime selection serves static HTTP requests without executing scripts" {
     });
     var running = try app.start(io);
     defer running.stop() catch {};
-    try expectRuntimeStaticResponse(io, &running, window);
+    try expectRuntimeStaticResponse(io, window);
     const cases = [_]struct { name: []const u8, resource: []const u8 }{
         .{ .name = "literal%.txt", .resource = "literal%25.txt" },
         .{ .name = "%2e%2e.txt", .resource = "%252e%252e.txt" },
@@ -7074,7 +7262,7 @@ test "runtime selection serves static HTTP requests without executing scripts" {
         const target = try std.fmt.allocPrint(gpa, "/{s}/{s}", .{ window.state.capability, case.resource });
         defer gpa.free(target);
         var response: [1024]u8 = undefined;
-        const wire = try getTestPath(running.inner.address, io, target, "\x00", &response);
+        const wire = try getTestPath(testAddress(window), io, target, "\x00", &response);
         try std.testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 200 "));
         const body_at = (std.mem.indexOf(u8, wire, "\r\n\r\n") orelse return error.MissingHttpHeaders) + 4;
         try std.testing.expectEqualStrings("literal resource", wire[body_at..]);
@@ -7084,18 +7272,18 @@ test "runtime selection serves static HTTP requests without executing scripts" {
         const target = try std.fmt.allocPrint(gpa, "/{s}/blocked.%6as", .{window.state.capability});
         defer gpa.free(target);
         var response: [1024]u8 = undefined;
-        const wire = try getTestPath(running.inner.address, io, target, "\x00", &response);
+        const wire = try getTestPath(testAddress(window), io, target, "\x00", &response);
         try std.testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 404 "));
         try std.testing.expect(std.mem.indexOf(u8, wire, "<p>static</p>") == null);
     }
 }
 
-fn expectRuntimeStaticResponse(io: std.Io, running: *Running, window: Window) !void {
+fn expectRuntimeStaticResponse(io: std.Io, window: Window) !void {
     const gpa = std.testing.allocator;
     const target = try std.fmt.allocPrint(gpa, "/{s}/page.html", .{window.state.capability});
     defer gpa.free(target);
     var response: [4096]u8 = undefined;
-    const wire = try getTestPath(running.inner.address, io, target, "\x00", &response);
+    const wire = try getTestPath(testAddress(window), io, target, "\x00", &response);
     try std.testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 200 "));
     const body_at = (std.mem.indexOf(u8, wire, "\r\n\r\n") orelse
         return error.MissingHttpHeaders) + 4;
@@ -7203,13 +7391,13 @@ test "directory monitor reloads changed window only" {
     defer running.stop() catch {};
 
     const first_stream = try connectTestWebSocket(
-        running.inner.address,
+        testAddress(first_window),
         io,
         &first_window.state.capability,
     );
     defer first_stream.close(io);
     const second_stream = try connectTestWebSocket(
-        running.inner.address,
+        testAddress(second_window),
         io,
         &second_window.state.capability,
     );
@@ -7345,7 +7533,7 @@ test "window connection waiting observes clients and timeouts" {
     defer _ = waiting.cancel(io) catch {};
 
     const stream = try connectTestWebSocket(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
     );
@@ -7400,7 +7588,7 @@ test "binding replies can be deferred, bounded, and disconnected" {
     defer running.stop() catch {};
 
     const client = try connectTestWebSocket(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
     );
@@ -7498,7 +7686,7 @@ test "cookie authorization guards WebSocket upgrades" {
     try std.testing.expectError(
         error.WebSocketUpgradeFailed,
         connectTestWebSocket(
-            running.inner.address,
+            testAddress(window),
             io,
             &window.state.capability,
         ),
@@ -7507,7 +7695,7 @@ test "cookie authorization guards WebSocket upgrades" {
     var target: [capability_len + 2]u8 = undefined;
     var response: [1024]u8 = undefined;
     const bytes = try getTestPath(
-        running.inner.address,
+        testAddress(window),
         io,
         try std.fmt.bufPrint(&target, "/{s}/", .{window.state.capability}),
         "cookie page",
@@ -7530,7 +7718,7 @@ test "cookie authorization guards WebSocket upgrades" {
     {
         var forbidden_response: [256]u8 = undefined;
         _ = try getTestPath(
-            running.inner.address,
+            testAddress(window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/", .{
                 window.state.capability,
@@ -7540,7 +7728,7 @@ test "cookie authorization guards WebSocket upgrades" {
         );
         var cookie_response: [1024]u8 = undefined;
         _ = try getTestPathCookie(
-            running.inner.address,
+            testAddress(window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/", .{
                 window.state.capability,
@@ -7554,14 +7742,14 @@ test "cookie authorization guards WebSocket upgrades" {
     try std.testing.expectError(
         error.WebSocketUpgradeFailed,
         connectTestWebSocketCookie(
-            running.inner.address,
+            testAddress(window),
             io,
             &window.state.capability,
             "00000000000000000000000000000000",
         ),
     );
     const client = try connectTestWebSocketCookie(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
         &window.state.cookie,
@@ -7679,7 +7867,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         var target: [capability_len + 2]u8 = undefined;
         var response: [512]u8 = undefined;
         const bytes = try getTestPath(
-            running.inner.address,
+            testAddress(page.window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/", .{
                 page.window.state.capability,
@@ -7713,7 +7901,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         var target: [capability_len + 13]u8 = undefined;
         var response: [512]u8 = undefined;
         const bytes = try getTestPath(
-            running.inner.address,
+            testAddress(icon.window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/favicon.ico", .{
                 icon.window.state.capability,
@@ -7741,7 +7929,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         var target: [capability_len + 12]u8 = undefined;
         var response: [1024]u8 = undefined;
         const bytes = try getTestPath(
-            running.inner.address,
+            testAddress(default_window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/index.html", .{
                 default_window.state.capability,
@@ -7759,7 +7947,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         var target: [capability_len + 20]u8 = undefined;
         var response: [512]u8 = undefined;
         const bytes = try getTestPath(
-            running.inner.address,
+            testAddress(default_window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/%2e%2e/secret.txt", .{
                 default_window.state.capability,
@@ -7778,7 +7966,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         var target: [capability_len + 17]u8 = undefined;
         var response: [512]u8 = undefined;
         const bytes = try getTestPath(
-            running.inner.address,
+            testAddress(custom_window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/hello?name=zig", .{
                 custom_window.state.capability,
@@ -7796,7 +7984,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         var target: [capability_len + 13]u8 = undefined;
         var response: [512]u8 = undefined;
         const bytes = try getTestPath(
-            running.inner.address,
+            testAddress(window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/index.html", .{
                 window.state.capability,
@@ -7834,7 +8022,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
     try std.testing.expectError(
         error.WebSocketUpgradeFailed,
         connectTestWebSocketOrigin(
-            running.inner.address,
+            testAddress(window),
             io,
             &window.state.capability,
             "https://attacker.example",
@@ -7842,7 +8030,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
     );
     {
         const external_client = try connectTestWebSocketOrigin(
-            running.inner.address,
+            testAddress(external_window),
             io,
             &external_window.state.capability,
             "http://external.example",
@@ -7854,7 +8042,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
 
     {
         const unauthenticated = try connectTestWebSocket(
-            running.inner.address,
+            testAddress(window),
             io,
             &window.state.capability,
         );
@@ -7874,7 +8062,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
     }
 
     const client = try connectTestWebSocket(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
     );
@@ -7890,7 +8078,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
     ));
     {
         const rejected = try connectTestWebSocket(
-            running.inner.address,
+            testAddress(window),
             io,
             &window.state.capability,
         );
@@ -7973,7 +8161,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
     try std.testing.expect(targeted_client.isConnected(io));
 
     const second_client = try connectTestWebSocket(
-        running.inner.address,
+        testAddress(second_window),
         io,
         &second_window.state.capability,
     );
@@ -8113,7 +8301,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         var target: [capability_len + 2]u8 = undefined;
         var response: [512]u8 = undefined;
         _ = try getTestPath(
-            running.inner.address,
+            testAddress(window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/", .{
                 window.state.capability,
@@ -8139,7 +8327,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         var target: [capability_len + 2]u8 = undefined;
         var response: [512]u8 = undefined;
         _ = try getTestPath(
-            running.inner.address,
+            testAddress(window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/", .{
                 window.state.capability,
@@ -8167,7 +8355,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         var target: [capability_len + 12]u8 = undefined;
         var response: [1024]u8 = undefined;
         _ = try getTestPath(
-            running.inner.address,
+            testAddress(window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/index.html", .{
                 window.state.capability,
@@ -8197,7 +8385,7 @@ test "JavaScript and Zig calls complete over HTTP and WebSocket" {
         var target: [capability_len + 20]u8 = undefined;
         var response: [512]u8 = undefined;
         _ = try getTestPath(
-            running.inner.address,
+            testAddress(window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/hello?name=runtime", .{
                 window.state.capability,
@@ -8327,12 +8515,14 @@ test "windows are created and destroyed while the app runs" {
     var primary_target: [64]u8 = undefined;
     const primary_path = try std.fmt.bufPrint(&primary_target, "/{s}/", .{primary.state.capability});
     var response: [2048]u8 = undefined;
-    var bytes = try getTestPath(running.inner.address, io, runtime_path, "runtime page", &response);
+    const runtime_address = testAddress(runtime);
+    try std.testing.expect(runtime_address.getPort() != testAddress(primary).getPort());
+    var bytes = try getTestPath(runtime_address, io, runtime_path, "runtime page", &response);
     try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200"));
 
     var capture: RuntimeDestroyCapture = .{ .app = &app };
     try runtime.bind(io, "leave", RuntimeDestroyCapture.leave, &capture);
-    const stream = try connectTestWebSocket(running.inner.address, io, &runtime.state.capability);
+    const stream = try connectTestWebSocket(testAddress(runtime), io, &runtime.state.capability);
     defer stream.close(io);
     var frame: [256]u8 = undefined;
     try std.testing.expect(try authenticateTestClient(
@@ -8356,13 +8546,12 @@ test "windows are created and destroyed while the app runs" {
     try waitForFlag(io, &capture.destroyed);
     try std.testing.expect(!app.hasWindow(runtime.state));
     try std.testing.expectError(error.UnknownWindow, app.destroyWindow(runtime));
-    bytes = try getTestPath(running.inner.address, io, runtime_path, "\r\n\r\n", &response);
-    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 404"));
+    try expectWindowGone(runtime_address, io, runtime_path);
     try disconnectTestStream(stream, io);
 
     // Destroyed from outside a handler: later messages close the transport.
     const connected = try app.createWindow(.{ .content = .{ .html = "connected page" } });
-    const second_stream = try connectTestWebSocket(running.inner.address, io, &connected.state.capability);
+    const second_stream = try connectTestWebSocket(testAddress(connected), io, &connected.state.capability);
     defer second_stream.close(io);
     try std.testing.expect(try authenticateTestClient(
         second_stream,
@@ -8379,12 +8568,19 @@ test "windows are created and destroyed while the app runs" {
     try std.testing.expectEqual(protocol.Command.close, notified.header.command);
     packet.clearRetainingCapacity();
     try protocol.append(&packet, gpa, .{ .token = connected_token, .command = .click }, "late\x00");
-    try sendClientFrame(second_stream, io, packet.items);
-    _ = try readServerFrameOpcode(second_stream, io, .close, &frame);
-    try disconnectTestStream(second_stream, io);
+    // The window's listener also closes in the background, so a late
+    // message either closes the transport or finds it already closed.
+    if (sendClientFrame(second_stream, io, packet.items)) |_| {
+        if (readServerFrameOpcode(second_stream, io, .close, &frame)) |_| {
+            disconnectTestStream(second_stream, io) catch {};
+        } else |err| switch (err) {
+            error.EndOfStream, error.ConnectionResetByPeer => {},
+            else => return err,
+        }
+    } else |_| {}
 
     // Other windows keep running.
-    bytes = try getTestPath(running.inner.address, io, primary_path, "primary page", &response);
+    bytes = try getTestPath(testAddress(primary), io, primary_path, "primary page", &response);
     try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200"));
 
     // Runtime directory windows get their own monitor, stopped on destroy.
@@ -8392,11 +8588,11 @@ test "windows are created and destroyed while the app runs" {
     try std.testing.expect(folder_window.state.monitor_task.token.load(.acquire) != null);
     var folder_target: [80]u8 = undefined;
     const folder_path = try std.fmt.bufPrint(&folder_target, "/{s}/index.html", .{folder_window.state.capability});
-    bytes = try getTestPath(running.inner.address, io, folder_path, "runtime folder", &response);
+    const folder_address = testAddress(folder_window);
+    bytes = try getTestPath(folder_address, io, folder_path, "runtime folder", &response);
     try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200"));
     try app.destroyWindow(folder_window);
-    bytes = try getTestPath(running.inner.address, io, folder_path, "\r\n\r\n", &response);
-    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 404"));
+    try expectWindowGone(folder_address, io, folder_path);
 
     // With every window destroyed, wait() returns and stops the app.
     try app.destroyWindow(primary);
@@ -8429,7 +8625,7 @@ test "multi-client limits, targeting, and disconnect lifecycle" {
     try std.testing.expect(!window.isShown(io));
 
     const first_stream = try connectTestWebSocket(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
     );
@@ -8465,7 +8661,7 @@ test "multi-client limits, targeting, and disconnect lifecycle" {
     };
 
     const second_stream = try connectTestWebSocket(
-        running.inner.address,
+        testAddress(window),
         io,
         &window.state.capability,
     );
@@ -8501,7 +8697,7 @@ test "multi-client limits, targeting, and disconnect lifecycle" {
 
     {
         const rejected = try connectTestWebSocket(
-            running.inner.address,
+            testAddress(window),
             io,
             &window.state.capability,
         );
@@ -8579,7 +8775,7 @@ test "multi-client limits, targeting, and disconnect lifecycle" {
         var target: [capability_len + 2]u8 = undefined;
         var response: [512]u8 = undefined;
         _ = try getTestPath(
-            running.inner.address,
+            testAddress(window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/", .{
                 window.state.capability,
@@ -8852,7 +9048,7 @@ test "multi-client limits, targeting, and disconnect lifecycle" {
         var target: [capability_len + 2]u8 = undefined;
         var response: [512]u8 = undefined;
         _ = try getTestPath(
-            running.inner.address,
+            testAddress(window),
             io,
             try std.fmt.bufPrint(&target, "/{s}/", .{
                 window.state.capability,
@@ -8931,7 +9127,7 @@ test "runtime registrations replace in-flight handlers and replay racing updates
     var replacement_events: IntegrationEventState = .{ .expected_click = "unbound" };
     var running = try app.start(io);
     defer running.stop() catch {};
-    const client = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    const client = try connectTestWebSocket(testAddress(window), io, &window.state.capability);
     defer client.close(io);
     var response: [512]u8 = undefined;
     try std.testing.expect(try authenticateTestClient(
@@ -8998,7 +9194,7 @@ test "runtime registrations replace in-flight handlers and replay racing updates
     // races authentication: it must appear in replay or in the subsequent push.
     try disconnectTestStream(client, io);
     try waitForFlag(io, &replacement_events.disconnected);
-    const reconnect = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    const reconnect = try connectTestWebSocket(testAddress(window), io, &window.state.capability);
     defer reconnect.close(io);
     packet.clearRetainingCapacity();
     try protocol.append(&packet, gpa, .{
@@ -9164,8 +9360,8 @@ test "CHECK_TOKEN cannot change the cookie authorized upgrade window" {
     const second = try app.createWindow(.{ .content = .{ .html = "second" } });
     var running = try app.start(io);
     defer running.stop() catch {};
-    try std.testing.expectError(error.WebSocketUpgradeFailed, connectTestWebSocket(running.inner.address, io, &second.state.capability));
-    const stream = try connectTestWebSocketCookie(running.inner.address, io, &first.state.capability, &first.state.cookie);
+    try std.testing.expectError(error.WebSocketUpgradeFailed, connectTestWebSocket(testAddress(second), io, &second.state.capability));
+    const stream = try connectTestWebSocketCookie(testAddress(first), io, &first.state.capability, &first.state.cookie);
     defer stream.close(io);
     var response: [125]u8 = undefined;
     try std.testing.expect(!try authenticateTestClient(stream, io, gpa, second.state.token, &second.state.capability, &response));
@@ -9191,7 +9387,7 @@ test "serial handler eval receives its own client reply without blocking the rec
     try window.bind(io, "evaluate", serialEvalHandler, null);
     var running = try app.start(io);
     defer running.stop() catch {};
-    const stream = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    const stream = try connectTestWebSocket(testAddress(window), io, &window.state.capability);
     defer stream.close(io);
     var response: [125]u8 = undefined;
     try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &response));
@@ -9220,7 +9416,7 @@ test "eval total deadline cancels a blocked send and releases caller buffers" {
     const window = try app.createWindow(.{ .content = .{ .html = "blocked eval" } });
     var running = try app.start(io);
     defer running.stop() catch {};
-    const stream = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    const stream = try connectTestWebSocket(testAddress(window), io, &window.state.capability);
     defer stream.close(io);
     var response: [125]u8 = undefined;
     try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &response));
@@ -9246,9 +9442,9 @@ test "silent and control-pinging upgrades expire and restore admission capacity"
     const window = try app.createWindow(.{ .content = .{ .html = "hard authentication deadline" } });
     var running = try app.start(io);
     defer running.stop() catch {};
-    const silent = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    const silent = try connectTestWebSocket(testAddress(window), io, &window.state.capability);
     defer silent.close(io);
-    const pinging = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    const pinging = try connectTestWebSocket(testAddress(window), io, &window.state.capability);
     defer pinging.close(io);
     try waitForCount(io, &app.unauthenticated_connections, 2);
     // Control traffic must not refresh the absolute authentication deadline.
@@ -9261,7 +9457,7 @@ test "silent and control-pinging upgrades expire and restore admission capacity"
     }
     try std.Io.sleep(io, .fromMilliseconds(2500), .awake);
     try waitForCount(io, &app.unauthenticated_connections, 0);
-    const replacement = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    const replacement = try connectTestWebSocket(testAddress(window), io, &window.state.capability);
     defer replacement.close(io);
     var response: [125]u8 = undefined;
     try std.testing.expect(try authenticateTestClient(replacement, io, gpa, window.state.token, &window.state.capability, &response));
@@ -9356,6 +9552,101 @@ test "managed browser replacement reaps its previous child before relaunch" {
     try std.testing.expectEqual(@as(?Browser, .chromium), app.lastBrowser(io));
 }
 
+test "each window listens on its own port and setPort moves it" {
+    try requireSocketIntegration();
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var app = App.init(gpa, .{ .startup_timeout = null });
+    defer app.deinit();
+    const alpha = try app.createWindow(.{ .content = .{ .html = "alpha page" } });
+    const beta = try app.createWindow(.{ .content = .{ .html = "beta page" } });
+    var running = try app.start(io);
+    var stopped = false;
+    defer if (!stopped) running.stop() catch {};
+
+    const alpha_port = try alpha.port(&running);
+    const beta_port = try beta.port(&running);
+    try std.testing.expect(alpha_port != beta_port);
+    try std.testing.expectEqual(alpha_port, testAddress(alpha).getPort());
+    const alpha_url = try alpha.url(&running, gpa);
+    defer gpa.free(alpha_url);
+    var expected: [96]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        try std.fmt.bufPrint(&expected, "http://127.0.0.1:{d}/{s}/", .{ alpha_port, alpha.state.capability }),
+        alpha_url,
+    );
+
+    // A window's server serves only that window.
+    var target: [capability_len + 2]u8 = undefined;
+    const alpha_path = try std.fmt.bufPrint(&target, "/{s}/", .{alpha.state.capability});
+    var response: [2048]u8 = undefined;
+    var bytes = try getTestPath(testAddress(beta), io, alpha_path, "\r\n\r\n", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 404"));
+    bytes = try getTestPath(testAddress(alpha), io, alpha_path, "alpha page", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200"));
+
+    const stream = try connectTestWebSocket(testAddress(alpha), io, &alpha.state.capability);
+    defer stream.close(io);
+    var frame: [256]u8 = undefined;
+    try std.testing.expect(try authenticateTestClient(
+        stream,
+        io,
+        gpa,
+        alpha.state.token,
+        &alpha.state.capability,
+        &frame,
+    ));
+
+    // The current port is a no-op; another window's port is refused and
+    // leaves the window where it was.
+    try alpha.setPort(&running, alpha_port);
+    try std.testing.expectError(error.AddressInUse, alpha.setPort(&running, beta_port));
+    try std.testing.expectEqual(alpha_port, try alpha.port(&running));
+
+    // Moving starts the new listener, navigates pages there and closes the
+    // old one.
+    const old_address = testAddress(alpha);
+    try alpha.setPort(&running, 0);
+    const moved_port = try alpha.port(&running);
+    try std.testing.expect(moved_port != alpha_port);
+    const moved_url = try alpha.url(&running, gpa);
+    defer gpa.free(moved_url);
+    try std.testing.expectEqualStrings(
+        try std.fmt.bufPrint(&expected, "http://127.0.0.1:{d}/{s}/", .{ moved_port, alpha.state.capability }),
+        moved_url,
+    );
+    const navigation = try protocol.decode(try readServerFrame(stream, io, &frame));
+    try std.testing.expectEqual(protocol.Command.navigation, navigation.header.command);
+    try std.testing.expectEqualStrings(moved_url, navigation.payload);
+    try expectWindowGone(old_address, io, alpha_path);
+    bytes = try getTestPath(testAddress(alpha), io, alpha_path, "alpha page", &response);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200"));
+    try std.testing.expectEqual(beta_port, try beta.port(&running));
+
+    // A runtime window may not take a port another window serves.
+    try std.testing.expectError(error.AddressInUse, app.createWindow(.{
+        .content = .{ .html = "clash" },
+        .port = beta_port,
+    }));
+
+    try running.stop();
+    stopped = true;
+    try std.testing.expectError(error.NotRunning, alpha.port(&running));
+    try std.testing.expectError(error.NotRunning, alpha.setPort(&running, 0));
+
+    // Duplicate configured ports fail start and leave the app restartable.
+    var clashing = App.init(gpa, .{});
+    defer clashing.deinit();
+    _ = try clashing.createWindow(.{ .content = .{ .html = "one" }, .port = moved_port });
+    _ = try clashing.createWindow(.{ .content = .{ .html = "two" }, .port = moved_port });
+    try std.testing.expectError(error.AddressInUse, clashing.start(io));
+    try std.testing.expect(!clashing.started);
+    for (clashing.windows.items) |window|
+        try std.testing.expect(window.server == null);
+}
+
 test "the server disables Nagle like upstream" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .unlimited });
@@ -9366,7 +9657,7 @@ test "the server disables Nagle like upstream" {
     _ = try app.createWindow(.{ .content = .{ .html = "nodelay" } });
     var running = try app.start(io);
     defer running.stop() catch {};
-    try std.testing.expect(app.server.?.config.tcp_nodelay);
+    try std.testing.expect(app.windows.items[0].server.?.server.config.tcp_nodelay);
 }
 
 test "late timed out evaluation cannot resolve a later request after ID wrap" {
@@ -9379,7 +9670,7 @@ test "late timed out evaluation cannot resolve a later request after ID wrap" {
     const window = try app.createWindow(.{ .content = .{ .html = "late evaluation" } });
     var running = try app.start(io);
     defer running.stop() catch {};
-    const stream = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    const stream = try connectTestWebSocket(testAddress(window), io, &window.state.capability);
     defer stream.close(io);
     var wire: [125]u8 = undefined;
     try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &wire));
@@ -9431,7 +9722,7 @@ test "exhausted evaluation wire IDs recover after a discarded late reply" {
     const window = try app.createWindow(.{ .content = .{ .html = "ID capacity" } });
     var running = try app.start(io);
     defer running.stop() catch {};
-    const stream = try connectTestWebSocket(running.inner.address, io, &window.state.capability);
+    const stream = try connectTestWebSocket(testAddress(window), io, &window.state.capability);
     defer stream.close(io);
     var wire: [125]u8 = undefined;
     try std.testing.expect(try authenticateTestClient(stream, io, gpa, window.state.token, &window.state.capability, &wire));

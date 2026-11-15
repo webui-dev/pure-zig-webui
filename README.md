@@ -228,6 +228,12 @@ try window.open(io, &running);
 try running.wait();
 ```
 
+Each window has its own listener. `WindowOptions.port` picks its port, and
+zero selects a free one. `Window.port()` returns the actual port, and
+`Window.setPort()` moves a running window: the new listener starts first, then
+connected pages navigate to the new URL and the old listener closes. A port
+that another window already serves returns `error.AddressInUse`.
+
 `Running.wait()` returns once no window is active. After its last client
 leaves, a window gets a 1.5-second reconnect grace, so reloads and
 `setContent()` survive. `Window.close()` ends a window at once.

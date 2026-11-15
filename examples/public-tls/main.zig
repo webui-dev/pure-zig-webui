@@ -12,7 +12,6 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(private_key);
     var app = webui.App.init(init.gpa, .{
         .address = "0.0.0.0",
-        .port = 8443,
         .public = true,
         .use_cookies = true,
         .tls = .{ .certificate_pem = certificate, .private_key_pem = private_key },
@@ -21,7 +20,10 @@ pub fn main(init: std.process.Init) !void {
         .startup_timeout = null,
     });
     defer app.deinit();
-    const window = try app.createWindow(.{ .content = .{ .html = "<!doctype html><title>Caller-provided TLS</title><h1>Pure Zig WebUI over TLS</h1><script src='webui.js'></script>" } });
+    const window = try app.createWindow(.{
+        .content = .{ .html = "<!doctype html><title>Caller-provided TLS</title><h1>Pure Zig WebUI over TLS</h1><script src='webui.js'></script>" },
+        .port = 8443,
+    });
     var running = try app.start(init.io);
     defer running.stop() catch {};
     const url = try window.url(&running, init.gpa);
