@@ -62,7 +62,7 @@ Closed after the rescans, each with focused tests in the same change:
 
 | Area | Resolution |
 |---|---|
-| Per-window servers and ports | Like upstream, each window has its own listener: `WindowOptions.port` (zero selects a free port), `Window.port()` like `webui_get_port()`, and `Window.setPort()`, which while running starts the new listener first, navigates connected pages to the new URL and closes the old one, like upstream `a973618`/`ef03466`. Capability routing stays: a window's server serves only that window's capability. A port another window of the app serves is refused with `error.AddressInUse` before binding, since Windows `SO_REUSEADDR` sockets may share a port. Destroying a window closes its listener. Tests: `each window listens on its own port and setPort moves it`, `windows are created and destroyed while the app runs`, and the route test's foreign-capability case. |
+| Per-window servers and ports | Like upstream, each window has its own listener: `WindowOptions.port` (zero selects a free port), `Window.port()` like `webui_get_port()`, and `Window.setPort()`, which while running starts the new listener first, navigates connected pages to the new URL and closes the old one, like upstream `a973618`/`ef03466`. Capability routing stays: a window's server serves only that window's capability. A port in use, by another window or another process, returns `error.AddressInUse` because Linsang binds exclusively since `c7b77e7` (POSIX `SO_REUSEADDR` without `SO_REUSEPORT`, Windows `SO_EXCLUSIVEADDRUSE`). Destroying a window closes its listener. Tests: `each window listens on its own port and setPort moves it`, `windows are created and destroyed while the app runs`, and the route test's foreign-capability case. |
 | Browser window state | Missed by earlier scans: upstream `02d2853` minimizes and maximizes browser windows, not only WebViews, and acts only on a unique window. `Window.minimize()`/`maximize()` follow it per platform, and Windows focus now shares the unique-window search and `AttachThreadInput`. Tests: `browser window state runs the platform tools as argv` (stub tools, failures, missing tools, deadline), `X11 window IDs parse from xdotool output`, `macOS window scripts interpolate only the process ID`, and the managed-browser guard assertions. |
 | Bare capability URL | Upstream serves the page at its root without a trailing slash. `/{capability}` of a live window answers `302` to `/{capability}/` with the query kept, so relative page resources resolve; unknown capabilities still answer `404`. Test: `a bare capability redirects to the window root with its query`. |
 | `TCP_NODELAY` | Like upstream `9125b20`, accepted sockets disable Nagle through Linsang's `Config.tcp_nodelay` (pinned at `21917cf`): `setsockopt` on POSIX, and on Windows an AFD `SOCKOPT` request, because Zig 0.17's AFD sockets have no Winsock context. Tests: Linsang `accepted sockets disable Nagle unless configured otherwise` reads the option back from the served socket on Linux, macOS, and Windows CI; `the server disables Nagle like upstream`. |
@@ -95,7 +95,7 @@ macOS transparency/profile and Wayland absolute-coordinate limits are unchanged.
 | Upstream WebUI | Its core is the roughly 14,500-line `src/webui.c`, mixing protocol, server, browser, WebView, and process management |
 | Browser bridge | About 1,006 lines of TypeScript using the 8-byte WebUI binary header |
 | Linsang | Zig 0.17 with HTTP/1.1, WebSocket, static files, TLS, and connection lifecycle support |
-| Linsang validation | At `21917cf965920952ecd326576b09fce2467e010d` (Zig 0.17.0, cancelation-independent stop, `Io.operateTimeout` socket deadlines, `TCP_NODELAY`), 97 tests pass on macOS and the 15 Linux-only tests skip; Linux CI runs all of them, plus fuzzing and TLS interop, and macOS and Windows CI run the suite |
+| Linsang validation | At `c7b77e770bc2340424ff4f9a7034097385c2e31f` (Zig 0.17.0, cancelation-independent stop, `Io.operateTimeout` socket deadlines, `TCP_NODELAY`, exclusive listeners), 98 tests pass on macOS and the 15 Linux-only tests skip; Linux CI runs all of them, plus fuzzing and TLS interop, and macOS and Windows CI run the suite |
 
 [Linsang issue #1](https://github.com/jinzhongjia/Linsang/issues/1) added a
 reference-counted `WebSocketPeer`, immediate cross-task sends, safe send/close
@@ -682,10 +682,11 @@ This snapshot used Linsang `db11eb05e897e4dccdab701e110dc8a6948cb690`, from
 [PR #3](https://github.com/jinzhongjia/Linsang/pull/3) (authorization-context,
 deadline, canonical-path, immutable TLS-reader, and concurrency fixes). That PR
 has since been merged. Linsang is now pinned to
-`21917cf965920952ecd326576b09fce2467e010d` on `main`: the Zig 0.17.0 port, a
+`c7b77e770bc2340424ff4f9a7034097385c2e31f` on `main`: the Zig 0.17.0 port, a
 stop that does not depend on cancelation, socket deadlines through
 `Io.operateTimeout`, which make keep-alive and WebSocket round trips about
-three times faster, and `TCP_NODELAY` on accepted sockets.
+three times faster, `TCP_NODELAY` on accepted sockets, and exclusive listeners
+that never share a port.
 
 The permanent exclusions remain unchanged: no C ABI compatibility layer, no
 old-Zig compatibility code, and no automatic self-signed certificate. Platform

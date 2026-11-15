@@ -784,8 +784,6 @@ const WindowState = struct {
     /// `server_mutex`, which connection callbacks never take.
     server: ?*WindowServer = null,
     server_mutex: std.Io.Mutex = .init,
-    /// The served port, readable without `server_mutex`; zero when stopped.
-    bound_port: std.atomic.Value(u16) = .init(0),
     const HandlerTask = struct {
         next: ?*HandlerTask = null,
         target: Client,
@@ -840,7 +838,6 @@ const WindowState = struct {
             defer self.server_mutex.unlock(io);
             const server = self.server orelse return;
             self.server = null;
-            self.bound_port.store(0, .release);
             break :blk server;
         };
         app.stopWindowServer(server);
@@ -2630,11 +2627,6 @@ pub const Window = struct {
         defer state.server_mutex.unlock(io);
         const previous = state.server orelse return error.NotRunning;
         if (new_port != 0 and new_port == previous.port()) return;
-        {
-            running.app.windows_lock.lockSharedUncancelable(io);
-            defer running.app.windows_lock.unlockShared(io);
-            if (running.app.portTaken(state, new_port)) return error.AddressInUse;
-        }
         const replacement = try running.app.startWindowServer(io, state, new_port);
         state.server = replacement;
         state.port = new_port;
@@ -3029,7 +3021,6 @@ pub const App = struct {
         errdefer state.stopMonitor(io);
         // Last fallible step: its connections wait on `windows_lock`, so it
         // must never be stopped while that lock is held.
-        if (self.portTaken(state, state.port)) return error.AddressInUse;
         state.server = try self.startWindowServer(io, state, state.port);
         self.windows.appendAssumeCapacity(state);
     }
@@ -3136,13 +3127,10 @@ pub const App = struct {
         errdefer for (self.windows.items) |window| {
             if (window.server) |server| self.stopWindowServer(server);
             window.server = null;
-            window.bound_port.store(0, .release);
             window.cancelEvents(io);
         };
-        for (self.windows.items) |window| {
-            if (self.portTaken(window, window.port)) return error.AddressInUse;
+        for (self.windows.items) |window|
             window.server = try self.startWindowServer(io, window, window.port);
-        }
         {
             self.windows_lock.lockUncancelable(io);
             defer self.windows_lock.unlock(io);
@@ -3179,20 +3167,9 @@ pub const App = struct {
                 .user_data = server,
             }),
         };
+        // Linsang binds exclusively, so a port in use is `error.AddressInUse`.
         server.running = try server.server.start(io);
-        window.bound_port.store(server.port(), .release);
         return server;
-    }
-
-    /// Whether another window of this app already serves `port`. Checked
-    /// before binding because Windows sockets with `SO_REUSEADDR` may share
-    /// a listening port. The caller holds `windows_lock` or runs before the
-    /// window list can change.
-    fn portTaken(self: *const App, window: *const WindowState, port: u16) bool {
-        if (port == 0) return false;
-        for (self.windows.items) |other|
-            if (other != window and other.bound_port.load(.acquire) == port) return true;
-        return false;
     }
 
     /// Close one window server's listener and connections, then free it.
